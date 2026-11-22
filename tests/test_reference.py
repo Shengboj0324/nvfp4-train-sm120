@@ -78,3 +78,29 @@ def test_gemm_reference_matches_dequantized_matmul():
     d = ref.gemm(qa, qb)
     assert torch.allclose(d, ref.dequantize(*qa) @ ref.dequantize(*qb).T, rtol=1e-4, atol=1e-4)
     assert ref.snr_db(a @ b.T, d) > 10.0
+
+
+def test_block_scale_uses_ieee_division():
+    # amax 14 -> genc 192; block max 6.25: IEEE 6.25 / 6 * 192 is exactly 200, the E4M3 midpoint of 192
+    # and 208, which rounds to even (192, code 0x74). Multiplying by a rounded 1/6 instead gives 208.
+    x = torch.zeros(2, 32)
+    x[0, 0] = 14.0
+    x[1, 16] = 6.25
+    _, s, _ = ref.quantize(x)
+    assert s[1, 1].item() == 0x74
+
+
+def test_quantize_dual_spec():
+    torch.manual_seed(0)
+    x = torch.randn(100, 64)
+    (rd, rs, rg), (cd, cs, cg) = ref.quantize_dual(x, rht_seed=3, col_sr_seed=4, col_pad=128)
+    assert rd.shape == (100, 32) and cd.shape == (64, 64)
+    want = ref.quantize(ref.apply_rht(torch.nn.functional.pad(x, (0, 0, 0, 28)).T.contiguous(), 3),
+                        stochastic=True, seed=4)
+    assert all(torch.equal(a, b) for a, b in zip((cd, cs, cg), want))
+    # The RHT mixes the block holding tokens 96..111 (4 real, 12 padding), so only fully padded blocks are zero.
+    assert torch.equal(ref.dequantize(cd, cs, cg)[:, 112:].abs().sum(), torch.tensor(0.0))
+    # 2D: the col output is the exact transpose of the row output
+    (rd, rs, rg), (cd, cs, cg) = ref.quantize_dual(torch.randn(64, 48), block_2d=True)
+    assert torch.equal(ref.dequantize(rd, rs, rg).T, ref.dequantize(cd, cs, cg))
+    assert ref.quantize_dual(x, col=False)[1] is None and ref.quantize_dual(x, row=False)[0] is None
