@@ -62,15 +62,31 @@ __device__ __forceinline__ void mbar_arrive(uint32_t bar) {
   asm volatile("mbarrier.arrive.shared::cta.b64 _, [%0];\n" ::"r"(bar) : "memory");
 }
 // try_wait with a suspend-time hint: a waiting warp sleeps instead of spinning on issue slots.
+__device__ __forceinline__ uint64_t global_ns() {
+  uint64_t t;
+  asm volatile("mov.u64 %0, %%globaltimer;\n" : "=l"(t));
+  return t;
+}
+// Bounded: a wait longer than 1 s means a pipeline bug, and an unbounded spin would instead run into the
+// OS display-driver watchdog (2 s on Windows/WSL), whose GPU reset is far more disruptive than a trap,
+// which surfaces as an ordinary CUDA launch failure.
+constexpr uint64_t kWaitLimitNs = 1000000000ull;
 __device__ __forceinline__ void mbar_wait(uint32_t bar, uint32_t parity) {
   uint32_t done;
-  do {
+  uint64_t t0 = 0;
+  for (;;) {
     asm volatile(
         "{\n .reg .pred p;\n mbarrier.try_wait.parity.shared::cta.b64 p, [%1], %2, %3;\n selp.u32 %0, 1, 0, p;\n}\n"
         : "=r"(done)
         : "r"(bar), "r"(parity), "r"(0x989680)
         : "memory");
-  } while (!done);
+    if (done) return;
+    if (t0 == 0) {
+      t0 = global_ns();
+    } else if (global_ns() - t0 > kWaitLimitNs) {
+      __trap();
+    }
+  }
 }
 __device__ __forceinline__ void tma_load_2d(uint32_t dst, const CUtensorMap* map, int x, int y, uint32_t bar) {
   asm volatile(
@@ -199,6 +215,7 @@ __device__ __forceinline__ void consume_stage(float (&acc)[MI][NI][4], Frag (&fr
       if (ks + 2 == KS) {
         __syncwarp();
         if (lane == 0) mbar_arrive(empty_bar(bars, S));
+        __syncwarp();  // reconverge before the next .aligned instruction
       }
     } else if (it + 1 < nk) {
       mbar_wait(full_bar(bars, SN), ((it + 1) / STAGES) & 1);
@@ -235,6 +252,9 @@ __device__ __forceinline__ void steps(float (&acc)[MI][NI][4], Frag (&fr)[2], Sc
     if (it + S < nk) {
       consume_stage<S>(acc, fr, sc, la, bars, it + S, nk, lane);
       if (threadIdx.x == 0) refill<S>(base, bars, it + S, nk, kt0, m0, n0, mp);
+      // Lane 0 of warp 0 may have waited on the empty barrier above; ldmatrix / mma.sync are .aligned and
+      // need the whole warp converged, which independent thread scheduling does not guarantee by itself.
+      __syncwarp();
       steps<S + 1>(acc, fr, sc, la, base, bars, it, nk, kt0, m0, n0, lane, mp);
     }
   }

@@ -1,6 +1,7 @@
 """Thin Python API over the CUDA kernels. Each op has a pure-PyTorch twin in ``nvfp4.reference``."""
 from __future__ import annotations
 
+import os
 from dataclasses import dataclass
 
 import torch
@@ -9,6 +10,9 @@ try:
     from nvfp4 import _C  # type: ignore[attr-defined]
 except ImportError:  # pragma: no cover - CPU-only installs
     _C = None
+
+
+_DEFAULT_SPLITS = int(os.environ.get("NVFP4_GEMM_SPLITS", "0"))  # 1 disables split-K (ablations)
 
 
 def available() -> bool:
@@ -129,18 +133,20 @@ def gelu_backward_quantize_dual(dy: torch.Tensor, h: torch.Tensor, *, row: bool 
 
 def gemm(a: NVFP4Tensor, b: NVFP4Tensor, out_dtype: torch.dtype = torch.bfloat16, *,
          out: torch.Tensor | None = None, accumulate: bool = False, impl: str = "auto",
-         splits: int = 0) -> torch.Tensor:
+         splits: int | None = None) -> torch.Tensor:
     """D[M, N] = A[M, K] @ B[N, K]^T with both operands in NVFP4 (block-scaled tensor-core MMA).
 
     ``out`` writes into an existing contiguous [M, N] tensor; ``accumulate=True`` adds to it instead
     (fp32 only), e.g. to accumulate a weight gradient in place across micro-batches.
     ``impl``: "auto" (TMA main loop when K % 256 == 0, else cp.async), "tma" or "cp.async".
-    ``splits``: number of K splits (0 = chosen from the grid size); the split-K reduction is
-    deterministic but sums in a different order than an unsplit GEMM.
+    ``splits``: number of K splits (0 = chosen from the grid size; None = $NVFP4_GEMM_SPLITS, default 0).
+    The split-K reduction is deterministic but sums in a different order than an unsplit GEMM.
     """
     if _C is None:
         raise RuntimeError("nvfp4 CUDA extension not built")
     if out is not None:
         out_dtype = out.dtype
     impl_id = {"auto": 0, "cp.async": 1, "tma": 2}[impl]
+    if splits is None:
+        splits = _DEFAULT_SPLITS
     return _C.gemm(a.data, a.scales, a.gdec, b.data, b.scales, b.gdec, out_dtype, out, accumulate, impl_id, splits)

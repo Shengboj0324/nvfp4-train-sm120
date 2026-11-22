@@ -63,7 +63,8 @@ be bit-identical to it in every mode.
 - **RHT on the wgrad operands:** it spreads outliers across each 16-element block before
   quantization. Because the transform is orthogonal and applied to both operands along the
   contraction dimension, `(A·M)(B·M)^T = A·B^T` holds exactly in exact arithmetic.
-- **Kept in BF16:** embeddings, the LM head, LayerNorms, attention and the last N transformer blocks.
+- **Kept in higher precision:** embeddings, the LM head, attention and the last N transformer blocks
+  stay BF16; LayerNorm and GELU run in fp32 (inside the quantizers when fused, §3.4).
 
 All three GEMMs run on a **single "TN" kernel** (`D = A·B^T`, with both operands quantized along
 the contraction dimension). This works because the quantizer can emit transposed outputs directly.
@@ -146,23 +147,140 @@ optional RHT and SR. It shares the per-block math above (`quantize16` in `nvfp4_
 thread owns one 16-element block. In rowwise 1D mode a warp covers 32 consecutive blocks of a row
 with 16-byte loads. Otherwise a warp covers 32 consecutive rows of one block column.
 
-## 4. GEMM (`csrc/gemm.cu`)
+### 3.4 Producer fusion: LayerNorm and GELU inside the quantizer (v0.3)
 
-| Parameter | Value |
-|---|---|
-| CTA tile | 128 × 128 × 128 (K in elements, i.e. 64 bytes per row) |
-| Warps | 8: 2 along M × 4 along N, each computing a 64×32 output tile |
-| MMAs per warp per 64-wide K-step | 16 (4 m16 tiles × 4 n8 tiles) |
-| Pipeline | 4-stage `cp.async`, 18 KB per stage = 72 KB shared memory |
-| Registers | 150 per thread, no spills (one 256-thread CTA per SM) |
-| Epilogue | `alpha = gdec_A · gdec_B` applied in fp32, then bf16 or fp32 store, or `D += alpha·acc` into an existing fp32 tensor |
+In a pre-LN block the NVFP4 operands are produced by elementwise ops: qkv and fc1 quantize
+`LayerNorm(x)`, fc2 quantizes `gelu(h)`, and fc1's backward quantizes `dY · gelu'(h)`. Unfused, each
+of these is a separate kernel that writes its output (the LayerNorm output in fp32 under autocast,
+plus a bf16 copy) only for the quantizer to read it twice (amax, quantize).
 
-**Accumulating epilogue.** `gemm(..., out=g, accumulate=True)` adds into `g`. `NVFP4Linear(...,
-fuse_wgrad_accumulation=True)` uses it to accumulate weight gradients across micro-batches in place.
-The add is two separate IEEE ops (no FMA contraction), so the result is bit-identical to autograd's
-`grad + dW`. The old values for one m16 row group are loaded together before any store. A load can't
-be moved past a store to the same array, so a load-add-store loop serialized 32 memory latencies per
-warp: with it, the fused version was slower than the separate add it replaced.
+The dual quantizer's tile loader can instead apply the producer op itself (`Pro` in
+`quantize_dual.cu`), in both the amax pass and the quantize pass:
+
+| Op | Reads | Computes per element (fp32, each op IEEE-rounded) |
+|---|---|---|
+| LayerNorm | x, mean[r], rstd[r], γ, β | `((x − mean) · rstd) · γ + β` |
+| GELU (tanh) | h | `(x · 0.5) · (tanh((x + x³ · κ) · β) + 1)` |
+| GELU backward | dY, h | `dY · gelu'(h)` |
+
+- **LayerNorm statistics** come from a small kernel (`ln_stats_kernel`: one warp per row, two passes,
+  deterministic shuffle-tree sums). The LayerNorm backward then runs PyTorch's
+  `native_layer_norm_backward` with these statistics, so forward and backward agree.
+- **Zero padding stays zero:** the padded token rows of the wgrad operand are not passed through the
+  op (LayerNorm of a zero row would be β).
+- **Bit-exact:** every op is written one rounded operation at a time, without FMA contraction, and
+  `nvfp4/reference.py` mirrors it with separate torch ops. Run on the GPU, `torch.tanh` is the same
+  libdevice `tanhf`, so `tests/test_fused_producers_cuda.py` checks bit-exactness against reference
+  op + `reference.quantize_dual`.
+- **What changes numerically:** the fused path quantizes the fp32 LayerNorm/GELU outputs directly
+  instead of first rounding them to bf16, and uses its own LayerNorm statistics.
+
+`nvfp4/fused.py` builds the two pre-LN sub-blocks on top: `layernorm_linear` (LN → qkv) and
+`layernorm_mlp` (LN → fc1 → GELU → fc2), each one autograd Function. They save what the unfused graph
+saves (x, the statistics, h, the NVFP4 transposed operands). One subtlety: everything a single
+`backward()` references stays alive until it returns, unlike between separate autograd nodes, so the
+functions drop each temporary as soon as it is consumed and the LayerNorm-gradient GEMM writes fp32
+directly. Without that, peak memory of the d=768 block rose 20%; with it, it is unchanged.
+
+## 4. GEMM (`csrc/gemm.cu`, `csrc/gemm_tma.cu`, `csrc/gemm_common.cuh`)
+
+Two main loops share one epilogue. Both use 128×128 CTA tiles and 8 MMA warps (2 along M × 4 along N,
+each computing a 64×32 output tile, 16 MMAs per 64-wide K step), one CTA per SM.
+
+| | TMA loop (`gemm_tma.cu`, default for K ≥ 1024) | cp.async loop (`gemm.cu`) |
+|---|---|---|
+| K tile | 256 (128 bytes per row) | 128 (64 bytes per row) |
+| Loads | TMA (`cp.async.bulk.tensor`), issued by one thread; full/empty mbarriers | every thread issues `cp.async` |
+| Buffers | 2 × 32 KB A/B stages + 2 × 16 KB scale buffers = 96 KB | 4 × 18 KB stages = 72 KB |
+| Swizzle | TMA 128B for A/B, 64B for scales | XOR `chunk ^ ((row >> 1) & 3)` |
+| Registers | 220, no spills | 180, no spills |
+| Requires | K % 256 == 0, 16-byte aligned operands | K % 128 == 0 |
+
+Below K = 1024 the cp.async loop is used: the 2-stage TMA loop needs a few k-tiles to reach steady
+state (8192×3072×768: 273 vs 268 TFLOPS).
+
+**Epilogue** (`finish_tile`): `alpha = gdec_A · gdec_B` in fp32, then a bf16 or fp32 store, or
+`D += alpha·acc` into an existing fp32 tensor (`accumulate=True`, used by fused wgrad accumulation).
+The add is two separate IEEE ops (no FMA contraction), so it is bit-identical to autograd's
+`grad + dW`. The old values of one m16 row group are loaded together before any store: a
+load-add-store loop serialized 32 memory latencies per warp and made the fused version slower than
+the separate add it replaced.
+
+### 4.1 Closing the gap to cuBLASLt (v0.3)
+
+v0.2's cp.async loop reached about 86% of cuBLASLt's NVFP4 kernel on long-K shapes. With GPU
+performance counters (Nsight Compute, at its locked ~1.05 GHz clock, so power limits don't
+interfere), 8192³ showed:
+
+| Kernel | Time | Tensor pipe active | L2 requests | Main stalls |
+|---|---|---|---|---|
+| cuBLASLt (CUTLASS `128x128x256`, 384 threads) | 3.4–3.5 ms | 90% | 39 M | math-pipe throttle, sleeping |
+| v0.2 cp.async loop | 5.4 ms | 56% | 116 M | MIO throttle (shared-memory instruction queue), wait |
+| TMA loop, first version | 5.3 ms | 57% | 74 M | branch resolving (spinning waits), long scoreboard |
+| + per-lane swizzled addresses, compile-time stage index, no by-reference lambdas | 4.85 ms | 62% | | |
+| *experiment: scale loads disabled (wrong results)* | *4.05 ms* | *77%* | | |
+| **+ scales loaded 4 k-tiles at a time (final)** | **4.4–4.55 ms** | **69%** | **48 M** | wait |
+
+What mattered, in order:
+
+1. **TMA instead of per-thread copies.** The cp.async loop issued 5 copy instructions per thread per
+   k-tile, which saturated the MIO queue that `ldmatrix` also needs.
+2. **Scale-factor traffic.** One k-tile's scales are a 16-byte slice of each of 128 rows (the scale
+   tensor is row-major `[rows, K/16]`), so their TMA boxes cost as many L2 requests as the 16 KB of
+   data and fetch half-empty sectors. Disabling them (an experiment with wrong results) recovered 18%
+   of the kernel time. Loading 64-byte rows (4 k-tiles) into separate double-buffered scale buffers
+   with their own mbarrier cuts those requests 4×.
+3. **Register budget.** A ninth (producer) warp puts 3 warps on one scheduler, which caps every
+   thread at 168 registers (3 × 32 × R ≤ 16K per scheduler). The MMA warps then spilled, and ptxas
+   moved each k-step's `ldmatrix` next to its MMAs, undoing the fragment double-buffering.
+   `setmaxnreg` would rebalance this (it compiles for sm_120a), but ptxas drops it ("ignored to
+   maintain compatibility into extern call") because taking the address of a `__grid_constant__`
+   tensor map inserts a call. So there is no producer warp: thread 0 issues the TMA copies once a
+   stage's empty barrier completes, and the 8 MMA warps get up to 255 registers.
+4. **Local-memory traffic.** Lambdas capturing locals by reference forced those locals onto the
+   stack (`LDL` in the main loop); the loop now uses plain functions and precomputed per-lane
+   addresses, with the stage index a template parameter.
+5. **Waiting warps sleep:** `mbarrier.try_wait` with a suspend-time hint, not a spin loop.
+
+**Robustness.** Lane 0 of warp 0 refills stages, so it can wait on an empty barrier while the rest
+of its warp moves on to `ldmatrix` / `mma.sync`, which are `.aligned` (the whole warp must execute
+them together). Independent thread scheduling doesn't guarantee reconvergence after such a branch,
+so an explicit `__syncwarp()` follows every divergent refill and barrier arrival. Without it, a
+d=2048 training run hung after ~600 steps (surfacing in WSL as "CUDA error: unknown error", i.e. a
+display-driver watchdog reset). In addition, every barrier wait is bounded: after 1 s (below the
+2 s Windows watchdog) it executes `trap`, so a pipeline bug fails as an ordinary CUDA error instead
+of a driver reset.
+
+Measured the same and dropped: four stages of 128-deep k-tiles in the same 96 KB (4.44 vs 4.55 ms),
+releasing a stage right after its last `ldmatrix` instead of after its MMAs, and B-reuse or
+serpentine MMA orders. The remaining locked-clock gap (69% vs 90% tensor-pipe activity with the same
+`ldmatrix` count as cuBLASLt, so the same warp tiling) is in instruction scheduling: the top stall
+is "wait", fixed-latency dependencies between tensor instructions.
+
+**At real clocks the gap is closed.** Training runs at the 175 W board limit, where kernels compete
+for power rather than issue slots. There the TMA loop measures 404–433 TFLOPS on long-K shapes, equal
+to or above cuBLASLt (401–426), and it stays far ahead on short K (RESULTS.md §1).
+
+### 4.2 Split-K for small output grids
+
+A wgrad GEMM with a small M×N, such as the 768×768 attention projection at d=768 (36 CTA tiles on 82
+SMs), leaves most of the GPU idle. With `splits = S`, CTA z covers k-tiles
+`[KT·z/S, KT·(z+1)/S)` and writes its fp32 partial to a workspace; the **last CTA of each tile to
+arrive** (atomic counter) sums all S partials in split order 0..S−1 and runs the normal epilogue.
+
+- **Deterministic:** the sum order doesn't depend on arrival order. Unsplit, the TMA and cp.async
+  loops are bit-identical to each other; split results differ from unsplit only by fp32 reassociation.
+- **Accumulate stays exact:** `old + alpha · Σ partials` uses the same ops as the unsplit epilogue, so
+  fused wgrad accumulation remains bit-identical to autograd.
+- **When:** only for grids that leave more than half the SMs idle, into as many splits as still fit
+  in one wave (≥ 8 k-tiles each). On this power-limited laptop GPU a partly idle GPU clocks its busy
+  SMs higher (36 CTAs reached 6.4 TFLOPS per SM vs about 5.0 with all SMs busy), so splitting into a
+  second wave never paid off. For 768×768×8192, two splits cut the kernel from 41.7 to 37.5 µs
+  under the profiler and lift it from 212 to 266 TFLOPS in the benchmark (RESULTS.md §1); in the
+  d=768 block step that is about 1% of the step.
+- `NVFP4_GEMM_SPLITS=1` disables automatic splitting (for ablations).
+
+### 4.3 Fragment layouts, swizzles, bounds
 
 **Fragment layouts.** These come from CUTLASS `MMA_Traits<SM120_16x8x64_TN_VS>` and were confirmed
 on the GPU by the GEMM tests. `g = lane / 4`, `t = lane % 4`.
@@ -180,12 +298,14 @@ on the GPU by the GEMM tests. `g = lane / 4`, `t = lane % 4`.
   - `tests/test_gemm_cuda.py::test_varied_block_scales` checks that every scale byte reaches the
     right block. It uses per-block magnitudes spanning six orders of magnitude.
 
-**Shared-memory swizzle.** Rows are 64 bytes, made of four 16-byte chunks. The swizzle is
-`chunk ^ ((row >> 1) & 3)`, which puts the eight row addresses of every `ldmatrix` phase on
-distinct banks.
+**Shared-memory swizzles.** In both loops the swizzle term of every row a lane addresses is a
+per-lane constant, so the eight row addresses of every `ldmatrix` phase land on distinct banks:
+`chunk ^ (row & 7)` for 128-byte rows (TMA 128B swizzle) and `chunk ^ ((row >> 1) & 3)` for 64-byte
+rows.
 
-**Bounds.** `M` and `N` can be any size: loads use zero-filled `cp.async` and stores are guarded.
-`K` must be a multiple of 128. `NVFP4Linear` zero-pads the token dimension for wgrad.
+**Bounds.** `M` and `N` can be any size: TMA zero-fills out-of-bounds rows, the cp.async loop uses
+zero-filled copies, and stores are guarded. `K` must be a multiple of 128 (256 for the TMA loop).
+`NVFP4Linear` zero-pads the token dimension for wgrad.
 
 ## 5. Verification
 
@@ -194,7 +314,9 @@ distinct banks.
 | Format spec | `tests/test_reference.py` (CPU, in CI) | RNE ties, saturation, SNR, 2D transpose invariance, RHT orthogonality, SR unbiasedness |
 | Quantizer | `tests/test_quantize_cuda.py` | **bit-exact** vs reference: bf16/fp32, transpose, 2D, SR, RHT, edge values, every E2M1 rounding tie, E4M3 scale ties, −0 |
 | Dual quantizer | `tests/test_quantize_dual_cuda.py` | **bit-exact** vs `reference.quantize_dual` for all 6 configurations × 7 shapes × 2 dtypes; == two separate calls; 2D col == exact transpose |
-| GEMM | `tests/test_gemm_cuda.py` | vs fp64 reference: max error ≤ 1e-5 · max\|ref\|, ragged shapes, extreme scales |
+| GEMM | `tests/test_gemm_cuda.py` | vs fp64 reference: max error ≤ 1e-5 · max\|ref\|, ragged shapes, extreme scales; TMA loop == cp.async loop bit for bit; split-K deterministic across runs, accumulate == add |
+| Fused producers | `tests/test_fused_producers_cuda.py` | **bit-exact** vs reference LayerNorm / GELU / GELU-backward + `quantize_dual` (4 configurations × 5 shapes × 2 dtypes); LayerNorm statistics vs fp64 |
+| Fused sub-blocks | `tests/test_fused_modules.py` | forward == explicit op composition bit for bit; every gradient's cosine with fp32 ≥ the unfused NVFP4 path's − 0.01; seeded determinism; partial gradients; fused wgrad accumulation |
 | Layer | `tests/test_linear.py` | CUDA == emulated recipe (same seeds); cosine with full precision > 0.97–0.98; SR noise averages out; only NVFP4 tensors saved for backward (exact byte count); no-grad / frozen-weight / no-input-grad paths; fused wgrad accumulation == autograd bit for bit |
 | Hardware ISA | CI `cuda-compile` job | `OMMA.SF.16864...UE4M3.4X` present in SASS |
 | End to end | `experiments/train_gpt.py` | loss curves vs BF16 (see [RESULTS.md](RESULTS.md)) |
@@ -203,19 +325,21 @@ Every benchmark checks correctness against the reference before it times anythin
 
 ## 6. Known limitations and next steps
 
-Done in v0.2: a single fused read per operand (§3.1), NVFP4-saved activations, and in-place wgrad
-accumulation (opt-in).
+Done in v0.3: the TMA GEMM main loop (§4.1), split-K (§4.2) and LayerNorm/GELU fused into
+quantization (§3.4). Done in v0.2: one fused read per operand, NVFP4-saved activations, in-place wgrad
+accumulation.
 
-1. **Quantization is not fused into the producing op.** Each operand still costs an amax pass plus a
-   quantize pass over a tensor that the preceding LayerNorm, GELU or attention just wrote. Fusing
-   amax and quantization into those producers would remove most of the remaining ~0.6 ms per block
-   step at d=768.
-2. **Stochastic rounding is ALU-bound.** It needs two 32-bit hashes per element, because sm_120a has
+1. **Locked-clock GEMM efficiency.** At equal clocks the TMA loop keeps the tensor pipe 69% busy vs
+   cuBLASLt's 90%; the difference is instruction scheduling inside the MMA warps (§4.1). It doesn't
+   show at this laptop's power limit, but it would on a GPU with more power headroom (a desktop RTX
+   5090). A tile-contiguous scale layout, which is what cuBLASLt's "blocked" scale format provides,
+   would remove the rest of the scale traffic; it changes the NVFP4 tensor format, so it was left out.
+2. **Attention-side producers.** The attention output (the projection's input) and the residual adds
+   are not fused; attention itself is PyTorch's BF16 SDPA.
+3. **Stochastic rounding is ALU-bound.** It needs two 32-bit hashes per element, because sm_120a has
    no `cvt.rs`. A cheaper generator, such as one hash per two elements, would need a spec change.
-3. **Large-K GEMM efficiency.** The kernel reaches about 85% of cuBLASLt NVFP4 on long-K shapes, and
-   beats it on short K. Candidates: 128×256 tiles, warp-specialized producer warps, stream-K.
-4. **wgrad with a small M×N** has no split-K yet. At d=768, the 768×768 projection wgrad fills only
-   36 CTAs on 82 SMs.
-5. **Weight quantization is redone per micro-batch.** It could be cached per optimizer step, but a
-   safe invalidation rule is needed: `param.data` writes don't bump `_version`.
+4. **Weight quantization is redone per micro-batch** (about 0.5 ms per block step at d=2048). It
+   could be cached per optimizer step, but a safe invalidation rule is needed: `param.data` writes
+   don't bump `_version`.
+5. **Fused sub-blocks** cover pre-LN blocks with bias-free linears and tanh-GELU.
 6. **Platform.** Linux/WSL2 only. The native Windows build hasn't been tried.

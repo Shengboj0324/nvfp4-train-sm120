@@ -243,16 +243,17 @@ torch::Tensor nvfp4_gemm(torch::Tensor a, torch::Tensor sfa, torch::Tensor gdec_
   int s = static_cast<int>(splits);
   if (s == 0) s = choose_splits(tiles_m * tiles_n, KT, at::cuda::getCurrentDeviceProperties()->multiProcessorCount);
   s = std::max(1, std::min(s, KT));
-  torch::Tensor ws, counters;
-  if (s > 1) {
-    ws = torch::empty({s, M, N}, a.options().dtype(at::kFloat));
-    counters = torch::zeros({tiles_m * tiles_n}, a.options().dtype(at::kInt));
+  torch::Tensor ws;
+  auto stream = at::cuda::getCurrentCUDAStream();
+  if (s > 1) {  // one allocation: fp32 partials, then the arrival counters (zeroed here, self-resetting)
+    const int64_t plane = static_cast<int64_t>(s) * M * N, tiles = static_cast<int64_t>(tiles_m) * tiles_n;
+    ws = torch::empty({plane + tiles}, a.options().dtype(at::kFloat));
     p.ws = ws.data_ptr<float>();
-    p.counters = counters.data_ptr<int>();
+    p.counters = reinterpret_cast<int*>(p.ws + plane);
     p.splits = s;
+    C10_CUDA_CHECK(cudaMemsetAsync(p.counters, 0, tiles * sizeof(int), stream));
   }
   const dim3 grid(tiles_n, tiles_m, s);
-  auto stream = at::cuda::getCurrentCUDAStream();
   const bool fp32 = out_dtype == at::kFloat;
   if (!(use_tma && launch_tma(p, fp32, accumulate, grid, stream))) {
     TORCH_CHECK(impl != 2, "TMA descriptor creation failed");

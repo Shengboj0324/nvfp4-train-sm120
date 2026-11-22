@@ -2,10 +2,11 @@
 
 **4-bit (NVFP4) training on consumer Blackwell GPUs (RTX 50-series, `sm_120`).**
 
-The repository contains block-scaled FP4 tensor-core GEMMs, bit-exact fused quantizers that emit
-an operand and its transpose in one pass (with 16-point random Hadamard transform and stochastic
-rounding), and a drop-in `NVFP4Linear` that runs the forward, input-gradient and weight-gradient
-GEMMs in NVFP4 and saves only 4-bit operands for backward.
+The repository contains block-scaled FP4 tensor-core GEMMs (a TMA-fed main loop plus split-K),
+bit-exact fused quantizers that emit an operand and its transpose in one pass (with 16-point random
+Hadamard transform and stochastic rounding, and with LayerNorm / GELU computed inside the
+quantizer), and drop-in layers that run the forward, input-gradient and weight-gradient GEMMs in
+NVFP4 and save only 4-bit operands for backward.
 
 Consumer Blackwell has hardware FP4 tensor cores, but its programming model differs from datacenter
 Blackwell: warp-level `mma.sync` instead of `tcgen05`, no tensor memory, and about 99 KB of shared
@@ -18,14 +19,14 @@ Full details and raw data are in [docs/RESULTS.md](docs/RESULTS.md).
 
 | | |
 |---|---|
-| NVFP4 GEMM throughput | **264–362 TFLOPS**: **3.1–4.1× BF16 cuBLAS**. Faster than cuBLASLt NVFP4 on short-K shapes, about 86% of it on the longest K |
-| Fused dual quantizer | operand + transposed operand in one pass: **1.5–2.4×** faster than two separate quantizations |
-| Transformer block fwd+bwd | **1.66× (d=768) → 2.15× (d=2048) → 2.54× (d=4096)** vs BF16, with 9–10% less memory |
-| GPT-507M (d=2048) pretraining | val loss **1.6937 vs 1.6786** BF16 (+0.9%), **1.56× tokens/s, −36% GPU energy** |
-| GPT-124M (d=768) pretraining, 49M tokens | val loss **1.5092 vs 1.4892** BF16 (constant +0.02 gap, no divergence), **+24% tokens/s, −20% GPU energy** |
-| Correctness | quantizers **bit-exact** vs the reference spec; GEMM = fp64 reference to ~1e-7; 164 tests |
+| NVFP4 GEMM throughput | **266–410 TFLOPS**: **3.2–4.7× BF16 cuBLAS**; on par with cuBLASLt NVFP4 on long K (96–121%), up to 2× faster on short K |
+| Fused dual quantizer | operand + transposed operand in one pass: **1.6–2.3×** faster than two separate quantizations |
+| Transformer block fwd+bwd | **1.80× (d=768) → 2.42× (d=2048) → 3.10× (d=4096)** vs BF16, with 7–14% less memory |
+| GPT-507M (d=2048) pretraining | val loss **1.6954 vs 1.6786** BF16 (+1.0%), **1.62× tokens/s, −39% GPU energy** |
+| GPT-124M (d=768) pretraining, 49M tokens | val loss **1.5062 vs 1.4892** BF16 (constant ~0.017 gap, no divergence), **+27% tokens/s, −22% GPU energy** |
+| Correctness | quantizers and fused LayerNorm/GELU **bit-exact** vs the reference spec; GEMM = fp64 reference to ~1e-7; 271 tests |
 
-![loss curves](experiments/results/v0.2_wide/loss.png)
+![loss curves](experiments/results/v0.3_wide/loss.png)
 
 ## Quick start (WSL2 or Linux, RTX 50-series)
 
@@ -44,6 +45,11 @@ y = layer(torch.randn(8192, 4096, device="cuda", dtype=torch.bfloat16))
 # or convert an existing model's block linears, keeping the last blocks in BF16:
 convert_linears(model.blocks, skip=("10.", "11."))
 
+# pre-LN sub-blocks with LayerNorm / GELU fused into the NVFP4 quantizers
+from nvfp4.fused import layernorm_linear, layernorm_mlp
+qkv = layernorm_linear(x, block.ln1, block.qkv)           # block.qkv: NVFP4Linear (bias-free)
+out = layernorm_mlp(x, block.ln2, block.fc1, block.fc2)   # fc2(gelu_tanh(fc1(ln2(x))))
+
 # low-level ops
 from nvfp4 import quantize, gemm
 qa = quantize(a)                                          # NVFP4Tensor(data, scales, gdec)
@@ -59,16 +65,19 @@ runs the same recipe through the pure-PyTorch reference.
 ## Layout
 
 ```
-csrc/quantize_dual.cu  fused BF16/FP32 -> NVFP4 rowwise + transposed (RHT, SR, 16x16 2D) in one pass
+csrc/quantize_dual.cu  fused BF16/FP32 -> NVFP4 rowwise + transposed (RHT, SR, 16x16 2D) in one pass,
+                       optionally applying LayerNorm / GELU / GELU-backward while loading
 csrc/quantize.cu       single-output quantizer (rowwise / transposed / 16x16 2D, RHT, stochastic rounding)
-csrc/gemm.cu           mma.sync kind::mxf4nvf4 block-scaled TN GEMM, 4-stage cp.async pipeline,
-                       optional fused fp32 accumulate (D += A @ B^T) for wgrad
+csrc/gemm_tma.cu       mma.sync kind::mxf4nvf4 block-scaled TN GEMM, TMA + mbarrier pipeline (K >= 1024)
+csrc/gemm.cu           cp.async GEMM main loop (short K / fallback) and host dispatch
+csrc/gemm_common.cuh   shared epilogue: deterministic split-K, fused fp32 accumulate (D += A @ B^T)
 nvfp4/reference.py     executable spec of the format and recipe (pure PyTorch)
 nvfp4/linear.py        NVFP4Linear autograd layer + convert_linears
+nvfp4/fused.py         layernorm_linear / layernorm_mlp with fused producers
 tests/                 bit-exact / reference tests (GPU tests auto-skip without sm_120)
 bench/                 GEMM, quantizer and transformer-block benchmarks (+ results/)
 experiments/           TinyStories GPT pretraining: BF16 vs NVFP4 (+ results/)
-tools/guard.py         runs jobs under GPU temperature / memory / host-RAM limits
+tools/guard.py         runs jobs under GPU temperature / memory / host-RAM limits, with cooldowns
 docs/                  DESIGN.md, RESULTS.md, research/ (why this project exists)
 ```
 
@@ -76,8 +85,10 @@ docs/                  DESIGN.md, RESULTS.md, research/ (why this project exists
 
 This is a research-grade implementation, verified on one GPU. The known gaps are listed in
 [docs/DESIGN.md §6](docs/DESIGN.md#6-known-limitations-and-next-steps):
-- quantization isn't fused into producer ops (LayerNorm, GELU), so activations still make one BF16 round trip;
-- there's no split-K for small-M/N, long-K GEMMs;
+- at equal clocks the GEMM keeps the tensor pipe 69% busy vs cuBLASLt's 90% (the gap disappears at
+  this laptop's power limit, but would show on a GPU with more power headroom);
+- the fused sub-blocks cover pre-LN blocks with bias-free linears and tanh-GELU; attention-side
+  producers aren't fused;
 - hardware stochastic rounding (`cvt.rs`) isn't available on sm_120a, so SR runs in software;
 - only Linux/WSL2 is supported.
 

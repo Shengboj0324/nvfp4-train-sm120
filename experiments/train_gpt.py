@@ -205,6 +205,12 @@ def main():
                 print("non-finite loss, stopping", flush=True)
                 break
     log.write(json.dumps({"done": True, "total_s": time.perf_counter() - t_start}) + "\n")
+    log.close()
+    # Wind down explicitly (finish queued work, release cached memory) rather than tearing down a busy
+    # CUDA context at interpreter exit; on this laptop a run once ended in a display-driver crash.
+    torch.cuda.synchronize()
+    del model, opt
+    torch.cuda.empty_cache()
 
 
 if __name__ == "__main__":
