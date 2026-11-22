@@ -7,7 +7,7 @@ std::vector<torch::Tensor> nvfp4_quantize_dual(torch::Tensor x, bool do_row, boo
                                                bool col_rht, int64_t rht_seed, int64_t col_pad);
 torch::Tensor nvfp4_gemm(torch::Tensor a, torch::Tensor sfa, torch::Tensor gdec_a, torch::Tensor b, torch::Tensor sfb,
                          torch::Tensor gdec_b, c10::ScalarType out_dtype, c10::optional<torch::Tensor> out,
-                         bool accumulate);
+                         bool accumulate, int64_t impl, int64_t splits);
 
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
   m.doc() = "NVFP4 kernels for sm_120 (consumer Blackwell)";
@@ -21,5 +21,5 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
         py::arg("col_rht") = false, py::arg("rht_seed") = 0, py::arg("col_pad") = 16);
   m.def("gemm", &nvfp4_gemm, "NVFP4 TN GEMM: D = A @ B^T", py::arg("a"), py::arg("sfa"), py::arg("gdec_a"),
         py::arg("b"), py::arg("sfb"), py::arg("gdec_b"), py::arg("out_dtype"), py::arg("out") = py::none(),
-        py::arg("accumulate") = false);
+        py::arg("accumulate") = false, py::arg("impl") = 0, py::arg("splits") = 0);
 }

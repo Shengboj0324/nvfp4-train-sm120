@@ -4,50 +4,48 @@
 //
 // Hardware path: warp-level block-scaled MMA
 //   mma.sync.aligned.kind::mxf4nvf4.block_scale.scale_vec::4X.m16n8k64.row.col.f32.e2m1.e2m1.f32.ue4m3
-// (sm_120 has no wgmma / tcgen05; this is its 5th-gen tensor-core interface). Fragment layouts follow
-// CUTLASS cute::MMA_Traits<SM120_16x8x64_TN_VS> and are verified by tests/test_gemm_cuda.py.
+// (sm_120 has no wgmma / tcgen05; this is its 5th-gen tensor-core interface).
 //
-// Tiling: CTA 128x128x128, 8 warps (2 along M x 4 along N, 64x32 per warp), 4-stage cp.async
-// pipeline, 18 KB per stage = 72 KB shared memory (sm_120 allows ~99 KB per block).
+// Two main loops share one epilogue (gemm_common.cuh):
+//   - gemm_tma.cu: TMA producer warp + 8 MMA warps, 128x128x256 tiles, 2 stages (default when K % 256 == 0)
+//   - this file:   all-threads cp.async loop, 128x128x128 tiles, 4 stages, 72 KB (fallback for any K % 128 == 0)
+// Small output grids are split along K (deterministic in-kernel reduction) to fill the GPU.
 
 #include <ATen/cuda/CUDAContext.h>
 #include <c10/cuda/CUDAGuard.h>
-#include <cuda_bf16.h>
 #include <torch/extension.h>
 
 #include <cstdint>
 
+#include "gemm_common.cuh"
+
 namespace nvfp4 {
 namespace gemm {
 
-constexpr int BM = 128, BN = 128, BK = 128;  // BK in elements (64 bytes per row)
-constexpr int BKB = BK / 2;                  // bytes per row per k-tile
-constexpr int SFK = BK / 16;                 // scale bytes per row per k-tile (8)
+bool launch_tma(const Args& p, bool out_fp32, bool accumulate, dim3 grid, cudaStream_t stream);  // gemm_tma.cu
+bool tma_supported(const Args& p);
+int tma_k_tile();
+
+namespace legacy {
+
+constexpr int BK = 128;       // K elements per stage (64 bytes per row)
+constexpr int BKB = BK / 2;
+constexpr int SFK = BK / 16;  // 8 scale bytes per row
 #ifndef NVFP4_GEMM_STAGES
 #define NVFP4_GEMM_STAGES 4
 #endif
-#ifndef NVFP4_GEMM_MIN_BLOCKS
-#define NVFP4_GEMM_MIN_BLOCKS 1
-#endif
 constexpr int STAGES = NVFP4_GEMM_STAGES;
-constexpr int WARPS_M = 2, WARPS_N = 4;
-constexpr int WM = BM / WARPS_M, WN = BN / WARPS_N;  // 64 x 32
-constexpr int MI = WM / 16, NI = WN / 8;             // 4 x 4 MMA tiles per warp
-constexpr int THREADS = 32 * WARPS_M * WARPS_N;      // 256
+constexpr int THREADS = MMA_THREADS;
 
 constexpr int A_STAGE = BM * BKB;   // 8192
 constexpr int B_STAGE = BN * BKB;   // 8192
 constexpr int SFA_STAGE = BM * SFK; // 1024
 constexpr int SFB_STAGE = BN * SFK; // 1024
 constexpr int STAGE_BYTES = A_STAGE + B_STAGE + SFA_STAGE + SFB_STAGE;
-constexpr int SMEM_BYTES = STAGES * STAGE_BYTES;  // 73728
+constexpr int SMEM_BYTES = STAGES * STAGE_BYTES + 16;  // + split-K flag
 
 // 64-byte rows = four 16-byte chunks; XOR swizzle makes 8-row ldmatrix reads bank-conflict free.
 __device__ __forceinline__ int swz(int row, int chunk) { return row * BKB + ((chunk ^ ((row >> 1) & 3)) << 4); }
-
-__device__ __forceinline__ uint32_t smem_u32(const void* p) {
-  return static_cast<uint32_t>(__cvta_generic_to_shared(p));
-}
 
 __device__ __forceinline__ void cp_async16(uint32_t dst, const void* src, bool pred) {
   const int n = pred ? 16 : 0;  // src-size 0 => zero fill
@@ -60,34 +58,6 @@ __device__ __forceinline__ void cp_async8(uint32_t dst, const void* src, bool pr
 __device__ __forceinline__ void cp_async_commit() { asm volatile("cp.async.commit_group;\n" ::); }
 template <int N>
 __device__ __forceinline__ void cp_async_wait() { asm volatile("cp.async.wait_group %0;\n" ::"n"(N)); }
-
-__device__ __forceinline__ void ldmatrix_x4(uint32_t addr, uint32_t& r0, uint32_t& r1, uint32_t& r2, uint32_t& r3) {
-  asm volatile("ldmatrix.sync.aligned.m8n8.x4.shared.b16 {%0,%1,%2,%3}, [%4];\n"
-               : "=r"(r0), "=r"(r1), "=r"(r2), "=r"(r3)
-               : "r"(addr));
-}
-
-__device__ __forceinline__ void mma_nvfp4(float (&d)[4], const uint32_t (&a)[4], const uint32_t (&b)[2], uint32_t sfa,
-                                          uint32_t sfb) {
-  const uint16_t zero = 0;  // byte-id / thread-id selectors (layout chosen so 0 is correct)
-  asm volatile(
-      "mma.sync.aligned.kind::mxf4nvf4.block_scale.scale_vec::4X.m16n8k64.row.col.f32.e2m1.e2m1.f32.ue4m3 "
-      "{%0,%1,%2,%3}, {%4,%5,%6,%7}, {%8,%9}, {%0,%1,%2,%3}, {%10}, {%11,%12}, {%13}, {%14,%15};\n"
-      : "+f"(d[0]), "+f"(d[1]), "+f"(d[2]), "+f"(d[3])
-      : "r"(a[0]), "r"(a[1]), "r"(a[2]), "r"(a[3]), "r"(b[0]), "r"(b[1]), "r"(sfa), "h"(zero), "h"(zero), "r"(sfb),
-        "h"(zero), "h"(zero));
-}
-
-struct Args {
-  const uint8_t* a;    // [M, K/2]
-  const uint8_t* b;    // [N, K/2]
-  const uint8_t* sfa;  // [M, K/16]
-  const uint8_t* sfb;  // [N, K/16]
-  const float* gdec_a;
-  const float* gdec_b;
-  void* d;  // [M, N] (ldd = N)
-  int M, N, K;
-};
 
 __device__ __forceinline__ void load_stage(const Args& p, uint8_t* smem, int stage, int kt, int m0, int n0) {
   uint8_t* sa = smem + stage * STAGE_BYTES;
@@ -126,15 +96,17 @@ __device__ __forceinline__ void load_stage(const Args& p, uint8_t* smem, int sta
   }
 }
 
-// kAccum (fp32 output only): D += alpha * A @ B^T, e.g. accumulating a weight gradient in place.
 template <typename OutT, bool kAccum>
-__global__ void __launch_bounds__(THREADS, NVFP4_GEMM_MIN_BLOCKS) nvfp4_gemm_kernel(Args p) {
+__global__ void __launch_bounds__(THREADS, 1) nvfp4_gemm_kernel(Args p) {
   extern __shared__ __align__(128) uint8_t smem[];
   const int lane = threadIdx.x & 31;
   const int warp = threadIdx.x >> 5;
   const int wm = warp / WARPS_N, wn = warp % WARPS_N;
   const int m0 = blockIdx.y * BM, n0 = blockIdx.x * BN;
   const int KT = p.K / BK;
+  const int kt0 = static_cast<int>((static_cast<int64_t>(KT) * blockIdx.z) / p.splits);
+  const int kt1 = static_cast<int>((static_cast<int64_t>(KT) * (blockIdx.z + 1)) / p.splits);
+  const int nk = kt1 - kt0;
 
   float acc[MI][NI][4];
 #pragma unroll
@@ -146,20 +118,20 @@ __global__ void __launch_bounds__(THREADS, NVFP4_GEMM_MIN_BLOCKS) nvfp4_gemm_ker
 
 #pragma unroll
   for (int s = 0; s < STAGES - 1; ++s) {
-    if (s < KT) load_stage(p, smem, s, s, m0, n0);
+    if (s < nk) load_stage(p, smem, s, kt0 + s, m0, n0);
     cp_async_commit();
   }
 
   const int g = lane >> 2;  // groupID
-  for (int kt = 0; kt < KT; ++kt) {
+  for (int it = 0; it < nk; ++it) {
     cp_async_wait<STAGES - 2>();
     __syncthreads();
     {
-      const int nk = kt + STAGES - 1;
-      if (nk < KT) load_stage(p, smem, nk % STAGES, nk, m0, n0);
+      const int nit = it + STAGES - 1;
+      if (nit < nk) load_stage(p, smem, nit % STAGES, kt0 + nit, m0, n0);
       cp_async_commit();
     }
-    const uint8_t* sa = smem + (kt % STAGES) * STAGE_BYTES;
+    const uint8_t* sa = smem + (it % STAGES) * STAGE_BYTES;
     const uint8_t* sb = sa + A_STAGE;
     const uint8_t* ssfa = sb + B_STAGE;
     const uint8_t* ssfb = ssfa + SFA_STAGE;
@@ -191,78 +163,12 @@ __global__ void __launch_bounds__(THREADS, NVFP4_GEMM_MIN_BLOCKS) nvfp4_gemm_ker
     }
   }
   cp_async_wait<0>();
-
-  float alpha = (*p.gdec_a) * (*p.gdec_b);
-  const int tig = lane & 3;
-  if constexpr (kAccum) {
-    // acc <- D_old + alpha * acc. Loads for one m16 row group are issued together (a load cannot be
-    // moved past a store to the same array, so a load-add-store loop would serialize their latency).
-#pragma unroll
-    for (int i = 0; i < MI; ++i) {
-      float2 old[NI][2];
-#pragma unroll
-      for (int j = 0; j < NI; ++j) {
-        const int col = n0 + wn * WN + j * 8 + 2 * tig;
-#pragma unroll
-        for (int h = 0; h < 2; ++h) {
-          const int row = m0 + wm * WM + i * 16 + g + 8 * h;
-          const float* src = reinterpret_cast<const float*>(p.d) + static_cast<int64_t>(row) * p.N + col;
-          old[j][h] = make_float2(0.0f, 0.0f);
-          if (row < p.M) {
-            if (col + 1 < p.N && (p.N % 2 == 0)) {
-              old[j][h] = *reinterpret_cast<const float2*>(src);
-            } else {
-              if (col < p.N) old[j][h].x = src[0];
-              if (col + 1 < p.N) old[j][h].y = src[1];
-            }
-          }
-        }
-      }
-#pragma unroll
-      for (int j = 0; j < NI; ++j)
-#pragma unroll
-        for (int h = 0; h < 2; ++h) {
-          // separate rn ops (no FMA contraction): bit-identical to autograd's grad + (alpha * acc)
-          acc[i][j][2 * h] = __fadd_rn(old[j][h].x, __fmul_rn(acc[i][j][2 * h], alpha));
-          acc[i][j][2 * h + 1] = __fadd_rn(old[j][h].y, __fmul_rn(acc[i][j][2 * h + 1], alpha));
-        }
-    }
-    alpha = 1.0f;
-  }
-#pragma unroll
-  for (int i = 0; i < MI; ++i) {
-#pragma unroll
-    for (int j = 0; j < NI; ++j) {
-      const int col = n0 + wn * WN + j * 8 + 2 * tig;
-#pragma unroll
-      for (int h = 0; h < 2; ++h) {
-        const int row = m0 + wm * WM + i * 16 + g + 8 * h;
-        if (row >= p.M) continue;
-        const float v0 = acc[i][j][2 * h] * alpha, v1 = acc[i][j][2 * h + 1] * alpha;
-        OutT* out = reinterpret_cast<OutT*>(p.d) + static_cast<int64_t>(row) * p.N + col;
-        if constexpr (std::is_same_v<OutT, float>) {
-          if (col + 1 < p.N && (p.N % 2 == 0)) {
-            *reinterpret_cast<float2*>(out) = make_float2(v0, v1);
-          } else {
-            if (col < p.N) out[0] = v0;
-            if (col + 1 < p.N) out[1] = v1;
-          }
-        } else {
-          if (col + 1 < p.N && (p.N % 2 == 0)) {
-            *reinterpret_cast<__nv_bfloat162*>(out) = __floats2bfloat162_rn(v0, v1);
-          } else {
-            if (col < p.N) out[0] = __float2bfloat16_rn(v0);
-            if (col + 1 < p.N) out[1] = __float2bfloat16_rn(v1);
-          }
-        }
-      }
-    }
-  }
+  finish_tile<OutT, kAccum>(p, acc, m0, n0, wm, wn, lane, reinterpret_cast<int*>(smem + STAGES * STAGE_BYTES));
 }
 
 // One static per instantiation: each kernel needs its own max-dynamic-smem attribute.
 template <typename OutT, bool kAccum>
-void launch_gemm(const Args& p, dim3 grid, cudaStream_t stream) {
+void launch(const Args& p, dim3 grid, cudaStream_t stream) {
   static const bool attr = (cudaFuncSetAttribute(nvfp4_gemm_kernel<OutT, kAccum>,
                                                  cudaFuncAttributeMaxDynamicSharedMemorySize, SMEM_BYTES),
                             true);
@@ -270,13 +176,36 @@ void launch_gemm(const Args& p, dim3 grid, cudaStream_t stream) {
   nvfp4_gemm_kernel<OutT, kAccum><<<grid, THREADS, SMEM_BYTES, stream>>>(p);
 }
 
+void launch_any(const Args& p, bool out_fp32, bool accumulate, dim3 grid, cudaStream_t stream) {
+  if (out_fp32) {
+    if (accumulate)
+      launch<float, true>(p, grid, stream);
+    else
+      launch<float, false>(p, grid, stream);
+  } else {
+    launch<__nv_bfloat16, false>(p, grid, stream);
+  }
+}
+
+}  // namespace legacy
+
+// Number of K splits for a grid of `tiles` CTAs with KT k-tiles each, on `sms` SMs at 1 CTA/SM.
+// Split only grids that leave more than half the SMs idle, into as many splits as still fit in one
+// wave (each keeping >= 8 k-tiles). Splitting into extra waves never paid off on the power-limited
+// laptop GPU: a partly idle GPU already runs its busy SMs at higher clocks (docs/RESULTS.md §1).
+int choose_splits(int tiles, int KT, int sms) {
+  if (2 * tiles > sms) return 1;
+  return std::max(1, std::min({sms / tiles, KT / 8, kMaxSplits}));
+}
+
 }  // namespace gemm
 }  // namespace nvfp4
 
 // D = A @ B^T (into a new tensor, or into `out`); with accumulate, out += A @ B^T (fp32 only).
+// impl: 0 = auto, 1 = cp.async loop, 2 = TMA loop (error if unsupported). splits: 0 = auto.
 torch::Tensor nvfp4_gemm(torch::Tensor a, torch::Tensor sfa, torch::Tensor gdec_a, torch::Tensor b, torch::Tensor sfb,
                          torch::Tensor gdec_b, c10::ScalarType out_dtype, c10::optional<torch::Tensor> out,
-                         bool accumulate) {
+                         bool accumulate, int64_t impl, int64_t splits) {
   using namespace nvfp4::gemm;
   for (auto* t : {&a, &sfa, &b, &sfb})
     TORCH_CHECK(t->is_cuda() && t->scalar_type() == at::kByte && t->dim() == 2 && t->is_contiguous(),
@@ -285,11 +214,13 @@ torch::Tensor nvfp4_gemm(torch::Tensor a, torch::Tensor sfa, torch::Tensor gdec_
   const int M = static_cast<int>(a.size(0)), N = static_cast<int>(b.size(0));
   const int K = static_cast<int>(a.size(1) * 2);
   TORCH_CHECK(b.size(1) * 2 == K, "A and B must have the same K");
-  TORCH_CHECK(K % BK == 0, "K (", K, ") must be a multiple of ", BK);
+  TORCH_CHECK(K % legacy::BK == 0, "K (", K, ") must be a multiple of ", legacy::BK);
   TORCH_CHECK(sfa.size(0) == M && sfa.size(1) == K / 16 && sfb.size(0) == N && sfb.size(1) == K / 16,
               "scale tensors must be [rows, K/16]");
   TORCH_CHECK(out_dtype == at::kBFloat16 || out_dtype == at::kFloat, "out_dtype must be bf16 or fp32");
   TORCH_CHECK(!accumulate || (out.has_value() && out_dtype == at::kFloat), "accumulate needs an fp32 `out`");
+  TORCH_CHECK(impl >= 0 && impl <= 2, "impl must be 0 (auto), 1 (cp.async) or 2 (TMA)");
+  TORCH_CHECK(splits >= 0 && splits <= kMaxSplits, "splits must be in [0, ", kMaxSplits, "]");
   const c10::cuda::CUDAGuard guard(a.device());
   torch::Tensor d;
   if (out.has_value()) {
@@ -302,16 +233,30 @@ torch::Tensor nvfp4_gemm(torch::Tensor a, torch::Tensor sfa, torch::Tensor gdec_
   }
   if (M == 0 || N == 0) return d;
   Args p{a.data_ptr<uint8_t>(), b.data_ptr<uint8_t>(), sfa.data_ptr<uint8_t>(), sfb.data_ptr<uint8_t>(),
-         gdec_a.data_ptr<float>(), gdec_b.data_ptr<float>(), d.data_ptr(), M, N, K};
-  dim3 grid((N + BN - 1) / BN, (M + BM - 1) / BM);
+         gdec_a.data_ptr<float>(), gdec_b.data_ptr<float>(), d.data_ptr(), nullptr, nullptr, M, N, K, 1};
+  // The 2-stage TMA loop needs a few k-tiles to reach steady state; below K = 1024 the 4-stage cp.async
+  // loop with 128-deep tiles is as fast (8192x3072x768: 273 vs 268 TFLOPS).
+  const bool use_tma = impl == 2 || (impl == 0 && K >= 1024 && tma_supported(p));
+  TORCH_CHECK(impl != 2 || tma_supported(p), "TMA GEMM needs K % 256 == 0 and 16-byte aligned operands");
+  const int KT = K / (use_tma ? tma_k_tile() : legacy::BK);
+  const int tiles_n = (N + BN - 1) / BN, tiles_m = (M + BM - 1) / BM;
+  int s = static_cast<int>(splits);
+  if (s == 0) s = choose_splits(tiles_m * tiles_n, KT, at::cuda::getCurrentDeviceProperties()->multiProcessorCount);
+  s = std::max(1, std::min(s, KT));
+  torch::Tensor ws, counters;
+  if (s > 1) {
+    ws = torch::empty({s, M, N}, a.options().dtype(at::kFloat));
+    counters = torch::zeros({tiles_m * tiles_n}, a.options().dtype(at::kInt));
+    p.ws = ws.data_ptr<float>();
+    p.counters = counters.data_ptr<int>();
+    p.splits = s;
+  }
+  const dim3 grid(tiles_n, tiles_m, s);
   auto stream = at::cuda::getCurrentCUDAStream();
-  if (out_dtype == at::kFloat) {
-    if (accumulate)
-      launch_gemm<float, true>(p, grid, stream);
-    else
-      launch_gemm<float, false>(p, grid, stream);
-  } else {
-    launch_gemm<__nv_bfloat16, false>(p, grid, stream);
+  const bool fp32 = out_dtype == at::kFloat;
+  if (!(use_tma && launch_tma(p, fp32, accumulate, grid, stream))) {
+    TORCH_CHECK(impl != 2, "TMA descriptor creation failed");
+    legacy::launch_any(p, fp32, accumulate, grid, stream);
   }
   C10_CUDA_KERNEL_LAUNCH_CHECK();
   return d;

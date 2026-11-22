@@ -68,14 +68,19 @@ def quantize_dual(x: torch.Tensor, *, row: bool = True, col: bool = True, block_
 
 
 def gemm(a: NVFP4Tensor, b: NVFP4Tensor, out_dtype: torch.dtype = torch.bfloat16, *,
-         out: torch.Tensor | None = None, accumulate: bool = False) -> torch.Tensor:
+         out: torch.Tensor | None = None, accumulate: bool = False, impl: str = "auto",
+         splits: int = 0) -> torch.Tensor:
     """D[M, N] = A[M, K] @ B[N, K]^T with both operands in NVFP4 (block-scaled tensor-core MMA).
 
     ``out`` writes into an existing contiguous [M, N] tensor; ``accumulate=True`` adds to it instead
     (fp32 only), e.g. to accumulate a weight gradient in place across micro-batches.
+    ``impl``: "auto" (TMA main loop when K % 256 == 0, else cp.async), "tma" or "cp.async".
+    ``splits``: number of K splits (0 = chosen from the grid size); the split-K reduction is
+    deterministic but sums in a different order than an unsplit GEMM.
     """
     if _C is None:
         raise RuntimeError("nvfp4 CUDA extension not built")
     if out is not None:
         out_dtype = out.dtype
-    return _C.gemm(a.data, a.scales, a.gdec, b.data, b.scales, b.gdec, out_dtype, out, accumulate)
+    impl_id = {"auto": 0, "cp.async": 1, "tma": 2}[impl]
+    return _C.gemm(a.data, a.scales, a.gdec, b.data, b.scales, b.gdec, out_dtype, out, accumulate, impl_id, splits)
