@@ -1,0 +1,45 @@
+name: ci
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+# GitHub-hosted runners have no GPU. CI therefore (1) runs the reference/emulation tests on CPU and
+# (2) proves the CUDA kernels compile for sm_120a with the CUDA 13 toolkit. Kernel correctness and
+# performance are verified on real sm_120 hardware with tools/check.sh (results in docs/RESULTS.md).
+jobs:
+  cpu-tests:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - name: Install CPU PyTorch
+        run: pip install torch --index-url https://download.pytorch.org/whl/cpu && pip install pytest numpy
+      - name: Install package (no CUDA extension)
+        run: NVFP4_SKIP_CUDA=1 pip install -e . --no-build-isolation
+      - name: Tests (GPU tests auto-skip)
+        run: pytest -q tests/ -rs
+
+  cuda-compile:
+    runs-on: ubuntu-latest
+    container: nvidia/cuda:13.0.2-devel-ubuntu22.04
+    steps:
+      - uses: actions/checkout@v4
+      - name: Python toolchain
+        run: |
+          apt-get update -qq
+          DEBIAN_FRONTEND=noninteractive apt-get install -y -qq python3.10-venv python3.10-dev ninja-build git
+          python3 -m venv /opt/venv
+          /opt/venv/bin/pip install -q -U pip setuptools wheel ninja numpy
+          /opt/venv/bin/pip install -q torch==2.14.1 --index-url https://download.pytorch.org/whl/cu130
+      - name: Build extension for sm_120a
+        run: MAX_JOBS=2 /opt/venv/bin/python setup.py build_ext --inplace 2>&1 | grep -E "error|registers|spill" || true; ls nvfp4/_C*.so
+      - name: Check the block-scaled MMA made it into SASS
+        run: |
+          # sm_120 SASS for mma.sync kind::mxf4nvf4.block_scale.scale_vec::4X (verified locally)
+          n=$(cuobjdump -sass nvfp4/_C*.so | grep -c "OMMA.SF.16864.F32.E2M1.E2M1.UE4M3.4X" || true)
+          echo "block-scaled FP4 MMA instructions in SASS: $n"
+          test "$n" -gt 0

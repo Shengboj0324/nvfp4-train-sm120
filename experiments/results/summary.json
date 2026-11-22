@@ -1,0 +1,54 @@
+{
+ "bf16": {
+  "final_val_loss": 1.4884385973215104,
+  "median_tok_per_s": 63290.05960852288,
+  "wall_s": 798.068112179,
+  "max_mem_gb": 10.118679523468018,
+  "nvfp4_linears": 0,
+  "completed": true,
+  "gpu_joules": 140244.9090000001,
+  "mean_gpu_w": 169.50073604060927,
+  "mean_sm_mhz": 2166.096446700508,
+  "max_gpu_temp_c": 77.0,
+  "joules_per_1k_tokens": 2.853289978027346
+ },
+ "nvfp4": {
+  "final_val_loss": 1.5064035415649415,
+  "median_tok_per_s": 70085.74861472071,
+  "wall_s": 718.2579838880001,
+  "max_mem_gb": 9.968777179718018,
+  "nvfp4_linears": 40,
+  "completed": true,
+  "gpu_joules": 119934.40000000005,
+  "mean_gpu_w": 169.87875354107655,
+  "mean_sm_mhz": 2190.3824362606233,
+  "max_gpu_temp_c": 76.0,
+  "joules_per_1k_tokens": 2.4400716145833345
+ },
+ "nvfp4_all": {
+  "final_val_loss": 1.5086741685867309,
+  "median_tok_per_s": 71531.17706671526,
+  "wall_s": 703.210750061,
+  "max_mem_gb": 9.943508625030518,
+  "nvfp4_linears": 48,
+  "completed": true,
+  "gpu_joules": 117511.59999999993,
+  "mean_gpu_w": 169.81445086705193,
+  "mean_sm_mhz": 2186.9450867052024,
+  "max_gpu_temp_c": 78.0,
+  "joules_per_1k_tokens": 2.390779622395832
+ },
+ "nvfp4_no_rht": {
+  "final_val_loss": 1.507535356283188,
+  "median_tok_per_s": 70526.0246272979,
+  "wall_s": 713.8904199980002,
+  "max_mem_gb": 9.968777179718018,
+  "nvfp4_linears": 40,
+  "completed": true,
+  "gpu_joules": 119257.70000000007,
+  "mean_gpu_w": 169.88276353276362,
+  "mean_sm_mhz": 2195.769230769231,
+  "max_gpu_temp_c": 77.0,
+  "joules_per_1k_tokens": 2.426304117838543
+ }
+}

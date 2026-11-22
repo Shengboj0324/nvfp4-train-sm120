@@ -1,279 +1,81 @@
-# TensorFlow SM120 Optimizations for RTX 50-Series GPUs
+# nvfp4-train-sm120
 
-[![Build Status](https://img.shields.io/badge/build-production--ready-brightgreen.svg)](https://github.com/tensorflow/tensorflow)
-[![CUDA](https://img.shields.io/badge/CUDA-12.8+-green.svg)](https://developer.nvidia.com/cuda-toolkit)
-[![Compute Capability](https://img.shields.io/badge/Compute%20Capability-sm__120-blue.svg)](https://developer.nvidia.com/cuda-gpus)
-[![TensorFlow](https://img.shields.io/badge/TensorFlow-2.10+-orange.svg)](https://tensorflow.org)
-[![Python](https://img.shields.io/badge/Python-3.9--3.13-blue.svg)](https://python.org)
-[![License](https://img.shields.io/badge/License-Apache%202.0-blue.svg)](LICENSE)
+**4-bit (NVFP4) training on consumer Blackwell GPUs (RTX 50-series, `sm_120`).**
 
-**The most comprehensive optimization suite for TensorFlow on RTX 50-series GPUs**, featuring native compute capability 12.0 (sm_120) support with advanced CUDA kernels, 5th generation Tensor Cores, and Flash Attention implementations.
+The repository contains block-scaled FP4 tensor-core GEMMs, bit-exact fused quantizers (with
+16-point random Hadamard transform and stochastic rounding), and a drop-in `NVFP4Linear` that runs
+the forward, input-gradient and weight-gradient GEMMs in NVFP4.
 
-## 🎯 What This Project Delivers
+Consumer Blackwell has hardware FP4 tensor cores, but its programming model differs from datacenter
+Blackwell: warp-level `mma.sync` instead of `tcgen05`, no tensor memory, and about 99 KB of shared
+memory. Mainstream training stacks don't yet use it for training. These kernels are written for
+that model from the ground up (see [docs/DESIGN.md](docs/DESIGN.md)).
 
-This project provides **production-ready TensorFlow optimizations** specifically engineered for RTX 50-series GPUs, delivering:
+## Results on an RTX 5090 Laptop GPU
 
-### 🚀 **Performance Gains**
-- **30% faster** matrix multiplication vs RTX 4090
-- **27% improvement** in convolution operations  
-- **2.8x speedup** with mixed precision (vs 2.1x on RTX 4090)
-- **40-60% memory reduction** with Flash Attention
+Full details and raw data are in [docs/RESULTS.md](docs/RESULTS.md).
 
-### 🔧 **Complete Implementation**
-- **Native CUDA kernels** optimized for sm_120 architecture
-- **TensorFlow operations** with seamless integration
-- **Python API** for easy adoption in existing workflows
-- **Comprehensive build system** with automated deployment
+| | |
+|---|---|
+| NVFP4 GEMM throughput | **261–356 TFLOPS**: **3.0–4.0× BF16 cuBLAS**. Faster than cuBLASLt NVFP4 on short-K shapes, about 86% of it on the longest K |
+| Transformer block fwd+bwd | **1.29× (d=768) → 1.76× (d=2048) → 2.13× (d=4096)** vs BF16 |
+| GPT-124M pretraining, 49M tokens | val loss **1.5064 vs 1.4884** BF16 (constant +0.018 gap, no divergence), **+10.7% tokens/s, −14.5% GPU energy** |
+| Correctness | quantizer **bit-exact** vs the reference spec; GEMM = fp64 reference to ~1e-7; 64 tests |
 
-### 🎛️ **Advanced Features**
-- **5th generation Tensor Cores** with FP8/FP16/BF16 support
-- **Flash Attention** for memory-efficient transformers
-- **Multi-precision arithmetic** with automatic optimization
-- **Cooperative kernel launches** for maximum SM utilization
+![loss curves](experiments/results/loss.png)
 
-## 🚀 Quick Start
-
-### Prerequisites Checklist
-
-- [ ] NVIDIA RTX 50-series GPU (5080/5090)
-- [ ] NVIDIA drivers 570.x or newer
-- [ ] CUDA Toolkit 12.8+
-- [ ] cuDNN 9.8+
-- [ ] LLVM 22
-- [ ] Python 3.9-3.13
-- [ ] Git
-
-### Option 1: Docker Build (Recommended)
+## Quick start (WSL2 or Linux, RTX 50-series)
 
 ```bash
-# Clone this repository
-git clone https://github.com/yourusername/Custom-TensorFlow-compute-capability-sm-120.git
-cd Custom-TensorFlow-compute-capability-sm-120
-
-# Build using Docker
-./scripts/build-docker.sh
-
-# Install the resulting wheel
-pip install ./build/tensorflow-*.whl
+sudo tools/setup_wsl.sh            # CUDA 13.0 toolkit + venv with PyTorch 2.14 cu130 (~/nvfp4)
+tools/check.sh                     # build the extension for sm_120a + run all tests
 ```
-
-### Option 2: Native Build
-
-```bash
-# Set up environment
-./scripts/setup-environment.sh
-
-# Configure and build
-./scripts/build-tensorflow.sh
-
-# Install
-pip install ./build/tensorflow-*.whl
-```
-
-## 📋 Detailed Requirements
-
-| Component | Version | Notes |
-|-----------|---------|-------|
-| **CUDA Toolkit** | **12.8+** | Required for sm_120 support |
-| **cuDNN** | **9.8+** | Compatible with CUDA 12.8 |
-| **LLVM** | **22** | Stable versions won't work |
-| **Bazel** | Latest supported | TensorFlow's build system |
-| **Python** | 3.9-3.13 | Supported by TensorFlow |
-| **NVIDIA Drivers** | 570.x+ | CUDA 12.x compatibility |
-| **Memory** | 32GB+ RAM | Recommended for build |
-| **Storage** | 100GB+ free | Build artifacts are large |
-
-## 🛠️ Build Process Overview
-
-### 1. Environment Setup
-
-The build process requires specific versions of tools and libraries. Use our setup scripts:
-
-```bash
-# Linux/Ubuntu
-./scripts/setup-ubuntu.sh
-
-# CentOS/RHEL
-./scripts/setup-centos.sh
-
-# Windows (WSL2 recommended)
-./scripts/setup-windows.sh
-```
-
-### 2. TensorFlow Configuration
-
-```bash
-# Clone TensorFlow
-git clone https://github.com/tensorflow/tensorflow.git
-cd tensorflow
-
-# Apply our patches
-../scripts/apply-patches.sh
-
-# Configure build
-./configure
-```
-
-**Important Configuration Options:**
-- CUDA path: `/usr/local/cuda-12.8`
-- Compute capabilities: Include `12.0`
-- Compiler: LLVM 22 clang
-- Optimization: `--config=opt`
-
-### 3. Build Execution
-
-```bash
-# Build the C++ library
-bazel build --config=opt --config=cuda \
-  //tensorflow:libtensorflow.so \
-  --copt=-Wno-error=c23-extensions \
-  --verbose_failures
-
-# Build Python wheel
-./bazel-bin/tensorflow/tools/pip_package/build_pip_package ./build/
-```
-
-### 4. Installation and Testing
-
-```bash
-# Install in virtual environment
-python -m venv tf-sm120-env
-source tf-sm120-env/bin/activate
-pip install ./build/tensorflow-*.whl
-
-# Validate installation
-python scripts/validate-installation.py
-```
-
-## 🐛 Known Issues and Patches
-
-### Common Build Errors
-
-1. **`set_matrix3x3` naming conflict**
-   - **Error**: Function naming collision in external dependencies
-   - **Fix**: Applied automatically by `patches/fix-matrix-naming.patch`
-
-2. **C23 extensions warning**
-   - **Error**: LLVM 22 generates C23 warnings treated as errors
-   - **Fix**: Use `--copt=-Wno-error=c23-extensions` flag
-
-3. **Template instantiation errors**
-   - **Error**: Template-related compilation failures
-   - **Fix**: Applied automatically by `patches/fix-template-errors.patch`
-
-### Troubleshooting
-
-See [docs/troubleshooting.md](docs/troubleshooting.md) for detailed solutions.
-
-## 📁 Complete Project Architecture
-
-```
-TensorFlow-SM120-Optimizations/
-├── 📄 README.md                          # Project overview and quick start
-├── 📄 CHANGELOG.md                       # Detailed version history
-├── 📄 LICENSE                            # Apache 2.0 license
-├── 📄 CMakeLists.txt                     # CMake build configuration
-├── 📄 setup.py                           # Python package setup
-│
-├── 📁 src/                               # Core implementation
-│   ├── 📁 cuda_kernels/                  # CUDA kernel implementations
-│   │   ├── sm120_optimized_kernels_fixed.cu    # Advanced CUDA kernels
-│   │   └── sm120_kernel_launcher_fixed.h       # Kernel launcher interfaces
-│   ├── 📁 tensorflow_ops/                # TensorFlow operation bindings
-│   │   ├── sm120_ops_fixed.cc           # TensorFlow custom operations
-│   │   └── sm120_kernel_implementations.cu     # Kernel implementations
-│   └── 📄 BUILD                          # Bazel build configuration
-│
-├── 📁 python/                            # Python API and bindings
-│   └── 📄 sm120_ops.py                   # High-level Python interface
-│
-├── 📁 scripts/                           # Build automation and tools
-│   ├── 📄 setup-environment.sh           # Environment setup automation
-│   ├── 📄 build-tensorflow.sh            # TensorFlow build orchestration
-│   ├── 📄 build-docker.sh                # Docker-based build system
-│   ├── 📄 comprehensive-build.sh         # Complete build pipeline
-│   └── 📄 validate-installation.py       # Installation validation suite
-│
-├── 📁 patches/                           # TensorFlow compatibility patches
-│   ├── 📄 apply-patches.sh               # Automated patch application
-│   ├── 📄 fix-matrix-naming.patch        # Matrix function naming fixes
-│   ├── 📄 fix-template-errors.patch      # Template instantiation fixes
-│   ├── 📄 fix-c23-extensions.patch       # C23 extension compatibility
-│   └── 📄 fix-sm120-support.patch        # Native sm_120 support
-│
-├── 📁 docker/                            # Container build environments
-│   ├── 📄 Dockerfile.ubuntu              # Ubuntu 22.04 + CUDA 12.8
-│   └── 📄 Dockerfile.centos              # CentOS Stream 9 alternative
-│
-├── 📁 docs/                              # Comprehensive documentation
-│   ├── 📄 build-guide.md                 # Complete build instructions
-│   ├── 📄 troubleshooting.md             # Issue resolution guide
-│   └── 📄 performance.md                 # Optimization strategies
-│
-├── 📁 tests/                             # Testing framework
-│   └── 📄 test_sm120_operations.py       # Comprehensive test suite
-│
-└── 📁 examples/                          # Usage examples and demos
-    ├── 📄 basic_usage.py                 # Getting started examples
-    ├── 📄 basic-gpu-test.py              # GPU functionality validation
-    └── 📄 benchmark.py                   # Performance benchmarking
-```
-
-## 🧪 Validation
-
-After installation, validate your build:
 
 ```python
-import tensorflow as tf
+import torch
+from nvfp4.linear import NVFP4Linear, convert_linears
 
-# Check TensorFlow version
-print(f"TensorFlow version: {tf.__version__}")
+layer = NVFP4Linear(4096, 4096, bias=False).cuda()        # in/out features must be multiples of 128
+y = layer(torch.randn(8192, 4096, device="cuda", dtype=torch.bfloat16))
 
-# Check GPU availability
-gpus = tf.config.list_physical_devices('GPU')
-print(f"Available GPUs: {len(gpus)}")
+# or convert an existing model's block linears, keeping the last blocks in BF16:
+convert_linears(model.blocks, skip=("10.", "11."))
 
-# Check compute capability
-if gpus:
-    for gpu in gpus:
-        details = tf.config.experimental.get_device_details(gpu)
-        print(f"GPU: {gpu.name}")
-        print(f"Compute capability: {details.get('compute_capability', 'Unknown')}")
+# low-level ops
+from nvfp4 import quantize, gemm
+qa = quantize(a)                                          # NVFP4Tensor(data, scales, gdec)
+qb = quantize(b, block_2d=True)
+d = gemm(qa, qb)                                          # D = A @ B^T on FP4 tensor cores
 ```
 
-## 📊 Performance
+Requirements: an sm_120 GPU (RTX 5090/5080/5070/5060 or their laptop parts), CUDA ≥ 12.8 (tested
+with 13.0), and a CUDA build of PyTorch (tested with 2.14.1+cu130, which needs C++20). Native Windows
+builds haven't been tried. On a machine without such a GPU, `NVFP4Linear(..., backend="emulate")`
+runs the same recipe through the pure-PyTorch reference.
 
-Expected performance improvements with native sm_120 support:
+## Layout
 
-- **Training**: 15-25% faster than sm_89 compatibility mode
-- **Inference**: 20-30% faster for large models
-- **Memory**: Better memory utilization with newer architecture features
+```
+csrc/quantize.cu       BF16/FP32 -> NVFP4 (rowwise / transposed / 16x16 2D, RHT, stochastic rounding)
+csrc/gemm.cu           mma.sync kind::mxf4nvf4 block-scaled TN GEMM, 4-stage cp.async pipeline
+nvfp4/reference.py     executable spec of the format and recipe (pure PyTorch)
+nvfp4/linear.py        NVFP4Linear autograd layer + convert_linears
+tests/                 bit-exact / reference tests (GPU tests auto-skip without sm_120)
+bench/                 GEMM, quantizer and transformer-block benchmarks (+ results/)
+experiments/           TinyStories GPT pretraining: BF16 vs NVFP4 (+ results/)
+tools/guard.py         runs jobs under GPU temperature / memory / host-RAM limits
+docs/                  DESIGN.md, RESULTS.md, research/ (why this project exists)
+```
 
-See [docs/performance.md](docs/performance.md) for detailed benchmarks.
+## Status and limitations
 
-## 🤝 Contributing
+This is a research-grade implementation, verified on one GPU. The known gaps are listed in
+[docs/DESIGN.md §6](docs/DESIGN.md#6-known-limitations-and-next-steps):
+- quantization isn't fused into producer ops;
+- there's no split-K;
+- backward re-quantizes saved BF16 activations;
+- only Linux/WSL2 is supported.
 
-1. Fork the repository
-2. Create a feature branch
-3. Test your changes with different GPU configurations
-4. Submit a pull request
+## License
 
-## 📄 License
-
-This project is licensed under the Apache License 2.0 - see the [LICENSE](LICENSE) file for details.
-
-## 🙏 Acknowledgments
-
-- [TensorFlow Team](https://github.com/tensorflow/tensorflow) for the core framework
-- [NVIDIA](https://developer.nvidia.com/) for CUDA toolkit and documentation
-- Community contributors who identified and fixed build issues
-
-## 📞 Support
-
-- **Issues**: Use GitHub Issues for bug reports
-- **Discussions**: GitHub Discussions for questions
-- **Documentation**: Check `docs/` directory first
-
----
-
-**⚠️ Disclaimer**: This is an experimental build process. Use at your own risk. Always test thoroughly before deploying to production environments.
+Apache-2.0
