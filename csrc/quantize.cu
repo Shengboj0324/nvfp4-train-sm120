@@ -32,16 +32,64 @@ struct QParams {
   int R_out, C_out;  // logical output shape
   bool transpose;
   bool use_rht;
+  bool lanes_along_cols;  // lanes = consecutive blocks of one row (rowwise 1D); else consecutive rows
   uint64_t rht_seed;
 };
+
+// Thread -> (logical row, block column) mapping shared by both passes.
+//  * lanes_along_cols: a warp covers 32 consecutive 16-element blocks of one row (1 KB of bf16,
+//    fully coalesced 16-byte vector loads). Used for rowwise 1D quantization.
+//  * otherwise: a warp covers 32 consecutive rows of one block column. Coalesced for the transposed
+//    read, and puts each 16x16 tile in 16 adjacent lanes for the 2D-scale reduction.
+__host__ __device__ __forceinline__ int64_t num_warps(const QParams& p) {
+  const int nbc = p.C_out / kBlock;
+  return p.lanes_along_cols ? static_cast<int64_t>(p.R_out) * ((nbc + 31) / 32)
+                            : static_cast<int64_t>((p.R_out + 31) / 32) * nbc;
+}
+__device__ __forceinline__ bool block_coords(const QParams& p, int64_t warp, int lane, int& orow, int& bcol) {
+  const int nbc = p.C_out / kBlock;
+  if (p.lanes_along_cols) {
+    const int col_groups = (nbc + 31) / 32;
+    orow = static_cast<int>(warp / col_groups);
+    bcol = static_cast<int>(warp % col_groups) * 32 + lane;
+  } else {
+    const int row_groups = (p.R_out + 31) / 32;
+    bcol = static_cast<int>(warp / row_groups);
+    orow = static_cast<int>(warp % row_groups) * 32 + lane;
+  }
+  return orow < p.R_out && bcol < nbc;
+}
+
+__device__ __forceinline__ void unpack8(const uint4& u, float* v, const __nv_bfloat16*) {
+  const __nv_bfloat162* h = reinterpret_cast<const __nv_bfloat162*>(&u);
+#pragma unroll
+  for (int i = 0; i < 4; ++i) {
+    const float2 f = __bfloat1622float2(h[i]);
+    v[2 * i] = f.x;
+    v[2 * i + 1] = f.y;
+  }
+}
 
 template <typename T>
 __device__ __forceinline__ void load_block(const T* __restrict__ x, const QParams& p, int orow, int bcol,
                                            float (&v)[kBlock]) {
   if (!p.transpose) {
-    const T* src = x + static_cast<int64_t>(orow) * p.C + bcol * kBlock;
+    const T* src = x + static_cast<int64_t>(orow) * p.C + bcol * kBlock;  // 32/64-byte aligned
+    if constexpr (std::is_same_v<T, __nv_bfloat16>) {
+      const uint4* s4 = reinterpret_cast<const uint4*>(src);
+      unpack8(__ldg(s4), v, src);
+      unpack8(__ldg(s4 + 1), v + 8, src);
+    } else {
+      const float4* s4 = reinterpret_cast<const float4*>(src);
 #pragma unroll
-    for (int i = 0; i < kBlock; ++i) v[i] = to_f(src[i]);
+      for (int i = 0; i < 4; ++i) {
+        const float4 f = __ldg(s4 + i);
+        v[4 * i] = f.x;
+        v[4 * i + 1] = f.y;
+        v[4 * i + 2] = f.z;
+        v[4 * i + 3] = f.w;
+      }
+    }
   } else {
     // logical row orow = input column, logical cols bcol*16.. = input rows
     const T* src = x + static_cast<int64_t>(bcol * kBlock) * p.C + orow;
@@ -55,18 +103,12 @@ __device__ __forceinline__ void load_block(const T* __restrict__ x, const QParam
 // float's bit pattern (integer order == float order for non-negative floats).
 template <typename T>
 __global__ void amax_kernel(const T* __restrict__ x, QParams p, unsigned int* __restrict__ amax_bits) {
-  const int nbc = p.C_out / kBlock;
-  const int64_t nblocks = static_cast<int64_t>(p.R_out) * nbc;
+  const int64_t nthreads = num_warps(p) * 32;
   float m = 0.0f;
-  for (int64_t t = blockIdx.x * static_cast<int64_t>(blockDim.x) + threadIdx.x; t < nblocks;
+  for (int64_t t = blockIdx.x * static_cast<int64_t>(blockDim.x) + threadIdx.x; t < nthreads;
        t += static_cast<int64_t>(gridDim.x) * blockDim.x) {
-    // same (row, block-col) enumeration as the quantize kernel
-    int64_t warp = t / 32;
-    int lane = static_cast<int>(t % 32);
-    int64_t row_groups = (p.R_out + 31) / 32;
-    int bcol = static_cast<int>(warp / row_groups);
-    int orow = static_cast<int>((warp % row_groups) * 32 + lane);
-    if (orow >= p.R_out) continue;
+    int orow, bcol;
+    if (!block_coords(p, t / 32, static_cast<int>(t % 32), orow, bcol)) continue;
     float v[kBlock];
     load_block(x, p, orow, bcol, v);
 #pragma unroll
@@ -82,13 +124,11 @@ __global__ void quantize_kernel(const T* __restrict__ x, QParams p, const unsign
                                 uint8_t* __restrict__ data, uint8_t* __restrict__ scales, float* __restrict__ gdec_out,
                                 uint64_t sr_seed) {
   const int nbc = p.C_out / kBlock;
-  const int row_groups = (p.R_out + 31) / 32;
   const int64_t warp = (blockIdx.x * static_cast<int64_t>(blockDim.x) + threadIdx.x) / 32;
   const int lane = threadIdx.x & 31;
-  if (warp >= static_cast<int64_t>(row_groups) * nbc) return;  // whole warp exits together
-  const int bcol = static_cast<int>(warp / row_groups);
-  const int orow = static_cast<int>((warp % row_groups) * 32 + lane);
-  const bool valid = orow < p.R_out;
+  if (warp >= num_warps(p)) return;  // whole warp exits together
+  int orow, bcol;
+  const bool valid = block_coords(p, warp, lane, orow, bcol);
 
   // global scales: genc = 2688 / amax (1 if amax == 0), gdec = 1 / genc
   const float amax = __uint_as_float(*amax_bits);
@@ -151,6 +191,7 @@ std::vector<torch::Tensor> nvfp4_quantize(torch::Tensor x, bool transpose, bool 
   p.C_out = transpose ? p.R : p.C;
   p.use_rht = use_rht;
   p.rht_seed = static_cast<uint64_t>(rht_seed);
+  p.lanes_along_cols = !transpose && !block_2d;
   TORCH_CHECK(p.C_out % kBlock == 0, "quantized dim (", p.C_out, ") must be a multiple of 16");
   TORCH_CHECK(!block_2d || p.R_out % kBlock == 0, "2D blocks need the other dim (", p.R_out, ") % 16 == 0");
 
@@ -163,7 +204,7 @@ std::vector<torch::Tensor> nvfp4_quantize(torch::Tensor x, bool transpose, bool 
 
   auto stream = at::cuda::getCurrentCUDAStream();
   const int threads = 256;
-  const int64_t nthreads = static_cast<int64_t>((p.R_out + 31) / 32) * 32 * (p.C_out / kBlock);
+  const int64_t nthreads = num_warps(p) * 32;
   const int grid = static_cast<int>((nthreads + threads - 1) / threads);
   const int amax_grid = std::min(grid, 4096);
   auto* amax_ptr = reinterpret_cast<unsigned int*>(amax.data_ptr<int>());

@@ -142,7 +142,7 @@ class NVFP4Linear(torch.nn.Linear):
 
 
 def convert_linears(module: torch.nn.Module, *, skip=(), **kw) -> list[str]:
-    """Replace every eligible nn.Linear (dims % 128 == 0, name not matching ``skip``) in place.
+    """Replace every eligible nn.Linear (dims % 128 == 0, name not starting with any ``skip`` prefix).
 
     Returns the names of converted modules.
     """
@@ -151,7 +151,7 @@ def convert_linears(module: torch.nn.Module, *, skip=(), **kw) -> list[str]:
         for cname, sub in list(child.named_children()):
             full = f"{name}.{cname}" if name else cname
             if (type(sub) is torch.nn.Linear and sub.in_features % ALIGN == 0 and sub.out_features % ALIGN == 0
-                    and not any(s in full for s in skip)):
+                    and not any(full.startswith(s) for s in skip)):
                 setattr(child, cname, NVFP4Linear.from_linear(sub, **kw))
                 converted.append(full)
     return converted

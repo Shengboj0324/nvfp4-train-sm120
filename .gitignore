@@ -9,3 +9,4 @@ dist/
 logs/
 *.ckpt
 experiments/data/
+bench/scratch/

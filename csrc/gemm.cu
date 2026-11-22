@@ -23,7 +23,13 @@ namespace gemm {
 constexpr int BM = 128, BN = 128, BK = 128;  // BK in elements (64 bytes per row)
 constexpr int BKB = BK / 2;                  // bytes per row per k-tile
 constexpr int SFK = BK / 16;                 // scale bytes per row per k-tile (8)
-constexpr int STAGES = 4;
+#ifndef NVFP4_GEMM_STAGES
+#define NVFP4_GEMM_STAGES 4
+#endif
+#ifndef NVFP4_GEMM_MIN_BLOCKS
+#define NVFP4_GEMM_MIN_BLOCKS 1
+#endif
+constexpr int STAGES = NVFP4_GEMM_STAGES;
 constexpr int WARPS_M = 2, WARPS_N = 4;
 constexpr int WM = BM / WARPS_M, WN = BN / WARPS_N;  // 64 x 32
 constexpr int MI = WM / 16, NI = WN / 8;             // 4 x 4 MMA tiles per warp
@@ -121,7 +127,7 @@ __device__ __forceinline__ void load_stage(const Args& p, uint8_t* smem, int sta
 }
 
 template <typename OutT>
-__global__ void __launch_bounds__(THREADS) nvfp4_gemm_kernel(Args p) {
+__global__ void __launch_bounds__(THREADS, NVFP4_GEMM_MIN_BLOCKS) nvfp4_gemm_kernel(Args p) {
   extern __shared__ __align__(128) uint8_t smem[];
   const int lane = threadIdx.x & 31;
   const int warp = threadIdx.x >> 5;
