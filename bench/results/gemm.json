@@ -1,0 +1,120 @@
+{
+ "info": {
+  "nvidia_smi": "NVIDIA GeForce RTX 5090 Laptop GPU, 595.79, [N/A], 3090 MHz, 442 MHz, 42",
+  "torch": "2.14.1+cu130",
+  "cuda": "13.0",
+  "device": "NVIDIA GeForce RTX 5090 Laptop GPU",
+  "sms": 82,
+  "host": "Micheal0324"
+ },
+ "results": [
+  {
+   "M": 2048,
+   "N": 2048,
+   "K": 2048,
+   "bf16_cublas_tflops": 85.6144240502202,
+   "nvfp4_ours_tflops": 261.28283982494605,
+   "nvfp4_ours_incl_quant_tflops": 146.57390673171776,
+   "check_rel_err": 6.937739271961618e-08,
+   "cublaslt_vs_ours_rel_diff": 0.004180459771305323,
+   "nvfp4_cublaslt_tflops": 232.79460185997317,
+   "after_shape_gpu_state": "330 MHz, 42, 32.38 W"
+  },
+  {
+   "M": 4096,
+   "N": 4096,
+   "K": 4096,
+   "bf16_cublas_tflops": 93.47970765266179,
+   "nvfp4_ours_tflops": 336.6040859472815,
+   "nvfp4_ours_incl_quant_tflops": 230.54472100366746,
+   "check_rel_err": 0.0,
+   "cublaslt_vs_ours_rel_diff": 0.0028289295732975006,
+   "nvfp4_cublaslt_tflops": 335.9117371900666,
+   "after_shape_gpu_state": "1590 MHz, 42, 73.68 W"
+  },
+  {
+   "M": 8192,
+   "N": 8192,
+   "K": 8192,
+   "bf16_cublas_tflops": 90.32178308363918,
+   "nvfp4_ours_tflops": 356.3552558581922,
+   "nvfp4_ours_incl_quant_tflops": 275.7849197635731,
+   "check_rel_err": 6.539327301879894e-08,
+   "cublaslt_vs_ours_rel_diff": 0.004397946875542402,
+   "nvfp4_cublaslt_tflops": 412.7127269463654,
+   "after_shape_gpu_state": "2077 MHz, 63, 175.77 W"
+  },
+  {
+   "M": 8192,
+   "N": 8192,
+   "K": 2048,
+   "bf16_cublas_tflops": 99.16693966871676,
+   "nvfp4_ours_tflops": 332.36027626088634,
+   "nvfp4_ours_incl_quant_tflops": 273.0595429242464,
+   "check_rel_err": 6.862248369543522e-08,
+   "cublaslt_vs_ours_rel_diff": 0.004952705930918455,
+   "nvfp4_cublaslt_tflops": 242.78244862134548,
+   "after_shape_gpu_state": "2460 MHz, 65, 146.69 W"
+  },
+  {
+   "M": 8192,
+   "N": 2048,
+   "K": 8192,
+   "bf16_cublas_tflops": 92.78481167495947,
+   "nvfp4_ours_tflops": 349.5253421630862,
+   "nvfp4_ours_incl_quant_tflops": 209.46895851244727,
+   "check_rel_err": 6.926765649950539e-08,
+   "cublaslt_vs_ours_rel_diff": 0.004938455298542976,
+   "nvfp4_cublaslt_tflops": 342.71043752651417,
+   "after_shape_gpu_state": "2272 MHz, 63, 153.62 W"
+  },
+  {
+   "M": 2048,
+   "N": 8192,
+   "K": 8192,
+   "bf16_cublas_tflops": 92.44207445084763,
+   "nvfp4_ours_tflops": 354.9801735176389,
+   "nvfp4_ours_incl_quant_tflops": 211.6216625114375,
+   "check_rel_err": 6.816328124159554e-08,
+   "cublaslt_vs_ours_rel_diff": 0.0049710688181221485,
+   "nvfp4_cublaslt_tflops": 339.6412227158934,
+   "after_shape_gpu_state": "2235 MHz, 63, 149.24 W"
+  },
+  {
+   "M": 8192,
+   "N": 3072,
+   "K": 768,
+   "bf16_cublas_tflops": 87.17103728332883,
+   "nvfp4_ours_tflops": 283.14981276897987,
+   "nvfp4_ours_incl_quant_tflops": 172.07155404192775,
+   "check_rel_err": 1.1581762038304078e-07,
+   "cublaslt_vs_ours_rel_diff": 0.006367294117808342,
+   "nvfp4_cublaslt_tflops": 139.65658036759055,
+   "after_shape_gpu_state": "277 MHz, 45, 33.00 W"
+  },
+  {
+   "M": 8192,
+   "N": 768,
+   "K": 3072,
+   "bf16_cublas_tflops": 90.94300422274236,
+   "nvfp4_ours_tflops": 325.2317788051927,
+   "nvfp4_ours_incl_quant_tflops": 135.88610663925792,
+   "check_rel_err": 5.83133079601339e-08,
+   "cublaslt_vs_ours_rel_diff": 0.006145555060356855,
+   "nvfp4_cublaslt_tflops": 319.73517621536917,
+   "after_shape_gpu_state": "262 MHz, 44, 31.97 W"
+  },
+  {
+   "M": 768,
+   "N": 3072,
+   "K": 8192,
+   "bf16_cublas_tflops": 84.99933605945881,
+   "nvfp4_ours_tflops": 339.1144548931715,
+   "nvfp4_ours_incl_quant_tflops": 133.222994468547,
+   "check_rel_err": 7.153720105179673e-08,
+   "cublaslt_vs_ours_rel_diff": 0.005227638408541679,
+   "nvfp4_cublaslt_tflops": 395.8381746653226,
+   "after_shape_gpu_state": "277 MHz, 44, 31.59 W"
+  }
+ ]
+}
