@@ -221,6 +221,63 @@ def quantize_dual(x: torch.Tensor, *, row: bool = True, col: bool = True, block_
     return r_out, c_out
 
 
+# --------------------------------------------------------------------------------------------------
+# Producer ops fused into the quantizer (csrc/quantize_dual.cu "Pro"). Each is written one rounded
+# fp32 op at a time, in the kernel's order. Run them on the same device as the kernel for bit-exact
+# comparisons: tanh is libdevice tanhf on CUDA but a different implementation on CPU.
+
+GELU_BETA = 0.7978845608028654   # sqrt(2 / pi); used as fp32, like the kernel's constants
+GELU_KAPPA = 0.044715
+GELU_3KAPPA = 0.134145
+
+
+def gelu_tanh(x: torch.Tensor) -> torch.Tensor:
+    """tanh-approximate GELU in fp32: (x * 0.5) * (tanh((x + x^3 * kappa) * beta) + 1)."""
+    x = x.float()
+    x3 = (x * x) * x
+    inner = (x + x3 * GELU_KAPPA) * GELU_BETA
+    return (x * 0.5) * (torch.tanh(inner) + 1.0)
+
+
+def gelu_tanh_backward(dy: torch.Tensor, x: torch.Tensor) -> torch.Tensor:
+    """dy * gelu'(x) in fp32, with gelu as in gelu_tanh."""
+    dy, x = dy.float(), x.float()
+    x2 = x * x
+    t = torch.tanh((x + (x2 * x) * GELU_KAPPA) * GELU_BETA)
+    left_d = (t + 1.0) * 0.5
+    right_d = (((x * 0.5) * (1.0 - t * t)) * GELU_BETA) * (x2 * GELU_3KAPPA + 1.0)
+    return dy * (left_d + right_d)
+
+
+def layernorm_stats(x: torch.Tensor, eps: float) -> tuple[torch.Tensor, torch.Tensor]:
+    """Per-row mean and 1 / sqrt(biased var + eps) (the kernel's reduction order differs: compare with a tolerance)."""
+    x = x.double()
+    mean = x.mean(-1)
+    var = ((x - mean[:, None]) ** 2).mean(-1)
+    return mean.float(), (1.0 / torch.sqrt(var + eps)).float()
+
+
+def layernorm_apply(x: torch.Tensor, mean: torch.Tensor, rstd: torch.Tensor, weight: torch.Tensor,
+                    bias: torch.Tensor) -> torch.Tensor:
+    """((x - mean) * rstd) * weight + bias in fp32, with the per-row statistics given."""
+    return ((x.float() - mean.float()[:, None]) * rstd.float()[:, None]) * weight.float() + bias.float()
+
+
+def layernorm_quantize_dual(x, weight, bias, mean, rstd, **kw):
+    """Spec of ops.layernorm_quantize_dual given its statistics: quantize_dual(layernorm_apply(...))."""
+    return quantize_dual(layernorm_apply(x, mean, rstd, weight, bias), **kw)
+
+
+def gelu_quantize_dual(h, **kw):
+    """Spec of ops.gelu_quantize_dual."""
+    return quantize_dual(gelu_tanh(h), **kw)
+
+
+def gelu_backward_quantize_dual(dy, h, **kw):
+    """Spec of ops.gelu_backward_quantize_dual."""
+    return quantize_dual(gelu_tanh_backward(dy, h), **kw)
+
+
 def unpack_codes(data: torch.Tensor) -> torch.Tensor:
     lo = data & 0xF
     hi = data >> 4

@@ -30,6 +30,10 @@ class NVFP4Tensor:
     def as_tuple(self):
         return self.data, self.scales, self.gdec.reshape(())
 
+    def as_storage(self) -> list[torch.Tensor]:
+        """[data, scales, gdec], e.g. for ctx.save_for_backward; NVFP4Tensor(*storage) rebuilds it."""
+        return [self.data, self.scales, self.gdec]
+
     def dequantize(self) -> torch.Tensor:
         from nvfp4 import reference
         return reference.dequantize(self.data, self.scales, self.gdec.reshape(()))
@@ -65,6 +69,62 @@ def quantize_dual(x: torch.Tensor, *, row: bool = True, col: bool = True, block_
         x, row, col, block_2d, row_sr_seed is not None, int(row_sr_seed or 0), col_sr_seed is not None,
         int(col_sr_seed or 0), rht_seed is not None, int(rht_seed or 0), int(col_pad))
     return (NVFP4Tensor(rd, rs, rg) if row else None, NVFP4Tensor(cd, cs, cg) if col else None)
+
+
+def _aligned(t: torch.Tensor) -> torch.Tensor:
+    if not t.is_contiguous():
+        t = t.contiguous()
+    return t if t.data_ptr() % 16 == 0 else t.clone()
+
+
+def _dual_flags(row, col, row_sr_seed, col_sr_seed, rht_seed, col_pad):
+    return (row, col, row_sr_seed is not None, int(row_sr_seed or 0), col_sr_seed is not None, int(col_sr_seed or 0),
+            rht_seed is not None, int(rht_seed or 0), int(col_pad))
+
+
+def _pair(outs, row, col):
+    rd, rs, rg, cd, cs, cg = outs
+    return (NVFP4Tensor(rd, rs, rg) if row else None, NVFP4Tensor(cd, cs, cg) if col else None)
+
+
+# Producer-fused variants of quantize_dual: the op that produces the quantized tensor runs inside the
+# quantizer, so its output is never written to memory. Same keyword arguments as quantize_dual
+# (without block_2d); each is bit-identical to its reference.* twin.
+
+def layernorm_quantize_dual(x: torch.Tensor, weight: torch.Tensor, bias: torch.Tensor, eps: float, *, row: bool = True,
+                            col: bool = True, row_sr_seed: int | None = None, col_sr_seed: int | None = None,
+                            rht_seed: int | None = None, col_pad: int = 16):
+    """Quantize ``LayerNorm(x)`` [R, C] (fp32 weight / bias [C]) without writing it.
+
+    Returns ``(mean, rstd, row, col)``: the per-row statistics ([R] fp32, what the LayerNorm backward
+    needs) and the two quantize_dual outputs of ``((x - mean) * rstd) * weight + bias`` in fp32.
+    """
+    if _C is None:
+        raise RuntimeError("nvfp4 CUDA extension not built")
+    outs = _C.layernorm_quantize_dual(_aligned(x), weight.float().contiguous(), bias.float().contiguous(), float(eps),
+                                      *_dual_flags(row, col, row_sr_seed, col_sr_seed, rht_seed, col_pad))
+    return (outs[0], outs[1], *_pair(outs[2:], row, col))
+
+
+def gelu_quantize_dual(h: torch.Tensor, *, row: bool = True, col: bool = True, row_sr_seed: int | None = None,
+                       col_sr_seed: int | None = None, rht_seed: int | None = None, col_pad: int = 16):
+    """Quantize ``gelu(h)`` (tanh approximation, bf16 ``h``) without writing it."""
+    if _C is None:
+        raise RuntimeError("nvfp4 CUDA extension not built")
+    outs = _C.gelu_quantize_dual(_aligned(h.to(torch.bfloat16)),
+                                 *_dual_flags(row, col, row_sr_seed, col_sr_seed, rht_seed, col_pad))
+    return _pair(outs, row, col)
+
+
+def gelu_backward_quantize_dual(dy: torch.Tensor, h: torch.Tensor, *, row: bool = True, col: bool = True,
+                                row_sr_seed: int | None = None, col_sr_seed: int | None = None,
+                                rht_seed: int | None = None, col_pad: int = 16):
+    """Quantize the GELU input gradient ``dy * gelu'(h)`` (bf16 ``dy``, ``h``) without writing it."""
+    if _C is None:
+        raise RuntimeError("nvfp4 CUDA extension not built")
+    outs = _C.gelu_backward_quantize_dual(_aligned(dy.to(torch.bfloat16)), _aligned(h.to(torch.bfloat16)),
+                                          *_dual_flags(row, col, row_sr_seed, col_sr_seed, rht_seed, col_pad))
+    return _pair(outs, row, col)
 
 
 def gemm(a: NVFP4Tensor, b: NVFP4Tensor, out_dtype: torch.dtype = torch.bfloat16, *,

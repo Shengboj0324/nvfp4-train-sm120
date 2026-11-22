@@ -104,6 +104,34 @@ __device__ __forceinline__ uint32_t clear_negative_zeros(uint32_t w) {
   return mag | (w & nonzero);
 }
 
+// reference.gelu_tanh / reference.gelu_tanh_backward: tanh-approximate GELU and its gradient, one
+// IEEE-rounded op at a time (no FMA contraction) so the reference reproduces them bit for bit with
+// separate torch ops (tanhf is the same libdevice function torch.tanh uses on CUDA).
+constexpr float kGeluBeta = 0.7978845608028654f;  // sqrt(2 / pi)
+constexpr float kGeluKappa = 0.044715f;
+constexpr float kGelu3Kappa = 0.134145f;          // 3 * kappa
+
+__device__ __forceinline__ float gelu_tanh(float x) {
+  const float x3 = __fmul_rn(__fmul_rn(x, x), x);
+  const float inner = __fmul_rn(__fadd_rn(x, __fmul_rn(x3, kGeluKappa)), kGeluBeta);
+  return __fmul_rn(__fmul_rn(x, 0.5f), __fadd_rn(tanhf(inner), 1.0f));
+}
+
+__device__ __forceinline__ float gelu_tanh_backward(float dy, float x) {
+  const float x2 = __fmul_rn(x, x);
+  const float inner = __fmul_rn(__fadd_rn(x, __fmul_rn(__fmul_rn(x2, x), kGeluKappa)), kGeluBeta);
+  const float t = tanhf(inner);
+  const float left_d = __fmul_rn(__fadd_rn(t, 1.0f), 0.5f);
+  const float right_d = __fmul_rn(__fmul_rn(__fmul_rn(__fmul_rn(x, 0.5f), __fsub_rn(1.0f, __fmul_rn(t, t))), kGeluBeta),
+                                  __fadd_rn(__fmul_rn(x2, kGelu3Kappa), 1.0f));
+  return __fmul_rn(dy, __fadd_rn(left_d, right_d));
+}
+
+// reference.layernorm_apply for one element: ((x - mean) * rstd) * gamma + beta.
+__device__ __forceinline__ float layernorm_apply(float x, float mean, float rstd, float gamma, float beta) {
+  return __fadd_rn(__fmul_rn(__fmul_rn(__fsub_rn(x, mean), rstd), gamma), beta);
+}
+
 // reference.global_scales: genc = 2688 / amax (1 if amax == 0); gdec = 1 / genc.
 __device__ __forceinline__ float global_encode_scale(float amax) {
   return amax > 0.0f ? __fdiv_rn(kE4M3Max * kE2M1Max, amax) : 1.0f;

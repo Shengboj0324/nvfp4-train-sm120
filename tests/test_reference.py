@@ -104,3 +104,20 @@ def test_quantize_dual_spec():
     (rd, rs, rg), (cd, cs, cg) = ref.quantize_dual(torch.randn(64, 48), block_2d=True)
     assert torch.equal(ref.dequantize(rd, rs, rg).T, ref.dequantize(cd, cs, cg))
     assert ref.quantize_dual(x, col=False)[1] is None and ref.quantize_dual(x, row=False)[0] is None
+
+
+def test_producer_specs_match_torch():
+    # The fused-producer specs (op-by-op fp32) agree with torch's own ops to fp32 rounding.
+    torch.manual_seed(0)
+    h = torch.randn(2048) * 4
+    assert (ref.gelu_tanh(h) - torch.nn.functional.gelu(h, approximate="tanh")).abs().max().item() < 2e-6
+    hh = h.clone().requires_grad_()
+    torch.nn.functional.gelu(hh, approximate="tanh").backward(torch.ones_like(hh))
+    assert (ref.gelu_tanh_backward(torch.ones_like(h), h) - hh.grad).abs().max().item() < 2e-6
+    x = torch.randn(64, 256) * 3 + 1
+    w, b = torch.rand(256) + 0.5, torch.randn(256) * 0.1
+    mean, rstd = ref.layernorm_stats(x, 1e-5)
+    y = torch.nn.functional.layer_norm(x, (256,), w, b, 1e-5)
+    assert (ref.layernorm_apply(x, mean, rstd, w, b) - y).abs().max().item() < 1e-5
+    (rd, _, _), (cd, _, _) = ref.layernorm_quantize_dual(x, w, b, mean, rstd, rht_seed=1, col_pad=128)
+    assert rd.shape == (64, 128) and cd.shape == (256, 64)
