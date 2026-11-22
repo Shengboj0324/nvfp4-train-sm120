@@ -184,7 +184,10 @@ def quantize(x: torch.Tensor, *, block_2d: bool = False, stochastic: bool = Fals
     if block_2d:
         assert r % BLOCK == 0, f"rows {r} must be a multiple of {BLOCK} for 2D blocks"
         bamax = bamax.reshape(r // BLOCK, BLOCK, c // BLOCK).amax(1, keepdim=True).expand(-1, BLOCK, -1).reshape(r, c // BLOCK)
-    s = e4m3_from_float(torch.minimum(bamax / E2M1_MAX * genc, torch.tensor(E4M3_MAX, device=x.device)))
+    # NB: `tensor / python_scalar` on CUDA is computed as tensor * (1/scalar), which is not IEEE division
+    # and differs at E4M3 rounding ties; divide by a full tensor so CPU, CUDA and the kernels agree.
+    s_target = torch.div(bamax, torch.full_like(bamax, E2M1_MAX)) * genc
+    s = e4m3_from_float(torch.minimum(s_target, torch.tensor(E4M3_MAX, device=x.device)))
     sf = e4m3_to_float(s)
     enc = torch.where(sf > 0, genc / torch.where(sf > 0, sf, torch.ones_like(sf)), torch.zeros_like(sf))
     v = blocks * enc.unsqueeze(-1)
@@ -196,6 +199,26 @@ def quantize(x: torch.Tensor, *, block_2d: bool = False, stochastic: bool = Fals
     codes = codes.reshape(r, c).to(torch.uint8)
     data = (codes[:, 0::2] | (codes[:, 1::2] << 4)).to(torch.uint8)
     return data.contiguous(), s.contiguous(), gdec.reshape(()).float()
+
+
+def quantize_dual(x: torch.Tensor, *, row: bool = True, col: bool = True, block_2d: bool = False,
+                  row_sr_seed: int | None = None, col_sr_seed: int | None = None, rht_seed: int | None = None,
+                  col_pad: int = 16):
+    """Spec of the fused dual quantizer: (quantize(x), quantize(RHT(pad_rows(x, col_pad).T))).
+
+    Either output is None when disabled. A seed of None means round-to-nearest-even.
+    """
+    xf = x.float()
+    r_out = c_out = None
+    if row:
+        r_out = quantize(xf, block_2d=block_2d, stochastic=row_sr_seed is not None, seed=row_sr_seed or 0)
+    if col:
+        pad = (-xf.shape[0]) % col_pad
+        y = torch.nn.functional.pad(xf, (0, 0, 0, pad)).T.contiguous()
+        if rht_seed is not None:
+            y = apply_rht(y, rht_seed)
+        c_out = quantize(y, block_2d=block_2d, stochastic=col_sr_seed is not None, seed=col_sr_seed or 0)
+    return r_out, c_out
 
 
 def unpack_codes(data: torch.Tensor) -> torch.Tensor:

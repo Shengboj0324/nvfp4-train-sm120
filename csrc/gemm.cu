@@ -126,7 +126,8 @@ __device__ __forceinline__ void load_stage(const Args& p, uint8_t* smem, int sta
   }
 }
 
-template <typename OutT>
+// kAccum (fp32 output only): D += alpha * A @ B^T, e.g. accumulating a weight gradient in place.
+template <typename OutT, bool kAccum>
 __global__ void __launch_bounds__(THREADS, NVFP4_GEMM_MIN_BLOCKS) nvfp4_gemm_kernel(Args p) {
   extern __shared__ __align__(128) uint8_t smem[];
   const int lane = threadIdx.x & 31;
@@ -191,8 +192,43 @@ __global__ void __launch_bounds__(THREADS, NVFP4_GEMM_MIN_BLOCKS) nvfp4_gemm_ker
   }
   cp_async_wait<0>();
 
-  const float alpha = (*p.gdec_a) * (*p.gdec_b);
+  float alpha = (*p.gdec_a) * (*p.gdec_b);
   const int tig = lane & 3;
+  if constexpr (kAccum) {
+    // acc <- D_old + alpha * acc. Loads for one m16 row group are issued together (a load cannot be
+    // moved past a store to the same array, so a load-add-store loop would serialize their latency).
+#pragma unroll
+    for (int i = 0; i < MI; ++i) {
+      float2 old[NI][2];
+#pragma unroll
+      for (int j = 0; j < NI; ++j) {
+        const int col = n0 + wn * WN + j * 8 + 2 * tig;
+#pragma unroll
+        for (int h = 0; h < 2; ++h) {
+          const int row = m0 + wm * WM + i * 16 + g + 8 * h;
+          const float* src = reinterpret_cast<const float*>(p.d) + static_cast<int64_t>(row) * p.N + col;
+          old[j][h] = make_float2(0.0f, 0.0f);
+          if (row < p.M) {
+            if (col + 1 < p.N && (p.N % 2 == 0)) {
+              old[j][h] = *reinterpret_cast<const float2*>(src);
+            } else {
+              if (col < p.N) old[j][h].x = src[0];
+              if (col + 1 < p.N) old[j][h].y = src[1];
+            }
+          }
+        }
+      }
+#pragma unroll
+      for (int j = 0; j < NI; ++j)
+#pragma unroll
+        for (int h = 0; h < 2; ++h) {
+          // separate rn ops (no FMA contraction): bit-identical to autograd's grad + (alpha * acc)
+          acc[i][j][2 * h] = __fadd_rn(old[j][h].x, __fmul_rn(acc[i][j][2 * h], alpha));
+          acc[i][j][2 * h + 1] = __fadd_rn(old[j][h].y, __fmul_rn(acc[i][j][2 * h + 1], alpha));
+        }
+    }
+    alpha = 1.0f;
+  }
 #pragma unroll
   for (int i = 0; i < MI; ++i) {
 #pragma unroll
@@ -224,11 +260,23 @@ __global__ void __launch_bounds__(THREADS, NVFP4_GEMM_MIN_BLOCKS) nvfp4_gemm_ker
   }
 }
 
+// One static per instantiation: each kernel needs its own max-dynamic-smem attribute.
+template <typename OutT, bool kAccum>
+void launch_gemm(const Args& p, dim3 grid, cudaStream_t stream) {
+  static const bool attr = (cudaFuncSetAttribute(nvfp4_gemm_kernel<OutT, kAccum>,
+                                                 cudaFuncAttributeMaxDynamicSharedMemorySize, SMEM_BYTES),
+                            true);
+  (void)attr;
+  nvfp4_gemm_kernel<OutT, kAccum><<<grid, THREADS, SMEM_BYTES, stream>>>(p);
+}
+
 }  // namespace gemm
 }  // namespace nvfp4
 
+// D = A @ B^T (into a new tensor, or into `out`); with accumulate, out += A @ B^T (fp32 only).
 torch::Tensor nvfp4_gemm(torch::Tensor a, torch::Tensor sfa, torch::Tensor gdec_a, torch::Tensor b, torch::Tensor sfb,
-                         torch::Tensor gdec_b, c10::ScalarType out_dtype) {
+                         torch::Tensor gdec_b, c10::ScalarType out_dtype, c10::optional<torch::Tensor> out,
+                         bool accumulate) {
   using namespace nvfp4::gemm;
   for (auto* t : {&a, &sfa, &b, &sfb})
     TORCH_CHECK(t->is_cuda() && t->scalar_type() == at::kByte && t->dim() == 2 && t->is_contiguous(),
@@ -241,23 +289,29 @@ torch::Tensor nvfp4_gemm(torch::Tensor a, torch::Tensor sfa, torch::Tensor gdec_
   TORCH_CHECK(sfa.size(0) == M && sfa.size(1) == K / 16 && sfb.size(0) == N && sfb.size(1) == K / 16,
               "scale tensors must be [rows, K/16]");
   TORCH_CHECK(out_dtype == at::kBFloat16 || out_dtype == at::kFloat, "out_dtype must be bf16 or fp32");
+  TORCH_CHECK(!accumulate || (out.has_value() && out_dtype == at::kFloat), "accumulate needs an fp32 `out`");
   const c10::cuda::CUDAGuard guard(a.device());
-  auto d = torch::empty({M, N}, a.options().dtype(out_dtype));
+  torch::Tensor d;
+  if (out.has_value()) {
+    d = *out;
+    TORCH_CHECK(d.is_cuda() && d.device() == a.device() && d.scalar_type() == out_dtype && d.is_contiguous() &&
+                    d.dim() == 2 && d.size(0) == M && d.size(1) == N,
+                "out must be a contiguous [M, N] tensor of out_dtype on the same device");
+  } else {
+    d = torch::empty({M, N}, a.options().dtype(out_dtype));
+  }
   if (M == 0 || N == 0) return d;
   Args p{a.data_ptr<uint8_t>(), b.data_ptr<uint8_t>(), sfa.data_ptr<uint8_t>(), sfb.data_ptr<uint8_t>(),
          gdec_a.data_ptr<float>(), gdec_b.data_ptr<float>(), d.data_ptr(), M, N, K};
   dim3 grid((N + BN - 1) / BN, (M + BM - 1) / BM);
   auto stream = at::cuda::getCurrentCUDAStream();
   if (out_dtype == at::kFloat) {
-    static bool attr = (cudaFuncSetAttribute(nvfp4_gemm_kernel<float>, cudaFuncAttributeMaxDynamicSharedMemorySize,
-                                             SMEM_BYTES), true);
-    (void)attr;
-    nvfp4_gemm_kernel<float><<<grid, THREADS, SMEM_BYTES, stream>>>(p);
+    if (accumulate)
+      launch_gemm<float, true>(p, grid, stream);
+    else
+      launch_gemm<float, false>(p, grid, stream);
   } else {
-    static bool attr = (cudaFuncSetAttribute(nvfp4_gemm_kernel<__nv_bfloat16>,
-                                             cudaFuncAttributeMaxDynamicSharedMemorySize, SMEM_BYTES), true);
-    (void)attr;
-    nvfp4_gemm_kernel<__nv_bfloat16><<<grid, THREADS, SMEM_BYTES, stream>>>(p);
+    launch_gemm<__nv_bfloat16, false>(p, grid, stream);
   }
   C10_CUDA_KERNEL_LAUNCH_CHECK();
   return d;

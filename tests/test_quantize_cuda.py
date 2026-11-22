@@ -69,3 +69,31 @@ def test_edge_values():
     x[3, 0] = 1e4                     # dominates amax
     _check(x)
     _check(torch.zeros(32, 32, device="cuda"))  # amax == 0 -> genc = 1
+
+
+def test_scale_rounding_tie():
+    # amax 14 -> genc 192; block max 6.25 -> 6.25 / 6 * 192 rounds onto the E4M3 midpoint between 192
+    # and 208. The reference must use IEEE division here (tensor / python scalar on CUDA does not).
+    x = torch.zeros(16, 32, device="cuda")
+    x[0, 0] = 14.0
+    x[1, 16] = 6.25
+    _check(x)
+    _check(x.cpu().cuda().to(torch.bfloat16))
+    d, s, g = ref.quantize(x.cpu())
+    assert torch.equal(s, ops.quantize(x).scales.cpu())  # CPU reference == CUDA kernel
+
+
+@pytest.mark.parametrize("transpose", [False, True])
+def test_rne_ties_and_signed_zero(transpose):
+    # amax 2688 -> genc 1; a block whose max is 6 -> scale 1.0 -> values are rounded unscaled, so every
+    # E2M1 rounding tie (and -0) is hit exactly. Exercises the hardware cvt.rn path vs the reference.
+    ties = [0.25, 0.75, 1.25, 1.75, 2.5, 3.5, 5.0, 0.1, 5.5, 7.0]
+    row = torch.tensor([6.0] + ties + [-t for t in ties[:5]], device="cuda")
+    x = torch.zeros(32, 32, device="cuda")
+    x[0, :16] = row
+    x[1, :16] = -row
+    x[2, 16] = 2688.0
+    x[3, 16:] = -1e-3  # tiny negatives -> -0 from the hardware convert -> must encode as +0
+    x[3, 17] = -2688.0 / 1000
+    _check(x.T.contiguous() if transpose else x, transpose=transpose)
+    _check(x, block_2d=True)

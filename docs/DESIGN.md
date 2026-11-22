@@ -68,25 +68,83 @@ be bit-identical to it in every mode.
 All three GEMMs run on a **single "TN" kernel** (`D = A·B^T`, with both operands quantized along
 the contraction dimension). This works because the quantizer can emit transposed outputs directly.
 
-## 3. Quantizer (`csrc/quantize.cu`)
+## 3. Quantizers (`csrc/quantize_dual.cu`, `csrc/quantize.cu`)
 
-The quantizer makes two passes: an amax reduction, then the quantization itself. Global amax
-scaling needs the whole tensor's maximum before any block can be scaled.
+Every NVFP4 quantization makes two passes: an amax reduction, then the quantization itself. Global
+amax scaling needs the whole tensor's maximum before any block can be scaled.
 
-- **Work assignment:** one thread owns one 16-element block, and there are two lane mappings.
-  - **Rowwise 1D:** a warp covers 32 consecutive blocks of one row, using 16-byte vector loads.
-    It reaches about 725–760 GB/s on 8192×2048 bf16, against the laptop's 896 GB/s peak.
-  - **Transposed and 2D:** a warp covers 32 consecutive rows of one block column. Reads are
-    coalesced across input columns, and each 16×16 tile sits in 16 adjacent lanes, so its scale is
-    a 4-step `__shfl_xor` max.
-- **Bit-exact arithmetic:** every operation uses an explicit IEEE intrinsic (`__fdiv_rn`,
-  `__fmul_rn`, ...), and the Hadamard transform is an explicit butterfly in the same order as the
-  reference. Results match the reference bit for bit.
-  - The reference had one subtle trap. In PyTorch, `2688.0 / tensor` is computed as
-    `reciprocal(tensor) * 2688`, which rounds twice and is 1 ulp off IEEE division. The reference
-    uses `torch.div` instead.
-- **Stochastic rounding:** it uses a counter-based hash (`lowbias32`) of (seed, element index).
-  This makes SR reproducible, seedable and identical between CPU and GPU.
+### 3.1 The fused dual quantizer (used by `NVFP4Linear`)
+
+Each training operand is needed in two layouts: X for fprop and RHT(X^T) for wgrad, W for fprop and
+W^T for dgrad, dY for dgrad and RHT(dY^T) for wgrad. `quantize_dual` produces both from **one read**:
+
+```
+quantize_dual(X [R, C]) -> ( Q(X) along C            [R, C/2]          row output
+                             Q(RHT(pad(X)^T)) along R [C, R_pad/2]      col output )
+```
+
+- **Options:** each output has its own stochastic-rounding seed. The col output can take the RHT and
+  is zero-padded to a multiple of `col_pad` tokens (128 for the wgrad GEMM). With 16×16 2D blocks
+  (weights), the col output is the exact transpose of the row output.
+- **Tiling:** a CTA stages a 64×64 tile of X in shared memory with coalesced 16-byte loads. The row
+  phase then has thread (b, r) quantize the block (row r, block column b). The col phase has thread
+  (b, c) quantize the block (column c, block row b).
+- **Conflict-free shared memory:** both phases read shared memory without bank conflicts (row stride
+  65 floats). In both, a warp's lanes are 32 consecutive rows or columns, so a 16×16 tile's scale is a
+  4-step `__shfl_xor` max.
+- **Staged stores:** each phase stages its codes and scales in shared memory and writes whole 32-byte
+  output rows with 16-byte stores. Writing directly from the quantizing threads meant 8-byte and
+  1-byte stores scattered over 32 rows per warp instruction, with four warps completing each sector.
+  That alone made each phase 2.3× slower.
+- **Amax:** it is a plain vectorized max, unless the col output uses the RHT. Then one tile kernel
+  computes both amax(X) and amax(RHT(X^T)). Both amax kernels are persistent (about 4 CTAs per SM)
+  and use **one `atomicMax` per CTA**. Same-address atomics serialize at the L2, and one per warp over
+  thousands of CTAs cost more than reading the tensor.
+- **Bit-exact:** each output is bit-identical to `reference.quantize_dual`, and so to two separate
+  single-output calls (`tests/test_quantize_dual_cuda.py`).
+
+`NVFP4Linear` therefore quantizes X in the forward pass in both layouts. It saves only the
+**NVFP4 copies of X^T and W^T** for backward. That is about 3.5× less than the BF16 activation
+v0.1 saved, and backward no longer re-reads it.
+
+### 3.2 Arithmetic: fast and bit-exact
+
+The quantize pass was ALU-bound with stochastic rounding. Every change below keeps the output
+bit-identical to the reference:
+
+- **Round-to-nearest-even uses the hardware convert** `cvt.rn.satfinite.e2m1x2.f32`, available on
+  sm_100a/sm_120a. One instruction converts two values. The hardware returns −0 for negative values
+  that round to zero, so a 3-instruction SWAR fix-up (`clear_negative_zeros`) clears the sign of
+  zero-magnitude nibbles, matching the reference.
+- **Stochastic rounding** has no hardware path on sm_120a: `ptxas` rejects `cvt.rs` (".rs not
+  supported on sm_120a"). It is done in software with no division and no int→float conversion:
+  - the 24-bit uniform `(h >> 8) · 2^-24` is assembled from mantissa bits;
+  - the lower grid point is `a` with its mantissa truncated to 1 bit (for `a ≥ 1`);
+  - the step's reciprocal comes from the exponent bits, a power of two, so `(a − lo) / step` is exact
+    as a multiply;
+  - the chosen grid value is then converted exactly by the hardware convert.
+
+  Together these made the SR quantize pass about 1.5× faster than v0.1's version.
+- **The RHT sign mask** (16 bits, derived from the seed) is computed once on the host. Sign flips are
+  XORs of the float sign bit, identical to multiplying by −1.
+- **Explicit rounding:** every remaining operation uses an explicit IEEE intrinsic (`__fdiv_rn`,
+  `__fmul_rn`, ...), and the Hadamard transform is a butterfly in the same order as the reference.
+- **Reference fix (v0.2):** in PyTorch on CUDA, `tensor / python_scalar` is computed as
+  `tensor * (1/scalar)`, which is not IEEE division. The reference's block-scale target
+  `amax_b / 6 · genc` used it, and it differs at E4M3 rounding ties. For example,
+  6.25 / 6 · 192 = 200 is exactly the midpoint of 192 and 208. The reference now uses true division,
+  so CPU and CUDA references and the kernels agree. `test_scale_rounding_tie` and
+  `test_block_scale_uses_ieee_division` cover it. In PyTorch, `2688.0 / tensor` is likewise
+  `reciprocal(tensor) * 2688`, so `global_scales` uses `torch.div`.
+- **Stochastic rounding is reproducible:** it uses a counter-based hash (`lowbias32`) of
+  (seed, element index), so SR is seedable and identical between CPU and GPU.
+
+### 3.3 The single-output quantizer
+
+`quantize()` (`csrc/quantize.cu`) is the general single-output kernel: rowwise, transposed or 2D, with
+optional RHT and SR. It shares the per-block math above (`quantize16` in `nvfp4_common.cuh`). One
+thread owns one 16-element block. In rowwise 1D mode a warp covers 32 consecutive blocks of a row
+with 16-byte loads. Otherwise a warp covers 32 consecutive rows of one block column.
 
 ## 4. GEMM (`csrc/gemm.cu`)
 
@@ -96,8 +154,15 @@ scaling needs the whole tensor's maximum before any block can be scaled.
 | Warps | 8: 2 along M × 4 along N, each computing a 64×32 output tile |
 | MMAs per warp per 64-wide K-step | 16 (4 m16 tiles × 4 n8 tiles) |
 | Pipeline | 4-stage `cp.async`, 18 KB per stage = 72 KB shared memory |
-| Registers | 130 per thread, no spills |
-| Epilogue | `alpha = gdec_A · gdec_B` applied in fp32, then bf16 or fp32 store |
+| Registers | 150 per thread, no spills (one 256-thread CTA per SM) |
+| Epilogue | `alpha = gdec_A · gdec_B` applied in fp32, then bf16 or fp32 store, or `D += alpha·acc` into an existing fp32 tensor |
+
+**Accumulating epilogue.** `gemm(..., out=g, accumulate=True)` adds into `g`. `NVFP4Linear(...,
+fuse_wgrad_accumulation=True)` uses it to accumulate weight gradients across micro-batches in place.
+The add is two separate IEEE ops (no FMA contraction), so the result is bit-identical to autograd's
+`grad + dW`. The old values for one m16 row group are loaded together before any store. A load can't
+be moved past a store to the same array, so a load-add-store loop serialized 32 memory latencies per
+warp: with it, the fused version was slower than the separate add it replaced.
 
 **Fragment layouts.** These come from CUTLASS `MMA_Traits<SM120_16x8x64_TN_VS>` and were confirmed
 on the GPU by the GEMM tests. `g = lane / 4`, `t = lane % 4`.
@@ -127,9 +192,10 @@ distinct banks.
 | Layer | Test | Criterion |
 |---|---|---|
 | Format spec | `tests/test_reference.py` (CPU, in CI) | RNE ties, saturation, SNR, 2D transpose invariance, RHT orthogonality, SR unbiasedness |
-| Quantizer | `tests/test_quantize_cuda.py` | **bit-exact** vs reference: bf16/fp32, transpose, 2D, SR, RHT, edge values |
+| Quantizer | `tests/test_quantize_cuda.py` | **bit-exact** vs reference: bf16/fp32, transpose, 2D, SR, RHT, edge values, every E2M1 rounding tie, E4M3 scale ties, −0 |
+| Dual quantizer | `tests/test_quantize_dual_cuda.py` | **bit-exact** vs `reference.quantize_dual` for all 6 configurations × 7 shapes × 2 dtypes; == two separate calls; 2D col == exact transpose |
 | GEMM | `tests/test_gemm_cuda.py` | vs fp64 reference: max error ≤ 1e-5 · max\|ref\|, ragged shapes, extreme scales |
-| Layer | `tests/test_linear.py` | CUDA == emulated recipe (same seeds); cosine with full precision > 0.97–0.98; SR noise averages out |
+| Layer | `tests/test_linear.py` | CUDA == emulated recipe (same seeds); cosine with full precision > 0.97–0.98; SR noise averages out; only NVFP4 tensors saved for backward (exact byte count); no-grad / frozen-weight / no-input-grad paths; fused wgrad accumulation == autograd bit for bit |
 | Hardware ISA | CI `cuda-compile` job | `OMMA.SF.16864...UE4M3.4X` present in SASS |
 | End to end | `experiments/train_gpt.py` | loss curves vs BF16 (see [RESULTS.md](RESULTS.md)) |
 
@@ -137,13 +203,19 @@ Every benchmark checks correctness against the reference before it times anythin
 
 ## 6. Known limitations and next steps
 
-1. **Quantization overhead.** Two passes per operand, with no fusion into the producing op. Fusing
-   amax and quantization into the preceding LayerNorm, GELU or residual would remove most of it.
-2. **Large-K GEMM efficiency.** The kernel reaches about 85% of cuBLASLt NVFP4 on long-K shapes,
-   and beats it on short K. Candidates: 2 CTAs per SM (2–3 stages), 128×256 tiles, a TMA producer
-   warp.
-3. **wgrad with small M×N.** There is no split-K yet.
-4. **Memory.** Backward re-quantizes the saved BF16 activations. Saving the NVFP4 copies instead
-   would cut activation memory by about 3.5×.
-5. **Weight quantization is redone per micro-batch.** It could be cached per optimizer step.
+Done in v0.2: a single fused read per operand (§3.1), NVFP4-saved activations, and in-place wgrad
+accumulation (opt-in).
+
+1. **Quantization is not fused into the producing op.** Each operand still costs an amax pass plus a
+   quantize pass over a tensor that the preceding LayerNorm, GELU or attention just wrote. Fusing
+   amax and quantization into those producers would remove most of the remaining ~0.6 ms per block
+   step at d=768.
+2. **Stochastic rounding is ALU-bound.** It needs two 32-bit hashes per element, because sm_120a has
+   no `cvt.rs`. A cheaper generator, such as one hash per two elements, would need a spec change.
+3. **Large-K GEMM efficiency.** The kernel reaches about 85% of cuBLASLt NVFP4 on long-K shapes, and
+   beats it on short K. Candidates: 128×256 tiles, warp-specialized producer warps, stream-K.
+4. **wgrad with a small M×N** has no split-K yet. At d=768, the 768×768 projection wgrad fills only
+   36 CTAs on 82 SMs.
+5. **Weight quantization is redone per micro-batch.** It could be cached per optimizer step, but a
+   safe invalidation rule is needed: `param.data` writes don't bump `_version`.
 6. **Platform.** Linux/WSL2 only. The native Windows build hasn't been tried.

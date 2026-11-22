@@ -2,9 +2,10 @@
 
 **4-bit (NVFP4) training on consumer Blackwell GPUs (RTX 50-series, `sm_120`).**
 
-The repository contains block-scaled FP4 tensor-core GEMMs, bit-exact fused quantizers (with
-16-point random Hadamard transform and stochastic rounding), and a drop-in `NVFP4Linear` that runs
-the forward, input-gradient and weight-gradient GEMMs in NVFP4.
+The repository contains block-scaled FP4 tensor-core GEMMs, bit-exact fused quantizers that emit
+an operand and its transpose in one pass (with 16-point random Hadamard transform and stochastic
+rounding), and a drop-in `NVFP4Linear` that runs the forward, input-gradient and weight-gradient
+GEMMs in NVFP4 and saves only 4-bit operands for backward.
 
 Consumer Blackwell has hardware FP4 tensor cores, but its programming model differs from datacenter
 Blackwell: warp-level `mma.sync` instead of `tcgen05`, no tensor memory, and about 99 KB of shared
@@ -17,12 +18,14 @@ Full details and raw data are in [docs/RESULTS.md](docs/RESULTS.md).
 
 | | |
 |---|---|
-| NVFP4 GEMM throughput | **261–356 TFLOPS**: **3.0–4.0× BF16 cuBLAS**. Faster than cuBLASLt NVFP4 on short-K shapes, about 86% of it on the longest K |
-| Transformer block fwd+bwd | **1.29× (d=768) → 1.76× (d=2048) → 2.13× (d=4096)** vs BF16 |
-| GPT-124M pretraining, 49M tokens | val loss **1.5064 vs 1.4884** BF16 (constant +0.018 gap, no divergence), **+10.7% tokens/s, −14.5% GPU energy** |
-| Correctness | quantizer **bit-exact** vs the reference spec; GEMM = fp64 reference to ~1e-7; 64 tests |
+| NVFP4 GEMM throughput | **264–362 TFLOPS**: **3.1–4.1× BF16 cuBLAS**. Faster than cuBLASLt NVFP4 on short-K shapes, about 86% of it on the longest K |
+| Fused dual quantizer | operand + transposed operand in one pass: **1.5–2.4×** faster than two separate quantizations |
+| Transformer block fwd+bwd | **1.66× (d=768) → 2.15× (d=2048) → 2.54× (d=4096)** vs BF16, with 9–10% less memory |
+| GPT-507M (d=2048) pretraining | val loss **1.6937 vs 1.6786** BF16 (+0.9%), **1.56× tokens/s, −36% GPU energy** |
+| GPT-124M (d=768) pretraining, 49M tokens | val loss **1.5092 vs 1.4892** BF16 (constant +0.02 gap, no divergence), **+24% tokens/s, −20% GPU energy** |
+| Correctness | quantizers **bit-exact** vs the reference spec; GEMM = fp64 reference to ~1e-7; 164 tests |
 
-![loss curves](experiments/results/loss.png)
+![loss curves](experiments/results/v0.2_wide/loss.png)
 
 ## Quick start (WSL2 or Linux, RTX 50-series)
 
@@ -56,8 +59,10 @@ runs the same recipe through the pure-PyTorch reference.
 ## Layout
 
 ```
-csrc/quantize.cu       BF16/FP32 -> NVFP4 (rowwise / transposed / 16x16 2D, RHT, stochastic rounding)
-csrc/gemm.cu           mma.sync kind::mxf4nvf4 block-scaled TN GEMM, 4-stage cp.async pipeline
+csrc/quantize_dual.cu  fused BF16/FP32 -> NVFP4 rowwise + transposed (RHT, SR, 16x16 2D) in one pass
+csrc/quantize.cu       single-output quantizer (rowwise / transposed / 16x16 2D, RHT, stochastic rounding)
+csrc/gemm.cu           mma.sync kind::mxf4nvf4 block-scaled TN GEMM, 4-stage cp.async pipeline,
+                       optional fused fp32 accumulate (D += A @ B^T) for wgrad
 nvfp4/reference.py     executable spec of the format and recipe (pure PyTorch)
 nvfp4/linear.py        NVFP4Linear autograd layer + convert_linears
 tests/                 bit-exact / reference tests (GPU tests auto-skip without sm_120)
@@ -71,9 +76,9 @@ docs/                  DESIGN.md, RESULTS.md, research/ (why this project exists
 
 This is a research-grade implementation, verified on one GPU. The known gaps are listed in
 [docs/DESIGN.md §6](docs/DESIGN.md#6-known-limitations-and-next-steps):
-- quantization isn't fused into producer ops;
-- there's no split-K;
-- backward re-quantizes saved BF16 activations;
+- quantization isn't fused into producer ops (LayerNorm, GELU), so activations still make one BF16 round trip;
+- there's no split-K for small-M/N, long-K GEMMs;
+- hardware stochastic rounding (`cvt.rs`) isn't available on sm_120a, so SR runs in software;
 - only Linux/WSL2 is supported.
 
 ## License

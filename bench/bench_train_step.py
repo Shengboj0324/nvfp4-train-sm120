@@ -22,11 +22,15 @@ from train_gpt import Block  # noqa: E402
 from nvfp4.linear import convert_linears  # noqa: E402
 
 
-def step_time(d: int, precision: str, b: int = 16, t: int = 512) -> float:
+def step_time(d: int, precision: str, b: int = 16, t: int = 512) -> tuple[float, float]:
+    """(seconds per fwd+bwd step, peak allocated MiB). Gradients accumulate across steps (no
+    zero_grad), as they do across micro-batches under gradient accumulation."""
     torch.manual_seed(0)
     blk = Block(d, max(1, d // 128)).cuda()
     if precision == "nvfp4":
         convert_linears(blk)
+    elif precision == "nvfp4_fused_wgrad":
+        convert_linears(blk, fuse_wgrad_accumulation=True)
     x = torch.randn(b, t, d, device="cuda", requires_grad=True)
 
     def step():
@@ -34,7 +38,11 @@ def step_time(d: int, precision: str, b: int = 16, t: int = 512) -> float:
             y = blk(x)
         y.float().sum().backward()
 
-    return timeit(step, iters=10, warmup=3, trials=5)
+    step()
+    torch.cuda.synchronize()
+    torch.cuda.reset_peak_memory_stats()
+    sec = timeit(step, iters=10, warmup=3, trials=5)
+    return sec, torch.cuda.max_memory_allocated() / 2**20
 
 
 def main():
@@ -43,10 +51,12 @@ def main():
     a = ap.parse_args()
     rows = []
     for d in (768, 1024, 2048, 3072, 4096):
-        tb, tq = step_time(d, "bf16"), step_time(d, "nvfp4")
+        (tb, mb), (tq, mq), (tf, mf) = (step_time(d, p) for p in ("bf16", "nvfp4", "nvfp4_fused_wgrad"))
         lin_flops = 6 * 8192 * 12 * d * d  # fwd+bwd FLOPs of the four linears
-        rows.append({"d": d, "bf16_ms": tb * 1e3, "nvfp4_ms": tq * 1e3, "speedup": tb / tq,
-                     "linear_tflops_bf16": lin_flops / tb / 1e12, "linear_tflops_nvfp4": lin_flops / tq / 1e12})
+        rows.append({"d": d, "bf16_ms": tb * 1e3, "nvfp4_ms": tq * 1e3, "nvfp4_fused_wgrad_ms": tf * 1e3,
+                     "speedup": tb / tq, "speedup_fused_wgrad": tb / tf,
+                     "linear_tflops_bf16": lin_flops / tb / 1e12, "linear_tflops_nvfp4": lin_flops / tq / 1e12,
+                     "peak_mib_bf16": mb, "peak_mib_nvfp4": mq})
         print(json.dumps({k: round(v, 3) if isinstance(v, float) else v for k, v in rows[-1].items()}), flush=True)
         torch.cuda.empty_cache()
     os.makedirs(os.path.dirname(a.out), exist_ok=True)
