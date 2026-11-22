@@ -5,6 +5,10 @@ Samples GPU (nvidia-smi) and host (/proc) state every --interval seconds, append
 kills the whole process group of the command if any limit is crossed, so a long benchmark or
 training run on a laptop can never drive the machine into a thermal or out-of-memory reset.
 
+Before starting, it waits for the GPU to cool below --start-max-temp; after the command exits, it
+keeps sampling until the GPU has cooled below --cooldown-temp (bounded by --cooldown-max-s), so
+back-to-back jobs never stack heat and every job ends with an idle, settled GPU.
+
     python tools/guard.py --log logs/run.csv -- python train.py ...
 
 Exit code: the command's exit code, or 99 if the guard had to kill it.
@@ -43,11 +47,25 @@ def host_sample() -> dict:
             "load1": load1, "ncpu": os.cpu_count()}
 
 
+def wait_cool(below_c: float, max_s: float) -> float:
+    """Sample every 2 s until the GPU is below `below_c` (or max_s passes); returns seconds waited."""
+    t0 = time.time()
+    while time.time() - t0 < max_s:
+        if gpu_sample().get("gpu_temp_c", 0.0) < below_c:
+            break
+        time.sleep(2.0)
+    return time.time() - t0
+
+
 def main() -> int:
     ap = argparse.ArgumentParser()
-    ap.add_argument("--interval", type=float, default=2.0)
-    ap.add_argument("--max-gpu-temp", type=float, default=87.0, help="kill at/above this GPU temp (C)")
-    ap.add_argument("--max-gpu-mem-frac", type=float, default=0.95)
+    ap.add_argument("--interval", type=float, default=1.0)
+    ap.add_argument("--max-gpu-temp", type=float, default=84.0, help="kill at/above this GPU temp (C)")
+    ap.add_argument("--max-gpu-mem-frac", type=float, default=0.90)
+    ap.add_argument("--start-max-temp", type=float, default=65.0, help="wait until the GPU is below this to start")
+    ap.add_argument("--cooldown-temp", type=float, default=65.0, help="after the command, wait until below this")
+    ap.add_argument("--cooldown-max-s", type=float, default=120.0)
+    ap.add_argument("--max-seconds", type=float, default=0.0, help="kill after this many seconds (0: no limit)")
     ap.add_argument("--min-host-mem-mb", type=float, default=1500.0)
     ap.add_argument("--max-load-per-cpu", type=float, default=1.5, help="sustained 1-min load / ncpu")
     ap.add_argument("--hot-strikes", type=int, default=3, help="consecutive bad samples before kill")
@@ -64,6 +82,9 @@ def main() -> int:
         log = open(a.log, "w", buffering=1)
         log.write("t_s,gpu_temp_c,gpu_power_w,gpu_util,gpu_mem_used_mb,sm_clock_mhz,host_mem_avail_mb,load1\n")
 
+    waited = wait_cool(a.start_max_temp, 300.0)
+    if waited > 1:
+        print(f"[guard] waited {waited:.0f}s for the GPU to cool below {a.start_max_temp:.0f}C", file=sys.stderr)
     proc = subprocess.Popen(cmd, start_new_session=True)
     t0, strikes, peak = time.time(), 0, {"temp": 0.0, "power": 0.0, "gpu_mem": 0.0, "min_host_mem": 1e12}
     killed_reason = None
@@ -86,6 +107,8 @@ def main() -> int:
             reasons.append(f"host mem available {h['host_mem_avail_mb']:.0f} MB < {a.min_host_mem_mb:.0f} MB")
         if h["load1"] / h["ncpu"] > a.max_load_per_cpu:
             reasons.append(f"load {h['load1']:.1f} on {h['ncpu']} CPUs")
+        if a.max_seconds and time.time() - t0 > a.max_seconds:
+            reasons.append(f"time limit {a.max_seconds:.0f}s")
         strikes = strikes + 1 if reasons else 0
         if strikes >= a.hot_strikes:
             killed_reason = "; ".join(reasons)
@@ -97,8 +120,10 @@ def main() -> int:
             break
         time.sleep(a.interval)
     rc = proc.wait()
+    cooled = wait_cool(a.cooldown_temp, a.cooldown_max_s)
     summary = (f"[guard] elapsed {time.time()-t0:.0f}s | peak GPU temp {peak['temp']:.0f}C, power {peak['power']:.0f}W, "
-               f"GPU mem {peak['gpu_mem']:.0f}MB | min host mem avail {peak['min_host_mem']:.0f}MB")
+               f"GPU mem {peak['gpu_mem']:.0f}MB | min host mem avail {peak['min_host_mem']:.0f}MB"
+               f" | cooldown {cooled:.0f}s")
     print(summary, file=sys.stderr, flush=True)
     if killed_reason:
         print(f"[guard] KILLED: {killed_reason}", file=sys.stderr, flush=True)

@@ -51,12 +51,14 @@ def energy(name):
     p = os.path.join(R, f"train_{name}.csv")
     if not os.path.exists(p):
         return None
-    rows = list(csv.DictReader(open(p)))
-    pw = [float(r["gpu_power_w"]) for r in rows if r["gpu_power_w"] not in ("", "nan")]
+    rows = [r for r in csv.DictReader(open(p)) if r["gpu_power_w"] not in ("", "nan")]
+    t = [float(r["t_s"]) for r in rows]
+    pw = [float(r["gpu_power_w"]) for r in rows]
     clk = [float(r["sm_clock_mhz"]) for r in rows if r["sm_clock_mhz"] not in ("", "nan")]
     temp = [float(r["gpu_temp_c"]) for r in rows if r["gpu_temp_c"] not in ("", "nan")]
-    dt = float(rows[1]["t_s"]) - float(rows[0]["t_s"]) if len(rows) > 1 else 2.0
-    return {"joules": sum(pw) * dt, "mean_w": sum(pw) / len(pw), "mean_sm_mhz": sum(clk) / len(clk),
+    # trapezoid over the actual sample times (the sampling interval is not constant)
+    joules = sum((t1 - t0) * (p0 + p1) / 2 for t0, t1, p0, p1 in zip(t, t[1:], pw, pw[1:]))
+    return {"joules": joules, "mean_w": joules / (t[-1] - t[0]), "mean_sm_mhz": sum(clk) / len(clk),
             "max_temp_c": max(temp)}
 
 

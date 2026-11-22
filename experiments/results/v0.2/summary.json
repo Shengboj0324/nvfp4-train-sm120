@@ -6,11 +6,11 @@
   "max_mem_gb": 10.118679523468018,
   "nvfp4_linears": 0,
   "completed": true,
-  "gpu_joules": 133555.2199999999,
-  "mean_gpu_w": 169.9175826972009,
+  "gpu_joules": 136166.89950000006,
+  "mean_gpu_w": 170.1235625937032,
   "mean_sm_mhz": 2179.8651399491096,
   "max_gpu_temp_c": 76.0,
-  "joules_per_1k_tokens": 2.7171879069010396
+  "joules_per_1k_tokens": 2.7703226623535167
  },
  "nvfp4": {
   "final_val_loss": 1.5091534167528153,
@@ -19,10 +19,10 @@
   "max_mem_gb": 9.547337055206299,
   "nvfp4_linears": 40,
   "completed": true,
-  "gpu_joules": 106971.50000000003,
-  "mean_gpu_w": 169.7960317460318,
+  "gpu_joules": 109210.35999999994,
+  "mean_gpu_w": 170.056617876051,
   "mean_sm_mhz": 2178.133333333333,
   "max_gpu_temp_c": 76.0,
-  "joules_per_1k_tokens": 2.1763407389322924
+  "joules_per_1k_tokens": 2.2218904622395823
  }
 }

@@ -26,6 +26,8 @@ SHAPES = [
     (8192, 8192, 2048), (8192, 2048, 8192), (2048, 8192, 8192),
     # smaller model (768 hidden, 3072 MLP), 8192 tokens
     (8192, 3072, 768), (8192, 768, 3072), (768, 3072, 8192),
+    # small-output wgrad GEMMs at d=768 (split-K territory)
+    (768, 768, 8192), (2304, 768, 8192),
 ]
 
 
@@ -116,10 +118,12 @@ def main():
         flops = 2.0 * m * n * k
         t_bf16 = timeit(lambda: a @ b.T, args.iters)
         t_fp4 = timeit(lambda: ops.gemm(qa, qb), args.iters)
+        t_fp4_cp = timeit(lambda: ops.gemm(qa, qb, impl="cp.async", splits=1), args.iters)
         t_fp4_q = timeit(lambda: ops.gemm(ops.quantize(a), ops.quantize(b)), args.iters)
         row = {"M": m, "N": n, "K": k,
                "bf16_cublas_tflops": flops / t_bf16 / 1e12,
-               "nvfp4_ours_tflops": flops / t_fp4 / 1e12,
+               "nvfp4_ours_tflops": flops / t_fp4 / 1e12,          # auto: TMA loop for K >= 1024
+               "nvfp4_cp_async_loop_tflops": flops / t_fp4_cp / 1e12,  # the v0.2 main loop
                "nvfp4_ours_incl_quant_tflops": flops / t_fp4_q / 1e12,
                "check_rel_err": rel}
         run, why = cublaslt_nvfp4(qa, qb)

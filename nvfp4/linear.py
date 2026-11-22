@@ -59,6 +59,17 @@ class _QuantizerEmulate:
 _BACKENDS = {"cuda": _QuantizerCUDA, "emulate": _QuantizerEmulate}
 
 
+def _weight_grad(param, dytq, xtq, w_dtype, backend_name: str):
+    """dW = dY^T X from the NVFP4 operands. With ``param`` given (fused accumulation) and an fp32
+    ``param.grad`` present, the GEMM adds into ``.grad`` in place and None is returned to autograd."""
+    g = param.grad if param is not None else None
+    if g is not None and g.dtype == torch.float32 and g.is_contiguous() and g.shape == param.shape:
+        ops.gemm(dytq, xtq, out=g, accumulate=True)
+        return None
+    dw = _BACKENDS[backend_name].mm(dytq, xtq, torch.float32 if w_dtype == torch.float32 else torch.bfloat16)
+    return dw.to(w_dtype)
+
+
 class _NVFP4LinearFn(torch.autograd.Function):
     @staticmethod
     def forward(ctx, x2d, weight, backend_name: str, wgrad_rht: bool, need_dgrad: bool, need_wgrad: bool,
@@ -100,15 +111,8 @@ class _NVFP4LinearFn(torch.autograd.Function):
         dyq, dytq = be.dual(dy, row=do_dx, col=do_dw, row_sr_seed=row_seed, col_sr_seed=col_seed,
                             rht_seed=ctx.rht, col_pad=ALIGN)
         dx = be.mm(dyq, wtq, torch.bfloat16) if do_dx else None              # [M, in]
-        dw = None
-        if do_dw:                                                            # [out, in]
-            g = ctx.param.grad if ctx.param is not None else None
-            if g is not None and g.dtype == torch.float32 and g.is_contiguous() and g.shape == ctx.param.shape:
-                # fused accumulation: .grad += dY^T X inside the GEMM epilogue; autograd sees no grad
-                ops.gemm(dytq, xtq, out=g, accumulate=True)
-            else:
-                dw = be.mm(dytq, xtq, torch.float32 if ctx.w_dtype == torch.float32 else torch.bfloat16)
-                dw = dw.to(ctx.w_dtype)
+        # [out, in]; with fused accumulation the GEMM adds into .grad and autograd sees no gradient
+        dw = _weight_grad(ctx.param, dytq, xtq, ctx.w_dtype, ctx.backend_name) if do_dw else None
         return dx, dw, None, None, None, None, None
 
 

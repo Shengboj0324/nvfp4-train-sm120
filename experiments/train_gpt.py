@@ -21,7 +21,8 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-from nvfp4.linear import convert_linears
+from nvfp4.fused import layernorm_linear, layernorm_mlp
+from nvfp4.linear import NVFP4Linear, convert_linears
 
 
 class Block(nn.Module):
@@ -34,14 +35,31 @@ class Block(nn.Module):
         self.ln2 = nn.LayerNorm(d)
         self.fc1 = nn.Linear(d, 4 * d, bias=False)
         self.fc2 = nn.Linear(4 * d, d, bias=False)
+        self.fused = False  # set by fuse_producers(): LayerNorm / GELU run inside the NVFP4 quantizers
 
     def forward(self, x):
         b, t, d = x.shape
-        q, k, v = self.qkv(self.ln1(x)).split(d, dim=2)
+        if self.fused:
+            q, k, v = layernorm_linear(x, self.ln1, self.qkv).split(d, dim=2)
+        else:
+            q, k, v = self.qkv(self.ln1(x)).split(d, dim=2)
         q, k, v = (z.view(b, t, self.h, d // self.h).transpose(1, 2) for z in (q, k, v))
         a = F.scaled_dot_product_attention(q, k, v, is_causal=True)
         x = x + self.proj(a.transpose(1, 2).reshape(b, t, d))
+        if self.fused:
+            return x + layernorm_mlp(x, self.ln2, self.fc1, self.fc2)
         return x + self.fc2(F.gelu(self.fc1(self.ln2(x)), approximate="tanh"))
+
+
+def fuse_producers(blocks) -> int:
+    """Run LayerNorm and GELU inside the NVFP4 quantizers in every block whose qkv / fc1 / fc2 are
+    NVFP4Linear (nvfp4.fused). Returns the number of fused blocks."""
+    n = 0
+    for blk in blocks:
+        if all(isinstance(m, NVFP4Linear) and m.backend == "cuda" for m in (blk.qkv, blk.fc1, blk.fc2)):
+            blk.fused = True
+            n += 1
+    return n
 
 
 class GPT(nn.Module):
@@ -113,6 +131,8 @@ def main():
     ap.add_argument("--no-rht", action="store_true", help="ablation: disable the wgrad Hadamard transform")
     ap.add_argument("--fuse-wgrad", action="store_true",
                     help="accumulate NVFP4 weight grads across micro-batches inside the wgrad GEMM")
+    ap.add_argument("--fuse-producers", action="store_true",
+                    help="run LayerNorm / GELU (and its backward) inside the NVFP4 quantizers")
     ap.add_argument("--seed", type=int, default=0)
     ap.add_argument("--data", default=os.environ.get("NVFP4_DATA", os.path.expanduser("~/nvfp4_data")))
     ap.add_argument("--out", required=True)
@@ -129,6 +149,8 @@ def main():
         skip = tuple(f"blocks.{i}." for i in range(a.layers - a.hp_last, a.layers))
         converted = convert_linears(model.blocks, skip=tuple(s[len("blocks."):] for s in skip),
                                     wgrad_rht=not a.no_rht, fuse_wgrad_accumulation=a.fuse_wgrad)
+        if a.fuse_producers:
+            fuse_producers(model.blocks)
     n_params = sum(p.numel() for p in model.parameters())
     opt = torch.optim.AdamW(model.parameters(), lr=a.lr, betas=(0.9, 0.95), weight_decay=0.1, fused=True)
     sched = lambda s: min(1.0, (s + 1) / a.warmup) * (0.1 + 0.9 * 0.5 * (1 + math.cos(math.pi * min(s, a.steps) / a.steps)))  # noqa: E731
@@ -183,6 +205,12 @@ def main():
                 print("non-finite loss, stopping", flush=True)
                 break
     log.write(json.dumps({"done": True, "total_s": time.perf_counter() - t_start}) + "\n")
+    log.close()
+    # Wind down explicitly (finish queued work, release cached memory) rather than tearing down a busy
+    # CUDA context at interpreter exit; on this laptop a run once ended in a display-driver crash.
+    torch.cuda.synchronize()
+    del model, opt
+    torch.cuda.empty_cache()
 
 
 if __name__ == "__main__":

@@ -1,0 +1,28 @@
+{
+ "bf16": {
+  "final_val_loss": 1.4892248600721358,
+  "median_tok_per_s": 63311.52828242194,
+  "wall_s": 797.452042098,
+  "max_mem_gb": 10.118679523468018,
+  "nvfp4_linears": 0,
+  "completed": true,
+  "gpu_joules": 136166.89950000006,
+  "mean_gpu_w": 170.1235625937032,
+  "mean_sm_mhz": 2179.8651399491096,
+  "max_gpu_temp_c": 76.0,
+  "joules_per_1k_tokens": 2.7703226623535167
+ },
+ "nvfp4": {
+  "final_val_loss": 1.5061935395002366,
+  "median_tok_per_s": 80526.01301305128,
+  "wall_s": 626.9136957669999,
+  "max_mem_gb": 9.550999164581299,
+  "nvfp4_linears": 40,
+  "completed": true,
+  "gpu_joules": 106708.04399999997,
+  "mean_gpu_w": 169.48545743329092,
+  "mean_sm_mhz": 2165.3948220064726,
+  "max_gpu_temp_c": 76.0,
+  "joules_per_1k_tokens": 2.1709807128906244
+ }
+}
