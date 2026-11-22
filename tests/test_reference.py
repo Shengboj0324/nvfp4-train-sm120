@@ -1,0 +1,80 @@
+"""CPU-only tests of the NVFP4 reference (the spec). Run in CI without a GPU."""
+import torch
+import pytest
+
+from nvfp4 import reference as ref
+
+
+def test_e2m1_grid_roundtrip():
+    grid = ref.E2M1_GRID
+    vals = torch.cat([grid, -grid[1:]])
+    assert torch.equal(ref.e2m1_decode(ref.e2m1_round_rne(vals)), vals)
+
+
+@pytest.mark.parametrize("x,expected", [
+    (0.25, 0.0), (0.2500001, 0.5), (0.75, 1.0), (1.25, 1.0), (1.2500001, 1.5), (1.75, 2.0),
+    (2.5, 2.0), (2.5000002, 3.0), (3.5, 4.0), (5.0, 4.0), (5.0000005, 6.0), (100.0, 6.0), (-0.75, -1.0),
+])
+def test_e2m1_rne_ties_and_saturation(x, expected):
+    got = ref.e2m1_decode(ref.e2m1_round_rne(torch.tensor([x]))).item()
+    assert got == expected
+
+
+def test_negative_zero_encodes_as_positive_zero():
+    assert ref.e2m1_round_rne(torch.tensor([-0.1])).item() == 0
+
+
+def test_quantize_error_is_bounded():
+    torch.manual_seed(0)
+    x = torch.randn(64, 256)
+    y = ref.fake_quant(x)
+    # 4-bit with fp8 block scales: ~ 9-10 dB-per-bit regime, expect roughly 19-22 dB SNR on Gaussians
+    assert 17.0 < ref.snr_db(x, y) < 25.0
+    # per-block max is representable to within the e4m3 scale rounding (<= 6.25% relative)
+    xb = x.reshape(64, 16, 16).abs().amax(-1)
+    yb = y.reshape(64, 16, 16).abs().amax(-1)
+    assert torch.all((yb - xb).abs() <= 0.0625 * xb + 1e-6)
+
+
+def test_block_2d_is_transpose_invariant():
+    torch.manual_seed(1)
+    w = torch.randn(128, 64)
+    a = ref.fake_quant(w, block_2d=True)
+    b = ref.fake_quant(w.T.contiguous(), block_2d=True).T
+    assert torch.equal(a, b)
+
+
+def test_rht_matches_dense_matrix_and_is_orthogonal():
+    torch.manual_seed(2)
+    m = ref.rht_matrix(1234)
+    assert torch.allclose(m @ m.T, torch.eye(16), atol=1e-6)
+    x = torch.randn(8, 64)
+    dense = (x.reshape(8, 4, 16) @ m).reshape(8, 64)
+    assert torch.allclose(ref.apply_rht(x, 1234), dense, atol=1e-5)
+    # inner products along the transformed dim are preserved -> GEMM result unchanged
+    a, b = torch.randn(32, 64), torch.randn(16, 64)
+    assert torch.allclose(ref.apply_rht(a, 7) @ ref.apply_rht(b, 7).T, a @ b.T, atol=1e-4)
+
+
+def test_stochastic_rounding_is_unbiased():
+    torch.manual_seed(3)
+    x = torch.rand(1, 16) * 5.5 + 0.2
+    x[0, 0] = x.abs().max() * 1.0001  # keep the block max (exactly representable) away from the probes
+    n = 4000
+    acc = torch.zeros_like(x)
+    for s in range(n):
+        acc += ref.fake_quant(x, stochastic=True, seed=s)
+    mean = acc / n
+    det = ref.fake_quant(x)
+    # SR mean converges to x (bias << RNE error); RNE has systematic error
+    assert (mean - x).abs()[0, 1:].max() < 0.06
+    assert (mean - x).abs()[0, 1:].mean() < 0.5 * (det - x).abs()[0, 1:].mean()
+
+
+def test_gemm_reference_matches_dequantized_matmul():
+    torch.manual_seed(4)
+    a, b = torch.randn(32, 128), torch.randn(48, 128)
+    qa, qb = ref.quantize(a), ref.quantize(b)
+    d = ref.gemm(qa, qb)
+    assert torch.allclose(d, ref.dequantize(*qa) @ ref.dequantize(*qb).T, rtol=1e-4, atol=1e-4)
+    assert ref.snr_db(a @ b.T, d) > 10.0
