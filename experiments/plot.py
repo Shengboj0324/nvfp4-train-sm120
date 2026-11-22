@@ -1,6 +1,8 @@
-"""Summarise and plot the runs in experiments/results/*.jsonl.
+"""Summarise and plot the runs in a results directory (default experiments/results).
 
-    python experiments/plot.py   -> experiments/results/loss.png, summary.json (and prints a table)
+    python experiments/plot.py [DIR]   -> DIR/loss.png, DIR/summary.json (and prints a table)
+
+The run named "bf16" in DIR is the baseline for the gap panel; energy comes from DIR/train_<run>.csv.
 """
 from __future__ import annotations
 
@@ -8,13 +10,14 @@ import csv
 import glob
 import json
 import os
+import sys
 
 import matplotlib
 
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt  # noqa: E402
 
-R = os.path.join(os.path.dirname(__file__), "results")
+R = sys.argv[1] if len(sys.argv) > 1 else os.path.join(os.path.dirname(__file__), "results")
 LABELS = {"bf16": "BF16 baseline", "nvfp4": "NVFP4 (last 2 blocks BF16)", "nvfp4_all": "NVFP4 (all blocks)",
           "nvfp4_no_rht": "NVFP4 without wgrad RHT"}
 
@@ -74,7 +77,10 @@ def main():
             summary[name].update({"gpu_joules": e["joules"], "mean_gpu_w": e["mean_w"],
                                   "mean_sm_mhz": e["mean_sm_mhz"], "max_gpu_temp_c": e["max_temp_c"],
                                   "joules_per_1k_tokens": e["joules"] / tokens * 1e3})
-    ax[0].set(xlabel="step", ylabel="train loss", ylim=(1.0, 4.0), title="Train loss (GPT 124M, TinyStories)")
+    m0 = runs[order[0]][0]
+    c0 = m0["config"]
+    model = f"GPT {m0['params'] / 1e6:.0f}M, d={c0['d']}, {c0['layers']} layers"
+    ax[0].set(xlabel="step", ylabel="train loss", ylim=(1.0, 4.0), title=f"Train loss ({model}, TinyStories)")
     ax[1].set(xlabel="step", ylabel="val loss", ylim=(1.0, 4.0), title="Validation loss")
     base = {r["step"]: r["val_loss"] for r in runs["bf16"][2]} if "bf16" in runs else {}
     for name in order:

@@ -33,7 +33,7 @@ struct QParams {
   bool transpose;
   bool use_rht;
   bool lanes_along_cols;  // lanes = consecutive blocks of one row (rowwise 1D); else consecutive rows
-  uint64_t rht_seed;
+  uint32_t rht_mask;  // rht_sign_mask(rht_seed)
 };
 
 // Thread -> (logical row, block column) mapping shared by both passes.
@@ -96,7 +96,7 @@ __device__ __forceinline__ void load_block(const T* __restrict__ x, const QParam
 #pragma unroll
     for (int i = 0; i < kBlock; ++i) v[i] = to_f(src[static_cast<int64_t>(i) * p.C]);
   }
-  if (p.use_rht) rht16(v, p.rht_seed);
+  if (p.use_rht) rht16(v, p.rht_mask);
 }
 
 // Pass 1: amax over the (optionally transformed) logical tensor. amax_bits holds a non-negative
@@ -114,9 +114,18 @@ __global__ void amax_kernel(const T* __restrict__ x, QParams p, unsigned int* __
 #pragma unroll
     for (int i = 0; i < kBlock; ++i) m = fmaxf(m, fabsf(v[i]));
   }
+  // CTA-level reduction, then one atomic per CTA (same-address atomics serialize at the L2)
+  __shared__ float red[32];
 #pragma unroll
   for (int o = 16; o > 0; o >>= 1) m = fmaxf(m, __shfl_xor_sync(0xffffffffu, m, o));
-  if ((threadIdx.x & 31) == 0) atomicMax(amax_bits, __float_as_uint(m));
+  if ((threadIdx.x & 31) == 0) red[threadIdx.x / 32] = m;
+  __syncthreads();
+  if (threadIdx.x < 32) {
+    m = threadIdx.x < blockDim.x / 32 ? red[threadIdx.x] : 0.0f;
+#pragma unroll
+    for (int o = 16; o > 0; o >>= 1) m = fmaxf(m, __shfl_xor_sync(0xffffffffu, m, o));
+    if (threadIdx.x == 0) atomicMax(amax_bits, __float_as_uint(m));
+  }
 }
 
 template <typename T, bool kBlock2D, bool kStochastic>
@@ -131,8 +140,7 @@ __global__ void quantize_kernel(const T* __restrict__ x, QParams p, const unsign
   const bool valid = block_coords(p, warp, lane, orow, bcol);
 
   // global scales: genc = 2688 / amax (1 if amax == 0), gdec = 1 / genc
-  const float amax = __uint_as_float(*amax_bits);
-  const float genc = amax > 0.0f ? __fdiv_rn(kE4M3Max * kE2M1Max, amax) : 1.0f;
+  const float genc = global_encode_scale(__uint_as_float(*amax_bits));
   if (blockIdx.x == 0 && threadIdx.x == 0) *gdec_out = __fdiv_rn(1.0f, genc);
 
   float v[kBlock];
@@ -148,29 +156,10 @@ __global__ void quantize_kernel(const T* __restrict__ x, QParams p, const unsign
   }
   if (!valid) return;
 
-  const float s_target = fminf(__fmul_rn(__fdiv_rn(bmax, kE2M1Max), genc), kE4M3Max);
-  const uint8_t s = e4m3_from_float(s_target);
-  const float sf = e4m3_to_float(s);
-  const float enc = sf > 0.0f ? __fdiv_rn(genc, sf) : 0.0f;
-
-  uint32_t lo_word = 0, hi_word = 0;
-#pragma unroll
-  for (int i = 0; i < kBlock; ++i) {
-    const float y = __fmul_rn(v[i], enc);
-    uint32_t code;
-    if (kStochastic) {
-      const uint64_t lin = static_cast<uint64_t>(orow) * p.C_out + bcol * kBlock + i;
-      code = e2m1_round_stochastic(y, sr_uniform(sr_seed, lin));
-    } else {
-      code = e2m1_round_rne(y);
-    }
-    if (i < 8)
-      lo_word |= code << (4 * i);
-    else
-      hi_word |= code << (4 * (i - 8));
-  }
-  uint2* dst = reinterpret_cast<uint2*>(data + static_cast<int64_t>(orow) * (p.C_out / 2) + bcol * (kBlock / 2));
-  *dst = make_uint2(lo_word, hi_word);
+  uint2 packed;
+  const uint64_t lin0 = static_cast<uint64_t>(orow) * p.C_out + bcol * kBlock;
+  const uint8_t s = quantize16<kStochastic>(v, bmax, genc, sr_seed, lin0, packed);
+  *reinterpret_cast<uint2*>(data + static_cast<int64_t>(orow) * (p.C_out / 2) + bcol * (kBlock / 2)) = packed;
   scales[static_cast<int64_t>(orow) * nbc + bcol] = s;
 }
 
@@ -190,7 +179,7 @@ std::vector<torch::Tensor> nvfp4_quantize(torch::Tensor x, bool transpose, bool 
   p.R_out = transpose ? p.C : p.R;
   p.C_out = transpose ? p.R : p.C;
   p.use_rht = use_rht;
-  p.rht_seed = static_cast<uint64_t>(rht_seed);
+  p.rht_mask = rht_sign_mask(static_cast<uint64_t>(rht_seed));
   p.lanes_along_cols = !transpose && !block_2d;
   TORCH_CHECK(p.C_out % kBlock == 0, "quantized dim (", p.C_out, ") must be a multiple of 16");
   TORCH_CHECK(!block_2d || p.R_out % kBlock == 0, "2D blocks need the other dim (", p.R_out, ") % 16 == 0");
@@ -206,7 +195,7 @@ std::vector<torch::Tensor> nvfp4_quantize(torch::Tensor x, bool transpose, bool 
   const int threads = 256;
   const int64_t nthreads = num_warps(p) * 32;
   const int grid = static_cast<int>((nthreads + threads - 1) / threads);
-  const int amax_grid = std::min(grid, 4096);
+  const int amax_grid = std::min(grid, 4 * at::cuda::getCurrentDeviceProperties()->multiProcessorCount);
   auto* amax_ptr = reinterpret_cast<unsigned int*>(amax.data_ptr<int>());
 
 #define NVFP4_LAUNCH(T, B2D, SR)                                                                           \

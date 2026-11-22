@@ -52,3 +52,18 @@ def test_varied_block_scales():
 def test_accuracy_vs_full_precision():
     d, _, full = _run(512, 512, 2048)
     assert ref.snr_db(full, d) > 10.0
+
+
+def test_out_and_accumulate():
+    a = torch.randn(200, 256, device="cuda")
+    b = torch.randn(136, 256, device="cuda")
+    qa, qb = ops.quantize(a), ops.quantize(b)
+    d = ops.gemm(qa, qb, torch.float32)
+    out = torch.full((200, 136), 0.5, device="cuda")
+    ops.gemm(qa, qb, out=out, accumulate=True)
+    assert torch.equal(out, 0.5 + d)
+    out2 = torch.empty(200, 136, device="cuda", dtype=torch.bfloat16)
+    ops.gemm(qa, qb, out=out2)
+    assert torch.equal(out2, ops.gemm(qa, qb, torch.bfloat16))
+    with pytest.raises(RuntimeError):
+        ops.gemm(qa, qb, out=out2, accumulate=True)  # bf16 accumulation is not supported

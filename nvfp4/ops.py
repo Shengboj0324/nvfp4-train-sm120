@@ -47,8 +47,35 @@ def quantize(x: torch.Tensor, *, transpose: bool = False, block_2d: bool = False
     return NVFP4Tensor(d, s, g)
 
 
-def gemm(a: NVFP4Tensor, b: NVFP4Tensor, out_dtype: torch.dtype = torch.bfloat16) -> torch.Tensor:
-    """D[M, N] = A[M, K] @ B[N, K]^T with both operands in NVFP4 (block-scaled tensor-core MMA)."""
+def quantize_dual(x: torch.Tensor, *, row: bool = True, col: bool = True, block_2d: bool = False,
+                  row_sr_seed: int | None = None, col_sr_seed: int | None = None, rht_seed: int | None = None,
+                  col_pad: int = 16) -> tuple[NVFP4Tensor | None, NVFP4Tensor | None]:
+    """One read of ``x`` [R, C] -> (``x`` quantized along C, ``x.T`` quantized along R).
+
+    The second output is padded with zero rows of ``x`` to a multiple of ``col_pad`` and optionally
+    random-Hadamard transformed (``rht_seed``). ``*_sr_seed`` enables stochastic rounding for that
+    output. With ``block_2d`` both use 16x16 tiles, so the col output is the exact transpose of the row
+    output. Bit-identical to ``reference.quantize_dual``.
+    """
     if _C is None:
         raise RuntimeError("nvfp4 CUDA extension not built")
-    return _C.gemm(a.data, a.scales, a.gdec, b.data, b.scales, b.gdec, out_dtype)
+    if not x.is_contiguous() or x.data_ptr() % 16:
+        x = x.contiguous() if not x.is_contiguous() else x.clone()
+    rd, rs, rg, cd, cs, cg = _C.quantize_dual(
+        x, row, col, block_2d, row_sr_seed is not None, int(row_sr_seed or 0), col_sr_seed is not None,
+        int(col_sr_seed or 0), rht_seed is not None, int(rht_seed or 0), int(col_pad))
+    return (NVFP4Tensor(rd, rs, rg) if row else None, NVFP4Tensor(cd, cs, cg) if col else None)
+
+
+def gemm(a: NVFP4Tensor, b: NVFP4Tensor, out_dtype: torch.dtype = torch.bfloat16, *,
+         out: torch.Tensor | None = None, accumulate: bool = False) -> torch.Tensor:
+    """D[M, N] = A[M, K] @ B[N, K]^T with both operands in NVFP4 (block-scaled tensor-core MMA).
+
+    ``out`` writes into an existing contiguous [M, N] tensor; ``accumulate=True`` adds to it instead
+    (fp32 only), e.g. to accumulate a weight gradient in place across micro-batches.
+    """
+    if _C is None:
+        raise RuntimeError("nvfp4 CUDA extension not built")
+    if out is not None:
+        out_dtype = out.dtype
+    return _C.gemm(a.data, a.scales, a.gdec, b.data, b.scales, b.gdec, out_dtype, out, accumulate)

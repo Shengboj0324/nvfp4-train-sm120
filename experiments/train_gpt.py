@@ -111,6 +111,8 @@ def main():
     ap.add_argument("--eval-every", type=int, default=250)
     ap.add_argument("--hp-last", type=int, default=2, help="keep the last N blocks in BF16 (NVFP4 mode)")
     ap.add_argument("--no-rht", action="store_true", help="ablation: disable the wgrad Hadamard transform")
+    ap.add_argument("--fuse-wgrad", action="store_true",
+                    help="accumulate NVFP4 weight grads across micro-batches inside the wgrad GEMM")
     ap.add_argument("--seed", type=int, default=0)
     ap.add_argument("--data", default=os.environ.get("NVFP4_DATA", os.path.expanduser("~/nvfp4_data")))
     ap.add_argument("--out", required=True)
@@ -126,7 +128,7 @@ def main():
     if a.precision == "nvfp4":
         skip = tuple(f"blocks.{i}." for i in range(a.layers - a.hp_last, a.layers))
         converted = convert_linears(model.blocks, skip=tuple(s[len("blocks."):] for s in skip),
-                                    wgrad_rht=not a.no_rht)
+                                    wgrad_rht=not a.no_rht, fuse_wgrad_accumulation=a.fuse_wgrad)
     n_params = sum(p.numel() for p in model.parameters())
     opt = torch.optim.AdamW(model.parameters(), lr=a.lr, betas=(0.9, 0.95), weight_decay=0.1, fused=True)
     sched = lambda s: min(1.0, (s + 1) / a.warmup) * (0.1 + 0.9 * 0.5 * (1 + math.cos(math.pi * min(s, a.steps) / a.steps)))  # noqa: E731
