@@ -106,7 +106,7 @@ do_tests() {
   timeout 300 python -m pytest -q tests/test_integration_cuda.py -k multi_gpu_nccl -p no:cacheprovider -rs -v \
     > "$OUT/tests_nccl_verbose.log" 2>&1
   grep -E "PASSED|FAILED|SKIPPED|passed|failed" "$OUT/tests_nccl_verbose.log" | tail -8
-  tools/sanitize.sh > "$OUT/sanitize.log" 2>&1 || st=1
+  bash tools/sanitize.sh > "$OUT/sanitize.log" 2>&1 || st=1
   grep -E "===|SUMMARY|exit=" "$OUT/sanitize.log"
   timeout 900 python tools/guard.py --log "$OUT/soak.csv" -- python tools/soak.py --minutes "${SOAK_MINUTES:-5}" \
     > "$OUT/soak.log" 2>&1 || st=1
