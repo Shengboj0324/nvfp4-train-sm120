@@ -103,6 +103,7 @@ enum Pro : int {
   kSwigluBwdUp = 7,    // X = dY: dY * silu(g),                aux = g
   kGeluErf = 8,        // X = h:  gelu_erf(h)
   kGeluErfBwd = 9,     // X = dY: dY * gelu_erf'(h),           aux = h
+  kParts = 10,         // X = [part0 | part1 | part2] (Params::part_cols): no op, multi-part load
 };
 // The four GELU variants add the per-column bias ProArgs::beta (if set) to h first; the three SwiGLU
 // variants add ProArgs::beta (if set) to g and ProArgs::gamma (if set) to u first (the gate / up biases).
@@ -115,7 +116,8 @@ struct ProArgs {
   const float* beta;   // [C]   LayerNorm bias / bias added to the GELU input (optional)
   const T* aux;        // [R,C] second input (see Pro)
   const T* aux2;       // [R,C] third input (see Pro)
-  const T* part[3];    // multi-part input (Params::part_cols)
+  const T *part0, *part1, *part2;  // multi-part input (Params::part_cols); named fields, not an array:
+                                  // indexing a parameter array at run time puts the struct in local memory
 };
 
 // Per-column bias b (optional) added to v[0..n) in fp32: the bias of the linear that produced v.
@@ -213,9 +215,10 @@ __device__ __forceinline__ float load_tile(const T* __restrict__ x, const Params
     float v[VEC];
     if (gr < p.R && gc < p.C) {  // C % 16 == 0, so a vector is either fully inside or fully outside
       const int64_t off = static_cast<int64_t>(gr) * p.C + gc;
-      if (PRO == kNone && p.part_cols > 0) {  // part_cols % 16 == 0: a vector lies in one part
+      if constexpr (PRO == kParts) {  // part_cols % 16 == 0: a vector lies in one part
         const int part = gc / p.part_cols;
-        load_vec(pa.part[part] + static_cast<int64_t>(gr) * p.part_cols + (gc - part * p.part_cols), v);
+        const T* src = part == 0 ? pa.part0 : part == 1 ? pa.part1 : pa.part2;
+        load_vec(src + static_cast<int64_t>(gr) * p.part_cols + (gc - part * p.part_cols), v);
       } else {
         load_vec(x + off, v);
       }
@@ -518,6 +521,7 @@ std::vector<torch::Tensor> run_dual(const torch::Tensor& x, int pro, const torch
   const int nparts = parts ? static_cast<int>(parts->size()) : 1;
   if (nparts > 1) {
     TORCH_CHECK(pro == kNone && nparts <= 3, "at most 3 parts, without a producer op");
+    pro = kParts;
     for (const auto& t : *parts)
       TORCH_CHECK(t.is_cuda() && t.device() == x.device() && t.scalar_type() == x.scalar_type() && t.dim() == 2 &&
                       t.is_contiguous() && t.sizes() == x.sizes() && reinterpret_cast<uintptr_t>(t.data_ptr()) % 16 == 0,
@@ -578,12 +582,13 @@ std::vector<torch::Tensor> run_dual(const torch::Tensor& x, int pro, const torch
     using T = std::remove_cv_t<std::remove_pointer_t<decltype(xp)>>;
     constexpr int PRO = decltype(pro_c)::value;
     ProArgs<T> pa{mean, rstd, gamma, beta, aux ? reinterpret_cast<const T*>(aux->data_ptr()) : nullptr,
-                  aux2 ? reinterpret_cast<const T*>(aux2->data_ptr()) : nullptr, {nullptr, nullptr, nullptr}};
+                  aux2 ? reinterpret_cast<const T*>(aux2->data_ptr()) : nullptr, nullptr, nullptr, nullptr};
     if (p.part_cols > 0)
-      for (int i = 0; i < nparts; ++i) pa.part[i] = reinterpret_cast<const T*>((*parts)[i].data_ptr());
+      for (int i = 0; i < nparts; ++i)
+        (i == 0 ? pa.part0 : i == 1 ? pa.part1 : pa.part2) = reinterpret_cast<const T*>((*parts)[i].data_ptr());
     // amax passes are persistent: ~4 CTAs per SM, grid-stride
     const int max_ctas = 4 * at::cuda::getCurrentDeviceProperties()->multiProcessorCount;
-    if (p.col_rht || PRO != kNone) {
+    if (p.col_rht || (PRO != kNone && PRO != kParts)) {
       const int64_t ntiles = static_cast<int64_t>((p.C + TILE - 1) / TILE) * ((p.R + TILE - 1) / TILE);
       const int agrid = static_cast<int>(std::min<int64_t>(ntiles, max_ctas));
       amax_tile_kernel<T, PRO><<<agrid, THREADS, 0, stream>>>(xp, p, pa, amax_ptr);
@@ -591,7 +596,8 @@ std::vector<torch::Tensor> run_dual(const torch::Tensor& x, int pro, const torch
       const int64_t nvec = x.numel() / (16 / static_cast<int64_t>(sizeof(T)));
       const int agrid = static_cast<int>(std::min<int64_t>((nvec + THREADS - 1) / THREADS, max_ctas));
       for (int i = 0; i < nparts; ++i)  // one pass per part: they share the atomic max
-        amax_flat_kernel<T><<<agrid, THREADS, 0, stream>>>(p.part_cols > 0 ? pa.part[i] : xp, nvec, amax_ptr);
+        amax_flat_kernel<T><<<agrid, THREADS, 0, stream>>>(
+            p.part_cols == 0 ? xp : i == 0 ? pa.part0 : i == 1 ? pa.part1 : pa.part2, nvec, amax_ptr);
     }
     dual_quantize_kernel<T, PRO><<<grid, THREADS, 0, stream>>>(xp, p, pa, amax_ptr, amax_col, o);
   };
@@ -603,6 +609,9 @@ std::vector<torch::Tensor> run_dual(const torch::Tensor& x, int pro, const torch
   switch (pro) {
     case kNone:
       if (bf16) run(xb, CNone{}); else run(xf, CNone{});
+      break;
+    case kParts:
+      if (bf16) run(xb, std::integral_constant<int, kParts>{}); else run(xf, std::integral_constant<int, kParts>{});
       break;
     case kLayerNorm:
       if (bf16) run(xb, CLn{}); else run(xf, CLn{});
