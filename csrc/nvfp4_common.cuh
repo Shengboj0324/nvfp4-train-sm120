@@ -67,6 +67,14 @@ __host__ __device__ __forceinline__ uint32_t rht_sign_mask(uint64_t seed) {
   return m;
 }
 
+// rht_sign_mask computed by a whole warp: lane i < 16 hashes bit i, one ballot assembles the mask.
+// One hash per thread instead of sixteen; must be called by all 32 lanes (convergent).
+__device__ __forceinline__ uint32_t rht_sign_mask_warp(uint64_t seed) {
+  const unsigned lane = threadIdx.x & 31u;
+  const bool bit = lane < kBlock && (hash_u32(lane ^ static_cast<uint32_t>(seed)) & 1u);
+  return __ballot_sync(0xffffffffu, bit) & ((1u << kBlock) - 1u);
+}
+
 // reference.apply_rht for one 16-element block, in place. Negation by sign-bit flip is exact, so this
 // equals the reference's multiplication by -1 bit for bit.
 __device__ __forceinline__ void rht16(float (&v)[kBlock], uint32_t sign_mask) {

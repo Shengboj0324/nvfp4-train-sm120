@@ -19,7 +19,7 @@ import torch
 import torch.nn.functional as F
 
 from nvfp4 import ops
-from nvfp4.linear import ALIGN, NVFP4Linear, _seed, _weight_grad
+from nvfp4.linear import ALIGN, NVFP4Linear, _weight_grad, draw_seeds, unflatten_output
 
 BF16 = torch.bfloat16
 
@@ -31,27 +31,30 @@ def _ln_backward(dln, x2d, mean, rstd, ln_w, ln_b, mask):
     return (dx.to(x2d.dtype) if dx is not None else None, dw, db)
 
 
-def _sr_seeds(row: bool, col: bool):
-    return (_seed() if row else None), (_seed() if col else None)
+def _sr(seeds, row: bool, col: bool, rht: bool):
+    """Seed keyword arguments from a [row SR, col SR, RHT] seed tensor."""
+    return dict(row_sr_seed=seeds[0] if row else None, col_sr_seed=seeds[1] if col else None,
+                rht_seed=seeds[2] if rht else None)
 
 
 class _LayerNormLinearFn(torch.autograd.Function):
     @staticmethod
     def forward(ctx, x2d, ln_w, ln_b, eps, weight, wgrad_rht, need_dln, need_wgrad, fuse_wgrad):
-        rht = _seed() if need_wgrad and wgrad_rht else None
-        mean, rstd, xq, xtq = ops.layernorm_quantize_dual(x2d, ln_w, ln_b, eps, col=need_wgrad, rht_seed=rht,
-                                                          col_pad=ALIGN)
+        seeds = draw_seeds(3, x2d.device) if need_dln or need_wgrad else None  # [dY row SR, dY^T SR, RHT]
+        use_rht = need_wgrad and wgrad_rht
+        mean, rstd, xq, xtq = ops.layernorm_quantize_dual(x2d, ln_w, ln_b, eps, col=need_wgrad,
+                                                          rht_seed=seeds[2] if use_rht else None, col_pad=ALIGN)
         wq, wtq = ops.quantize_dual(weight.detach(), col=need_dln, block_2d=True)
         y = ops.gemm(xq, wq, BF16)
-        ctx.save_for_backward(x2d, ln_w, ln_b, mean, rstd,
+        ctx.save_for_backward(x2d, ln_w, ln_b, mean, rstd, seeds,
                               *(xtq.as_storage() if need_wgrad else ()), *(wtq.as_storage() if need_dln else ()))
-        ctx.rht, ctx.w_dtype, ctx.need_dln, ctx.need_wgrad = rht, weight.dtype, need_dln, need_wgrad
+        ctx.use_rht, ctx.w_dtype, ctx.need_dln, ctx.need_wgrad = use_rht, weight.dtype, need_dln, need_wgrad
         ctx.param = weight if fuse_wgrad else None
         return y
 
     @staticmethod
     def backward(ctx, dy):
-        x2d, ln_w, ln_b, mean, rstd, *rest = ctx.saved_tensors
+        x2d, ln_w, ln_b, mean, rstd, seeds, *rest = ctx.saved_tensors
         xtq = ops.NVFP4Tensor(*rest[:3]) if ctx.need_wgrad else None
         wtq = ops.NVFP4Tensor(*rest[-3:]) if ctx.need_dln else None
         mask = [ctx.needs_input_grad[0], ctx.needs_input_grad[1], ctx.needs_input_grad[2]]
@@ -60,13 +63,12 @@ class _LayerNormLinearFn(torch.autograd.Function):
         grads = [None] * 9
         if not (do_dln or do_dw):
             return tuple(grads)
-        row_seed, col_seed = _sr_seeds(do_dln, do_dw)
-        dyq, dytq = ops.quantize_dual(dy.contiguous().to(BF16), row=do_dln, col=do_dw, row_sr_seed=row_seed,
-                                      col_sr_seed=col_seed, rht_seed=ctx.rht, col_pad=ALIGN)
+        dyq, dytq = ops.quantize_dual(dy.contiguous().to(BF16), row=do_dln, col=do_dw, col_pad=ALIGN,
+                                      **_sr(seeds, do_dln, do_dw, ctx.use_rht))
         # Temporaries are dropped as soon as they are consumed: everything referenced inside one backward
         # call stays alive until it returns, unlike between separate autograd nodes.
         if do_dw:
-            grads[4] = _weight_grad(ctx.param, dytq, xtq, ctx.w_dtype, "cuda")
+            grads[4] = _weight_grad(ctx, ctx.param, dytq, xtq, ctx.w_dtype, "cuda")
         del dytq, xtq
         if do_dln:
             dln = ops.gemm(dyq, wtq, torch.float32)  # fp32 straight into the LayerNorm backward
@@ -78,17 +80,19 @@ class _LayerNormLinearFn(torch.autograd.Function):
 class _LayerNormMLPFn(torch.autograd.Function):
     @staticmethod
     def forward(ctx, x2d, ln_w, ln_b, eps, w1, w2, wgrad_rht, need_dln, need_w1, need_w2, fuse_wgrad):
-        rht1 = _seed() if need_w1 and wgrad_rht else None
-        rht2 = _seed() if need_w2 and wgrad_rht else None
+        # [dH row SR, dH^T SR, RHT of fc1's wgrad, dOut row SR, dOut^T SR, RHT of fc2's wgrad]
+        seeds = draw_seeds(6, x2d.device) if need_dln or need_w1 or need_w2 else None
+        rht1, rht2 = need_w1 and wgrad_rht, need_w2 and wgrad_rht
         need_dh = need_dln or need_w1  # the gradient has to flow back through fc2 and the GELU
-        mean, rstd, xq, xtq = ops.layernorm_quantize_dual(x2d, ln_w, ln_b, eps, col=need_w1, rht_seed=rht1,
+        mean, rstd, xq, xtq = ops.layernorm_quantize_dual(x2d, ln_w, ln_b, eps, col=need_w1,
+                                                          rht_seed=seeds[2] if rht1 else None,
                                                           col_pad=ALIGN)
         w1q, w1tq = ops.quantize_dual(w1.detach(), col=need_dln, block_2d=True)
         h = ops.gemm(xq, w1q, BF16)                                       # fc1 output (GELU input)
-        gq, gtq = ops.gelu_quantize_dual(h, col=need_w2, rht_seed=rht2, col_pad=ALIGN)
+        gq, gtq = ops.gelu_quantize_dual(h, col=need_w2, rht_seed=seeds[5] if rht2 else None, col_pad=ALIGN)
         w2q, w2tq = ops.quantize_dual(w2.detach(), col=need_dh, block_2d=True)
         out = ops.gemm(gq, w2q, BF16)
-        saved = [x2d, ln_w, ln_b, mean, rstd, h]
+        saved = [x2d, ln_w, ln_b, mean, rstd, h, seeds]
         for flag, q in ((need_w1, xtq), (need_dln, w1tq), (need_w2, gtq), (need_dh, w2tq)):
             if flag:
                 saved += q.as_storage()
@@ -101,7 +105,7 @@ class _LayerNormMLPFn(torch.autograd.Function):
 
     @staticmethod
     def backward(ctx, dout):
-        x2d, ln_w, ln_b, mean, rstd, h, *rest = ctx.saved_tensors
+        x2d, ln_w, ln_b, mean, rstd, h, seeds, *rest = ctx.saved_tensors
         need_w1, need_dln, need_w2, need_dh = ctx.flags
         qs = {}
         for name, flag in (("xtq", need_w1), ("w1tq", need_dln), ("gtq", need_w2), ("w2tq", need_dh)):
@@ -115,22 +119,20 @@ class _LayerNormMLPFn(torch.autograd.Function):
         grads = [None] * 11
         if not (do_dg or do_dw2):
             return tuple(grads)
-        row_seed, col_seed = _sr_seeds(do_dg, do_dw2)
-        doq, dotq = ops.quantize_dual(dout.contiguous().to(BF16), row=do_dg, col=do_dw2, row_sr_seed=row_seed,
-                                      col_sr_seed=col_seed, rht_seed=ctx.rht2, col_pad=ALIGN)
+        doq, dotq = ops.quantize_dual(dout.contiguous().to(BF16), row=do_dg, col=do_dw2, col_pad=ALIGN,
+                                      **_sr(seeds[3:], do_dg, do_dw2, ctx.rht2))
         # Temporaries are dropped as soon as they are consumed (see _LayerNormLinearFn.backward).
         if do_dw2:
-            grads[5] = _weight_grad(ctx.params[1], dotq, qs.pop("gtq"), ctx.dtypes[1], "cuda")
+            grads[5] = _weight_grad(ctx, ctx.params[1], dotq, qs.pop("gtq"), ctx.dtypes[1], "cuda")
         del dotq
         if do_dg:
             dg = ops.gemm(doq, qs.pop("w2tq"), BF16)                     # gradient w.r.t. gelu(h)
             del doq
-            row_seed, col_seed = _sr_seeds(do_dln, do_dw1)
-            dhq, dhtq = ops.gelu_backward_quantize_dual(dg, h, row=do_dln, col=do_dw1, row_sr_seed=row_seed,
-                                                        col_sr_seed=col_seed, rht_seed=ctx.rht1, col_pad=ALIGN)
+            dhq, dhtq = ops.gelu_backward_quantize_dual(dg, h, row=do_dln, col=do_dw1, col_pad=ALIGN,
+                                                        **_sr(seeds, do_dln, do_dw1, ctx.rht1))
             del dg, h
             if do_dw1:
-                grads[4] = _weight_grad(ctx.params[0], dhtq, qs.pop("xtq"), ctx.dtypes[0], "cuda")
+                grads[4] = _weight_grad(ctx, ctx.params[0], dhtq, qs.pop("xtq"), ctx.dtypes[0], "cuda")
             del dhtq
             if do_dln:
                 dln = ops.gemm(dhq, qs.pop("w1tq"), torch.float32)      # fp32 straight into the LayerNorm backward
@@ -160,6 +162,10 @@ def _out_dtype(x):
     return torch.get_autocast_dtype("cuda") if torch.is_autocast_enabled("cuda") else x.dtype
 
 
+def _fuse(lin: NVFP4Linear) -> bool:
+    return lin.fuse_wgrad_accumulation and not torch.compiler.is_compiling()
+
+
 def _needs(x, *params):
     g = torch.is_grad_enabled()
     return [g and t.requires_grad for t in (x, *params)]
@@ -175,8 +181,8 @@ def layernorm_linear(x: torch.Tensor, ln: torch.nn.LayerNorm, lin: NVFP4Linear) 
         x2d = x2d.float()
     gx, gw, gb, gl = _needs(x2d, ln_w, ln_b, lin.weight)
     y = _LayerNormLinearFn.apply(x2d.contiguous(), ln_w, ln_b, ln.eps, lin.weight, lin.wgrad_rht, gx or gw or gb, gl,
-                                 lin.fuse_wgrad_accumulation)
-    return y.to(_out_dtype(x)).reshape(*x.shape[:-1], lin.out_features)
+                                 _fuse(lin))
+    return unflatten_output(y.to(_out_dtype(x)), x.shape[:-1], lin.out_features)
 
 
 def layernorm_mlp(x: torch.Tensor, ln: torch.nn.LayerNorm, fc1: NVFP4Linear, fc2: NVFP4Linear) -> torch.Tensor:
@@ -190,8 +196,8 @@ def layernorm_mlp(x: torch.Tensor, ln: torch.nn.LayerNorm, fc1: NVFP4Linear, fc2
         x2d = x2d.float()
     gx, gw, gb, g1, g2 = _needs(x2d, ln_w, ln_b, fc1.weight, fc2.weight)
     out = _LayerNormMLPFn.apply(x2d.contiguous(), ln_w, ln_b, ln.eps, fc1.weight, fc2.weight, fc1.wgrad_rht,
-                                gx or gw or gb, g1, g2, fc1.fuse_wgrad_accumulation)
-    return out.to(_out_dtype(x)).reshape(*x.shape[:-1], fc2.out_features)
+                                gx or gw or gb, g1, g2, _fuse(fc1))
+    return unflatten_output(out.to(_out_dtype(x)), x.shape[:-1], fc2.out_features)
 
 
 __all__ = ["layernorm_linear", "layernorm_mlp"]

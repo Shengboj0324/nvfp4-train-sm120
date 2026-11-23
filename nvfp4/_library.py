@@ -1,0 +1,172 @@
+"""torch.library registrations of the CUDA kernels used inside the autograd Functions.
+
+Eager calls go straight to the pybind11 extension (no dispatcher overhead). Under torch.compile the
+same functions are reached through ``torch.ops.nvfp4.*`` custom ops with fake (meta) implementations,
+so Dynamo traces NVFP4 layers into the graph instead of breaking the graph at each one.
+
+(This module deliberately has no ``from __future__ import annotations``: torch.library infers the
+operator schemas from the annotations.)
+"""
+from typing import Optional, Tuple
+
+import torch
+from torch import Tensor
+
+try:
+    from nvfp4 import _C  # type: ignore[attr-defined]
+except ImportError:  # pragma: no cover - CPU-only installs
+    _C = None
+
+_DUAL = Tuple[Tensor, Tensor, Tensor, Tensor, Tensor, Tensor]
+_SUPPORTED_CAPABILITY = (12, 0)
+_device_ok: dict = {}
+
+
+def require(t: Tensor) -> None:
+    """Fail early with a clear message instead of a CUDA launch error deep inside a kernel."""
+    if _C is None:
+        raise RuntimeError("nvfp4 CUDA extension not built (pip install -e . on a machine with CUDA >= 12.8); "
+                           "use NVFP4Linear(..., backend='emulate') to run the recipe without it")
+    if not t.is_cuda:
+        raise RuntimeError(f"nvfp4 CUDA ops need CUDA tensors, got a tensor on {t.device}")
+    idx = t.device.index if t.device.index is not None else torch.cuda.current_device()
+    ok = _device_ok.get(idx)
+    if ok is None:
+        ok = _device_ok[idx] = torch.cuda.get_device_capability(idx) == _SUPPORTED_CAPABILITY
+    if not ok:
+        cap = torch.cuda.get_device_capability(idx)
+        raise RuntimeError(f"nvfp4 kernels run on compute capability {_SUPPORTED_CAPABILITY} (RTX 50-series) only; "
+                           f"cuda:{idx} is {cap}. Use NVFP4Linear(..., backend='emulate') elsewhere")
+
+
+def aligned(t: Tensor) -> Tensor:
+    """Contiguous and 16-byte aligned (the kernels use 16-byte vector loads)."""
+    if not t.is_contiguous():
+        t = t.contiguous()
+    return t if t.data_ptr() % 16 == 0 else t.clone()
+
+
+# --- implementations (eager) -----------------------------------------------------------------------
+
+def _quantize_dual_impl(x: Tensor, do_row: bool, do_col: bool, block_2d: bool, row_sr: bool, row_seed: int,
+                        col_sr: bool, col_seed: int, col_rht: bool, rht_seed: int, col_pad: int,
+                        row_seed_t: Optional[Tensor], col_seed_t: Optional[Tensor],
+                        rht_seed_t: Optional[Tensor]) -> _DUAL:
+    require(x)
+    return tuple(_C.quantize_dual(aligned(x), do_row, do_col, block_2d, row_sr, row_seed, col_sr, col_seed, col_rht,
+                                  rht_seed, col_pad, row_seed_t, col_seed_t, rht_seed_t))
+
+
+def _layernorm_quantize_dual_impl(x: Tensor, weight: Tensor, bias: Tensor, eps: float, do_row: bool, do_col: bool,
+                                  row_sr: bool, row_seed: int, col_sr: bool, col_seed: int, col_rht: bool,
+                                  rht_seed: int, col_pad: int, row_seed_t: Optional[Tensor],
+                                  col_seed_t: Optional[Tensor], rht_seed_t: Optional[Tensor]
+                                  ) -> Tuple[Tensor, Tensor, Tensor, Tensor, Tensor, Tensor, Tensor, Tensor]:
+    require(x)
+    return tuple(_C.layernorm_quantize_dual(aligned(x), weight.float().contiguous(), bias.float().contiguous(), eps,
+                                            do_row, do_col, row_sr, row_seed, col_sr, col_seed, col_rht, rht_seed,
+                                            col_pad, row_seed_t, col_seed_t, rht_seed_t))
+
+
+def _gelu_quantize_dual_impl(h: Tensor, do_row: bool, do_col: bool, row_sr: bool, row_seed: int, col_sr: bool,
+                             col_seed: int, col_rht: bool, rht_seed: int, col_pad: int,
+                             row_seed_t: Optional[Tensor], col_seed_t: Optional[Tensor],
+                             rht_seed_t: Optional[Tensor]) -> _DUAL:
+    require(h)
+    return tuple(_C.gelu_quantize_dual(aligned(h.to(torch.bfloat16)), do_row, do_col, row_sr, row_seed, col_sr,
+                                       col_seed, col_rht, rht_seed, col_pad, row_seed_t, col_seed_t, rht_seed_t))
+
+
+def _gelu_backward_quantize_dual_impl(dy: Tensor, h: Tensor, do_row: bool, do_col: bool, row_sr: bool, row_seed: int,
+                                      col_sr: bool, col_seed: int, col_rht: bool, rht_seed: int, col_pad: int,
+                                      row_seed_t: Optional[Tensor], col_seed_t: Optional[Tensor],
+                                      rht_seed_t: Optional[Tensor]) -> _DUAL:
+    require(dy)
+    return tuple(_C.gelu_backward_quantize_dual(aligned(dy.to(torch.bfloat16)), aligned(h.to(torch.bfloat16)),
+                                                do_row, do_col, row_sr, row_seed, col_sr, col_seed, col_rht, rht_seed,
+                                                col_pad, row_seed_t, col_seed_t, rht_seed_t))
+
+
+def _gemm_impl(a: Tensor, sfa: Tensor, gdec_a: Tensor, b: Tensor, sfb: Tensor, gdec_b: Tensor, out_dtype: torch.dtype,
+               impl: int, splits: int) -> Tensor:
+    require(a)
+    return _C.gemm(a, sfa, gdec_a, b, sfb, gdec_b, out_dtype, None, False, impl, splits)
+
+
+def _gemm_out_impl(a: Tensor, sfa: Tensor, gdec_a: Tensor, b: Tensor, sfb: Tensor, gdec_b: Tensor, out: Tensor,
+                   accumulate: bool, impl: int, splits: int) -> None:
+    require(a)
+    _C.gemm(a, sfa, gdec_a, b, sfb, gdec_b, out.dtype, out, accumulate, impl, splits)
+
+
+# --- custom ops (torch.compile) ----------------------------------------------------------------------
+
+_quantize_dual_op = torch.library.custom_op("nvfp4::quantize_dual", _quantize_dual_impl, mutates_args=())
+_layernorm_quantize_dual_op = torch.library.custom_op("nvfp4::layernorm_quantize_dual", _layernorm_quantize_dual_impl,
+                                                      mutates_args=())
+_gelu_quantize_dual_op = torch.library.custom_op("nvfp4::gelu_quantize_dual", _gelu_quantize_dual_impl,
+                                                 mutates_args=())
+_gelu_backward_quantize_dual_op = torch.library.custom_op("nvfp4::gelu_backward_quantize_dual",
+                                                          _gelu_backward_quantize_dual_impl, mutates_args=())
+_gemm_op = torch.library.custom_op("nvfp4::gemm", _gemm_impl, mutates_args=())
+_gemm_out_op = torch.library.custom_op("nvfp4::gemm_out", _gemm_out_impl, mutates_args=("out",))
+
+
+def _dual_fake(x: Tensor, do_row: bool, do_col: bool, col_pad: int) -> _DUAL:
+    R, C = x.shape
+    r_pad = (R + col_pad - 1) // col_pad * col_pad
+    u8, f32 = torch.uint8, torch.float32
+    return (x.new_empty((R if do_row else 0, C // 2), dtype=u8), x.new_empty((R if do_row else 0, C // 16), dtype=u8),
+            x.new_empty((1 if do_row else 0,), dtype=f32), x.new_empty((C if do_col else 0, r_pad // 2), dtype=u8),
+            x.new_empty((C if do_col else 0, r_pad // 16), dtype=u8), x.new_empty((1 if do_col else 0,), dtype=f32))
+
+
+@_quantize_dual_op.register_fake
+def _(x, do_row, do_col, block_2d, row_sr, row_seed, col_sr, col_seed, col_rht, rht_seed, col_pad, *seed_tensors):
+    return _dual_fake(x, do_row, do_col, col_pad)
+
+
+@_layernorm_quantize_dual_op.register_fake
+def _(x, weight, bias, eps, do_row, do_col, row_sr, row_seed, col_sr, col_seed, col_rht, rht_seed, col_pad,
+      *seed_tensors):
+    stats = x.new_empty((x.shape[0],), dtype=torch.float32)
+    return (stats, torch.empty_like(stats), *_dual_fake(x, do_row, do_col, col_pad))
+
+
+@_gelu_quantize_dual_op.register_fake
+def _(h, do_row, do_col, row_sr, row_seed, col_sr, col_seed, col_rht, rht_seed, col_pad, *seed_tensors):
+    return _dual_fake(h, do_row, do_col, col_pad)
+
+
+@_gelu_backward_quantize_dual_op.register_fake
+def _(dy, h, do_row, do_col, row_sr, row_seed, col_sr, col_seed, col_rht, rht_seed, col_pad, *seed_tensors):
+    return _dual_fake(dy, do_row, do_col, col_pad)
+
+
+@_gemm_op.register_fake
+def _(a, sfa, gdec_a, b, sfb, gdec_b, out_dtype, impl, splits):
+    return a.new_empty((a.shape[0], b.shape[0]), dtype=out_dtype)
+
+
+@_gemm_out_op.register_fake
+def _(a, sfa, gdec_a, b, sfb, gdec_b, out, accumulate, impl, splits):
+    return None
+
+
+# --- dispatch: plain call in eager, custom op while compiling -------------------------------------------
+
+def _pick(impl, op):
+    def call(*args):
+        if torch.compiler.is_compiling():
+            return op(*args)
+        return impl(*args)
+    call.__name__ = impl.__name__.removesuffix("_impl").lstrip("_")
+    return call
+
+
+quantize_dual = _pick(_quantize_dual_impl, _quantize_dual_op)
+layernorm_quantize_dual = _pick(_layernorm_quantize_dual_impl, _layernorm_quantize_dual_op)
+gelu_quantize_dual = _pick(_gelu_quantize_dual_impl, _gelu_quantize_dual_op)
+gelu_backward_quantize_dual = _pick(_gelu_backward_quantize_dual_impl, _gelu_backward_quantize_dual_op)
+gemm = _pick(_gemm_impl, _gemm_op)
+gemm_out = _pick(_gemm_out_impl, _gemm_out_op)

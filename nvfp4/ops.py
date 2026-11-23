@@ -3,22 +3,23 @@ from __future__ import annotations
 
 import os
 from dataclasses import dataclass
+from typing import Union
 
 import torch
 
-try:
-    from nvfp4 import _C  # type: ignore[attr-defined]
-except ImportError:  # pragma: no cover - CPU-only installs
-    _C = None
-
+from nvfp4 import _library as _lib
+from nvfp4._library import _C, require as _require  # noqa: F401  (re-exported for callers and tests)
 
 _DEFAULT_SPLITS = int(os.environ.get("NVFP4_GEMM_SPLITS", "0"))  # 1 disables split-K (ablations)
 
 
 # The kernels are compiled for the arch-specific target sm_120a, whose code runs on compute
 # capability 12.0 only (RTX 50-series); 'a' targets are not forward compatible.
-SUPPORTED_CAPABILITY = (12, 0)
-_device_ok: dict[int, bool] = {}
+SUPPORTED_CAPABILITY = _lib._SUPPORTED_CAPABILITY
+
+# A seed is an int, or a one-element int64 tensor on the GPU (read by the kernel: no host sync, and
+# CUDA graphs / torch.compile see a new value on every replay / call), or None (feature off).
+Seed = Union[int, torch.Tensor, None]
 
 
 def available(device: int | torch.device | None = None) -> bool:
@@ -26,23 +27,6 @@ def available(device: int | torch.device | None = None) -> bool:
     if _C is None or not torch.cuda.is_available():
         return False
     return torch.cuda.get_device_capability(device) == SUPPORTED_CAPABILITY
-
-
-def _require(t: torch.Tensor) -> None:
-    """Fail early with a clear message instead of a CUDA launch error deep inside a kernel."""
-    if _C is None:
-        raise RuntimeError("nvfp4 CUDA extension not built (pip install -e . on a machine with CUDA >= 12.8); "
-                           "use NVFP4Linear(..., backend='emulate') to run the recipe without it")
-    if not t.is_cuda:
-        raise RuntimeError(f"nvfp4 CUDA ops need CUDA tensors, got a tensor on {t.device}")
-    idx = t.device.index if t.device.index is not None else torch.cuda.current_device()
-    ok = _device_ok.get(idx)
-    if ok is None:
-        ok = _device_ok[idx] = torch.cuda.get_device_capability(idx) == SUPPORTED_CAPABILITY
-    if not ok:
-        cap = torch.cuda.get_device_capability(idx)
-        raise RuntimeError(f"nvfp4 kernels run on compute capability {SUPPORTED_CAPABILITY} (RTX 50-series) only; "
-                           f"cuda:{idx} is {cap}. Use NVFP4Linear(..., backend='emulate') elsewhere")
 
 
 @dataclass
@@ -81,33 +65,30 @@ def quantize(x: torch.Tensor, *, transpose: bool = False, block_2d: bool = False
 
 
 def quantize_dual(x: torch.Tensor, *, row: bool = True, col: bool = True, block_2d: bool = False,
-                  row_sr_seed: int | None = None, col_sr_seed: int | None = None, rht_seed: int | None = None,
+                  row_sr_seed: Seed = None, col_sr_seed: Seed = None, rht_seed: Seed = None,
                   col_pad: int = 16) -> tuple[NVFP4Tensor | None, NVFP4Tensor | None]:
     """One read of ``x`` [R, C] -> (``x`` quantized along C, ``x.T`` quantized along R).
 
     The second output is padded with zero rows of ``x`` to a multiple of ``col_pad`` and optionally
     random-Hadamard transformed (``rht_seed``). ``*_sr_seed`` enables stochastic rounding for that
     output. With ``block_2d`` both use 16x16 tiles, so the col output is the exact transpose of the row
-    output. Bit-identical to ``reference.quantize_dual``.
+    output. Bit-identical to ``reference.quantize_dual`` (with the seeds' values).
     """
-    _require(x)
-    if not x.is_contiguous() or x.data_ptr() % 16:
-        x = x.contiguous() if not x.is_contiguous() else x.clone()
-    rd, rs, rg, cd, cs, cg = _C.quantize_dual(
-        x, row, col, block_2d, row_sr_seed is not None, int(row_sr_seed or 0), col_sr_seed is not None,
-        int(col_sr_seed or 0), rht_seed is not None, int(rht_seed or 0), int(col_pad))
-    return (NVFP4Tensor(rd, rs, rg) if row else None, NVFP4Tensor(cd, cs, cg) if col else None)
+    outs = _lib.quantize_dual(x, row, col, block_2d, *_seed_flags(row_sr_seed, col_sr_seed, rht_seed), int(col_pad),
+                              *_seed_tensors(row_sr_seed, col_sr_seed, rht_seed))
+    return _pair(outs, row, col)
 
 
-def _aligned(t: torch.Tensor) -> torch.Tensor:
-    if not t.is_contiguous():
-        t = t.contiguous()
-    return t if t.data_ptr() % 16 == 0 else t.clone()
+def _seed_flags(row_sr_seed: Seed, col_sr_seed: Seed, rht_seed: Seed):
+    """(row_sr, row_seed, col_sr, col_seed, col_rht, rht_seed) for the kernels' scalar arguments."""
+    out = []
+    for s in (row_sr_seed, col_sr_seed, rht_seed):
+        out += [s is not None, 0 if s is None or isinstance(s, torch.Tensor) else int(s)]
+    return out
 
 
-def _dual_flags(row, col, row_sr_seed, col_sr_seed, rht_seed, col_pad):
-    return (row, col, row_sr_seed is not None, int(row_sr_seed or 0), col_sr_seed is not None, int(col_sr_seed or 0),
-            rht_seed is not None, int(rht_seed or 0), int(col_pad))
+def _seed_tensors(*seeds: Seed):
+    return [s if isinstance(s, torch.Tensor) else None for s in seeds]
 
 
 def _pair(outs, row, col):
@@ -120,35 +101,33 @@ def _pair(outs, row, col):
 # (without block_2d); each is bit-identical to its reference.* twin.
 
 def layernorm_quantize_dual(x: torch.Tensor, weight: torch.Tensor, bias: torch.Tensor, eps: float, *, row: bool = True,
-                            col: bool = True, row_sr_seed: int | None = None, col_sr_seed: int | None = None,
-                            rht_seed: int | None = None, col_pad: int = 16):
+                            col: bool = True, row_sr_seed: Seed = None, col_sr_seed: Seed = None,
+                            rht_seed: Seed = None, col_pad: int = 16):
     """Quantize ``LayerNorm(x)`` [R, C] (fp32 weight / bias [C]) without writing it.
 
     Returns ``(mean, rstd, row, col)``: the per-row statistics ([R] fp32, what the LayerNorm backward
     needs) and the two quantize_dual outputs of ``((x - mean) * rstd) * weight + bias`` in fp32.
     """
-    _require(x)
-    outs = _C.layernorm_quantize_dual(_aligned(x), weight.float().contiguous(), bias.float().contiguous(), float(eps),
-                                      *_dual_flags(row, col, row_sr_seed, col_sr_seed, rht_seed, col_pad))
+    outs = _lib.layernorm_quantize_dual(x, weight, bias, float(eps), row, col,
+                                        *_seed_flags(row_sr_seed, col_sr_seed, rht_seed), int(col_pad),
+                                        *_seed_tensors(row_sr_seed, col_sr_seed, rht_seed))
     return (outs[0], outs[1], *_pair(outs[2:], row, col))
 
 
-def gelu_quantize_dual(h: torch.Tensor, *, row: bool = True, col: bool = True, row_sr_seed: int | None = None,
-                       col_sr_seed: int | None = None, rht_seed: int | None = None, col_pad: int = 16):
+def gelu_quantize_dual(h: torch.Tensor, *, row: bool = True, col: bool = True, row_sr_seed: Seed = None,
+                       col_sr_seed: Seed = None, rht_seed: Seed = None, col_pad: int = 16):
     """Quantize ``gelu(h)`` (tanh approximation, bf16 ``h``) without writing it."""
-    _require(h)
-    outs = _C.gelu_quantize_dual(_aligned(h.to(torch.bfloat16)),
-                                 *_dual_flags(row, col, row_sr_seed, col_sr_seed, rht_seed, col_pad))
+    outs = _lib.gelu_quantize_dual(h, row, col, *_seed_flags(row_sr_seed, col_sr_seed, rht_seed), int(col_pad),
+                                   *_seed_tensors(row_sr_seed, col_sr_seed, rht_seed))
     return _pair(outs, row, col)
 
 
 def gelu_backward_quantize_dual(dy: torch.Tensor, h: torch.Tensor, *, row: bool = True, col: bool = True,
-                                row_sr_seed: int | None = None, col_sr_seed: int | None = None,
-                                rht_seed: int | None = None, col_pad: int = 16):
+                                row_sr_seed: Seed = None, col_sr_seed: Seed = None, rht_seed: Seed = None,
+                                col_pad: int = 16):
     """Quantize the GELU input gradient ``dy * gelu'(h)`` (bf16 ``dy``, ``h``) without writing it."""
-    _require(dy)
-    outs = _C.gelu_backward_quantize_dual(_aligned(dy.to(torch.bfloat16)), _aligned(h.to(torch.bfloat16)),
-                                          *_dual_flags(row, col, row_sr_seed, col_sr_seed, rht_seed, col_pad))
+    outs = _lib.gelu_backward_quantize_dual(dy, h, row, col, *_seed_flags(row_sr_seed, col_sr_seed, rht_seed),
+                                            int(col_pad), *_seed_tensors(row_sr_seed, col_sr_seed, rht_seed))
     return _pair(outs, row, col)
 
 
@@ -163,10 +142,10 @@ def gemm(a: NVFP4Tensor, b: NVFP4Tensor, out_dtype: torch.dtype = torch.bfloat16
     ``splits``: number of K splits (0 = chosen from the grid size; None = $NVFP4_GEMM_SPLITS, default 0).
     The split-K reduction is deterministic but sums in a different order than an unsplit GEMM.
     """
-    _require(a.data)
-    if out is not None:
-        out_dtype = out.dtype
     impl_id = {"auto": 0, "cp.async": 1, "tma": 2}[impl]
     if splits is None:
         splits = _DEFAULT_SPLITS
-    return _C.gemm(a.data, a.scales, a.gdec, b.data, b.scales, b.gdec, out_dtype, out, accumulate, impl_id, splits)
+    if out is None:
+        return _lib.gemm(a.data, a.scales, a.gdec, b.data, b.scales, b.gdec, out_dtype, impl_id, splits)
+    _lib.gemm_out(a.data, a.scales, a.gdec, b.data, b.scales, b.gdec, out, accumulate, impl_id, splits)
+    return out
