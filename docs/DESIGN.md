@@ -363,7 +363,7 @@ zero-filled copies, and stores are guarded. `K` must be a multiple of 128 (256 f
 | Fused sub-blocks | `tests/test_fused_modules.py` | forward == explicit op composition bit for bit; every gradient's cosine with fp32 ≥ the unfused NVFP4 path's − 0.01; seeded determinism; partial gradients; fused wgrad accumulation |
 | Layer | `tests/test_linear.py` | CUDA == emulated recipe (same seeds); cosine with full precision > 0.97–0.98; SR noise averages out; only NVFP4 tensors saved for backward (exact byte count); no-grad / frozen-weight / no-input-grad paths; fused wgrad accumulation == autograd bit for bit |
 | Robustness | `tests/test_robustness_cuda.py` | NaN / ±inf anywhere → non-finite outputs (quantize, dual, fused producers, GEMM, layers, gradients); clear errors on misuse; any leading shape incl. empty; fp32/bf16/fp16 and non-contiguous inputs; bf16 weights; state dict ↔ `nn.Linear`; activation checkpointing bit-exact; `torch.compile` == eager; CUDA-graph replay == eager; concurrent streams with split-K; DDP |
-| Integration | `tests/test_integration_cuda.py` | GPU seed tensors == integer seeds bit for bit (all four quantizers); no host sync in a training step; `torch.compile(fullgraph=True)` with no graph breaks, bit-identical to eager; CUDA-graph capture of fwd+bwd (fresh seeds per replay, noise averages out) and of a full Adam step (loss falls); fused accumulation in place with hooks firing, and under `torch.autograd.grad`; outputs not views; **two-process DDP (plain and bucket views) and FSDP2** over gloo, fused and unfused, bit-exact vs a single-process reference |
+| Integration | `tests/test_integration_cuda.py` | GPU seed tensors == integer seeds bit for bit (all four quantizers); no host sync in a training step; `torch.compile(fullgraph=True)` with no graph breaks, bit-identical to eager; CUDA-graph capture of fwd+bwd (fresh seeds per replay, noise averages out) and of a full Adam step (loss falls); fused accumulation in place with hooks firing, and under `torch.autograd.grad`; outputs not views; **two-process DDP (plain and bucket views), FSDP1 (flat and `use_orig_params`) and FSDP2** over gloo, fused and unfused, bit-exact vs a single-process reference; deterministic mode + flash attention reproduces a block's gradients bit for bit |
 | Memory / race safety | `tools/sanitize.sh` | compute-sanitizer memcheck, racecheck, synccheck, initcheck over every kernel variant (ragged shapes, TMA and cp.async loops, split-K, accumulate, all producer ops, GPU-resident seeds, a layer forward + backward): 0 findings |
 | Long-run stability | `tools/soak.py` | 8 minutes: 18,401 fused + unfused training iterations, 3,682 bit-exact gradient replays, 92,005 GEMMs re-checked bit for bit, no non-finite values, no hang |
 | Packaging | wheel built and installed into an isolated directory | imports and trains from outside the repository |
@@ -374,6 +374,8 @@ Every benchmark checks correctness against the reference before it times anythin
 
 ## 6. Known limitations and next steps
 
+Done in v0.6: native Windows build and tests, FSDP1, bitwise-reproducible training with flash
+attention (deterministic mode), CI compile job on Windows.
 Done in v0.5: GPU-resident seeds, no graph breaks under `torch.compile`, CUDA-graph capture of
 training steps, fused accumulation compatible with DDP / FSDP2, FSDP2 and multi-process tests, a
 three-seed quality study ([RESULTS.md §4.1](RESULTS.md)).
@@ -396,9 +398,11 @@ accumulation.
    could be cached per optimizer step, but a safe invalidation rule is needed: `param.data` writes
    don't bump `_version`.
 5. **Fused sub-blocks** cover pre-LN blocks with bias-free linears and tanh-GELU.
-6. **Framework coverage.** FSDP1 (`FullyShardedDataParallel`, flat parameters) is untested; FSDP2
-   (`fully_shard`) is tested. Multi-process tests run two ranks on one GPU over gloo: the NCCL path
-   across several GPUs is exercised only with one rank. `DTensor.full_tensor()` over gloo with CUDA
-   tensors crashes in PyTorch 2.14 (also for plain `nn.Linear`); the tests gather shards on the CPU.
-7. **Platform.** Linux/WSL2 only, one GPU model tested (RTX 5090 Laptop). The native Windows build
-   hasn't been tried.
+6. **Framework coverage.** DDP, FSDP1 and FSDP2 are tested, but with two ranks on one GPU over gloo:
+   NCCL across several GPUs has only run with one rank (no multi-GPU machine available).
+   `DTensor.full_tensor()` over gloo with CUDA tensors crashes in PyTorch 2.14 (also for plain
+   `nn.Linear`); the tests gather shards on the CPU.
+7. **Platform.** Linux, WSL2 and native Windows build and pass the tests, but on one GPU model (RTX
+   5090 Laptop): other RTX 50 parts share the architecture (sm_120) but differ in SM count, clocks and
+   power limits, so the tile / split-K heuristics are tuned for this one. On Windows, inductor needs
+   Triton, which PyTorch's Windows wheels don't include.

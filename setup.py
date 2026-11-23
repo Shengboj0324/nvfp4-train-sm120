@@ -16,14 +16,19 @@ if os.environ.get("NVFP4_SKIP_CUDA") != "1":
 
     # The block-scaled MMA is an arch-specific feature: it needs the 'a' target (sm_120a).
     arch = os.environ.get("NVFP4_ARCH", "120a")
+    if os.name == "nt":  # MSVC host compiler (run from a VS 2022 x64 developer environment: tools/build.cmd)
+        cxx = ["/O2", "/std:c++20", "/Zc:__cplusplus", "/permissive-"]
+        host = ["-Xcompiler", "/Zc:__cplusplus", "-Xcompiler", "/permissive-"]
+    else:
+        cxx, host = ["-O3", "-std=c++20"], []
     ext_modules = [
         CUDAExtension(
             name="nvfp4._C",
             sources=["csrc/bindings.cpp", "csrc/quantize.cu", "csrc/quantize_dual.cu", "csrc/gemm.cu", "csrc/gemm_tma.cu"],
             extra_compile_args={
-                "cxx": ["-O3", "-std=c++20"],
+                "cxx": cxx,
                 "nvcc": ["-O3", "-std=c++20", f"-gencode=arch=compute_{arch},code=sm_{arch}",
-                         "--expt-relaxed-constexpr", "-lineinfo", "-Xptxas=-v,-warn-spills"],
+                         "--expt-relaxed-constexpr", "-lineinfo", "-Xptxas=-v,-warn-spills"] + host,
             },
         )
     ]
@@ -48,6 +53,7 @@ setup(
         "Programming Language :: C++",
         "Environment :: GPU :: NVIDIA CUDA :: 13",
         "Operating System :: POSIX :: Linux",
+        "Operating System :: Microsoft :: Windows",
         "Topic :: Scientific/Engineering :: Artificial Intelligence",
     ],
 )

@@ -51,12 +51,13 @@ def main() -> int:
     ap.add_argument("--d", type=int, default=1024)
     a = ap.parse_args()
     deadline = time.time() + 60 * a.minutes
-    # PyTorch's flash / memory-efficient attention backward accumulates dQ with atomics and is not
-    # bit-reproducible (a pure BF16 block fails the replay check with it). The math backend is, so
-    # with it any replay mismatch can only come from this repository's kernels.
-    torch.backends.cuda.enable_flash_sdp(False)
-    torch.backends.cuda.enable_mem_efficient_sdp(False)
-    torch.backends.cuda.enable_cudnn_sdp(False)
+    # PyTorch's flash attention backward accumulates dQ with atomics by default and is not
+    # bit-reproducible (a pure BF16 block fails the replay check with it). Deterministic mode switches
+    # it to a reproducible backward at little cost, so any replay mismatch can only come from this
+    # repository's kernels. (It also fills fresh allocations with NaN, so a kernel that read
+    # uninitialized output memory would fail the finiteness checks.)
+    os.environ.setdefault("CUBLAS_WORKSPACE_CONFIG", ":4096:8")
+    torch.use_deterministic_algorithms(True)
 
     blocks = {"unfused": make_block(a.d, False, 0), "fused": make_block(a.d, True, 0)}
     opts = {k: torch.optim.AdamW(b.parameters(), lr=1e-4) for k, b in blocks.items()}

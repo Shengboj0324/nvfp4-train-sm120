@@ -7,6 +7,7 @@ so Dynamo traces NVFP4 layers into the graph instead of breaking the graph at ea
 (This module deliberately has no ``from __future__ import annotations``: torch.library infers the
 operator schemas from the annotations.)
 """
+import os
 from typing import Optional, Tuple
 
 import torch
@@ -21,6 +22,16 @@ _DUAL = Tuple[Tensor, Tensor, Tensor, Tensor, Tensor, Tensor]
 _SUPPORTED_CAPABILITY = (12, 0)
 _device_ok: dict = {}
 
+PTX_JIT_MESSAGE = (
+    "CUDA_FORCE_PTX_JIT is set in the environment: the driver then ignores compiled GPU code and JIT-compiles "
+    "PTX instead, but this extension (sm_120a arch-specific code) and PyTorch's own wheels ship no PTX for "
+    "sm_120, so every kernel launch fails with 'no kernel image is available for execution on the device'. "
+    "Unset CUDA_FORCE_PTX_JIT (it is sometimes left behind by old TensorFlow / CUDA setup guides).")
+
+
+def ptx_jit_forced() -> bool:
+    return os.environ.get("CUDA_FORCE_PTX_JIT", "0").strip() not in ("", "0")
+
 
 def require(t: Tensor) -> None:
     """Fail early with a clear message instead of a CUDA launch error deep inside a kernel."""
@@ -29,6 +40,8 @@ def require(t: Tensor) -> None:
                            "use NVFP4Linear(..., backend='emulate') to run the recipe without it")
     if not t.is_cuda:
         raise RuntimeError(f"nvfp4 CUDA ops need CUDA tensors, got a tensor on {t.device}")
+    if ptx_jit_forced():
+        raise RuntimeError(PTX_JIT_MESSAGE)
     idx = t.device.index if t.device.index is not None else torch.cuda.current_device()
     ok = _device_ok.get(idx)
     if ok is None:

@@ -8,7 +8,7 @@ import pytest
 import torch
 import torch.nn.functional as F
 
-from conftest import requires_sm120
+from conftest import COMPILE_BACKEND, requires_sm120
 from nvfp4 import ops
 from nvfp4.fused import layernorm_linear, layernorm_mlp
 from nvfp4.linear import NVFP4Linear
@@ -177,10 +177,10 @@ def test_torch_compile_matches_eager():
     x = torch.randn(256, 512, device=DEV)
     with torch.no_grad():
         eager = m(x)
-        compiled = torch.compile(m)(x)
+        compiled = torch.compile(m, backend=COMPILE_BACKEND)(x)
     assert torch.equal(eager, compiled)
     xg = x.clone().requires_grad_()
-    torch.compile(m)(xg).float().sum().backward()
+    torch.compile(m, backend=COMPILE_BACKEND)(xg).float().sum().backward()
     assert torch.isfinite(xg.grad).all()
 
 
@@ -255,3 +255,15 @@ def test_fused_and_unfused_modules_share_state():
         y_fused = layernorm_linear(x, ln, lin)
     rel = ((y_fused - y_unfused).norm() / y_unfused.norm()).item()
     assert rel < 0.15  # both are 4-bit approximations of the same product
+
+
+def test_forced_ptx_jit_gives_a_clear_error(monkeypatch):
+    """CUDA_FORCE_PTX_JIT=1 makes every launch fail with 'no kernel image'; explain it instead."""
+    x = torch.randn(64, 64, device=DEV)
+    monkeypatch.setenv("CUDA_FORCE_PTX_JIT", "1")
+    assert not ops.available()
+    with pytest.raises(RuntimeError, match="CUDA_FORCE_PTX_JIT"):
+        ops.quantize(x)
+    monkeypatch.setenv("CUDA_FORCE_PTX_JIT", "0")
+    assert ops.available()
+    ops.quantize(x)

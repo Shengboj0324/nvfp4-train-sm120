@@ -8,9 +8,9 @@ works and [RESULTS.md](RESULTS.md) what it measured.
 | | |
 |---|---|
 | GPU | compute capability **12.0** exactly: GeForce RTX 5090 / 5080 / 5070 Ti / 5070 / 5060 Ti / 5060 and their laptop parts. The kernels are built for the arch-specific target `sm_120a`, which runs on no other GPU (not on sm_100 B200, sm_121 GB10, or older GPUs). |
-| OS | Linux or WSL2. Native Windows builds have not been tried. |
-| Toolkit | CUDA ≥ 12.8 (TMA descriptor API by version needs ≥ 12.5; tested with 13.0). Driver tested: 595.79. |
-| PyTorch | a CUDA build, tested with 2.14.1+cu130 (needs `-std=c++20` for extensions). The extension must be built against the same PyTorch it runs with. |
+| OS | Linux, WSL2 or native Windows (Visual Studio 2022 with the C++ workload). |
+| Toolkit | CUDA ≥ 12.8 (TMA descriptor API by version needs ≥ 12.5). Tested: 13.0 on Linux/WSL2, 12.9 on Windows. Driver tested: 595.79. |
+| PyTorch | a CUDA build ≥ 2.7, tested with 2.14.1+cu130 (WSL2) and 2.7.1+cu128 (Windows). The extension must be built against the same PyTorch it runs with. |
 
 `nvfp4.available()` returns whether the extension is built and the current GPU is supported. Every op
 also checks its inputs and raises a clear error for CPU tensors or unsupported GPUs.
@@ -26,10 +26,17 @@ pip wheel --no-build-isolation --no-deps -w dist .  # dist/nvfp4_train_sm120-<ve
 `MAX_JOBS=4` limits build parallelism (the build is CPU and memory heavy). `NVFP4_SKIP_CUDA=1`
 installs only the pure-PyTorch reference (CPU CI, numerics studies).
 
+**Native Windows:** `tools\build.cmd` finds CUDA (`CUDA_HOME`, `CUDA_PATH` or the default install
+folder) and Visual Studio (`vswhere`), sets up the x64 compiler environment and builds in place under
+the resource guard; `tools\check.cmd` also runs the tests. `pip install --no-build-isolation .` works
+too from an "x64 Native Tools" prompt. PyTorch's Windows wheels have no Triton and no NCCL, so
+`torch.compile` there needs a non-inductor backend (or a Windows build of Triton) and multi-process
+training uses gloo.
+
 Verify an installation on the target machine:
 
 ```bash
-tools/check.sh            # build + 321 tests (~20 s of GPU time)
+tools/check.sh            # build + 324 tests (~20 s of GPU time); Windows: tools\check.cmd
 tools/check.sh release    # + compute-sanitizer (memcheck, racecheck, synccheck, initcheck) + 5-minute soak
 ```
 
@@ -91,9 +98,13 @@ sync, and changes on every CUDA-graph replay. Both give bit-identical results fo
   bit-identical to `nvfp4.reference`, the executable spec; the GEMM matches an fp64 reference to ~1e-7.
 - **Determinism.** With the same seed (`torch.manual_seed`), forward and backward are bit-reproducible,
   including stochastic rounding and split-K. The layers draw their rounding seeds from the CUDA
-  generator, on the GPU. Note that PyTorch's own flash / memory-efficient attention backward is *not*
-  bit-reproducible (it accumulates with atomics); use the math SDPA backend if you need bitwise
-  reproducible runs (`tools/soak.py` does).
+  generator, on the GPU. PyTorch's own flash / memory-efficient attention backward is *not*
+  bit-reproducible by default (it accumulates dQ with atomics). For bitwise reproducible runs, set
+  `torch.use_deterministic_algorithms(True)` (and `CUBLAS_WORKSPACE_CONFIG=:4096:8`): with PyTorch 2.14
+  flash attention then uses a reproducible backward at a small cost (0.42 vs 0.29 ms for an
+  8×12×512×64 causal forward + backward), the NVFP4 layers run unchanged, and a block's gradients
+  repeat bit for bit (tested; `tools/soak.py` runs this way). cuDNN attention and FlexAttention were
+  reproducible on this GPU even without it.
 - **No host synchronization.** A training step through the layers never waits for the GPU (tested with
   `torch.cuda.set_sync_debug_mode("error")`), so the CPU can run ahead of the GPU.
 - **Non-finite values are never hidden.** A NaN or ±inf anywhere in a quantized tensor makes its
@@ -104,10 +115,12 @@ sync, and changes on every CUDA-graph replay. Both give bit-identical results fo
 - **Streams.** All kernels run on the current CUDA stream and allocate through PyTorch's caching
   allocator; concurrent streams are safe (split-K workspaces are per call). As always in PyTorch,
   synchronize streams yourself when one consumes another's output.
-- **Data parallel.** DDP (also with `gradient_as_bucket_view` and `no_sync` gradient accumulation) and
+- **Data parallel.** DDP (also with `gradient_as_bucket_view` and `no_sync` gradient accumulation),
+  FSDP1 (`FullyShardedDataParallel`, flat parameters or `use_orig_params=True`, with `no_sync`) and
   FSDP2 (`fully_shard`, with `set_requires_gradient_sync`) produce gradients bit-identical to a
   single-process computation of the same micro-batches, with or without fused accumulation (tested
-  with two processes). Kernel attributes are set per device, so one process driving several GPUs works
+  with two processes, on Linux and on Windows). Under FSDP1 the layers see views of the flat
+  parameter, so fused accumulation quietly takes the ordinary path. Kernel attributes are set per device, so one process driving several GPUs works
   too.
 - **Hangs become errors.** GEMM pipeline waits are bounded (1 s, then `trap`), so a fault surfaces as
   a CUDA error instead of a display-driver watchdog reset.
@@ -118,7 +131,7 @@ sync, and changes on every CUDA-graph replay. Both give bit-identical results fo
 |---|---|
 | `torch.compile` | No graph breaks: `fullgraph=True` works for models with NVFP4 layers and the fused LayerNorm / MLP blocks (the kernels are registered as `torch.library` custom ops). With `torch._inductor.config.fallback_random = True` the compiled step is bit-identical to eager; otherwise inductor draws its own random numbers (different seeds, same distribution). |
 | CUDA graphs | Inference and whole training steps (forward, backward, optimizer) can be captured. Seeds are drawn on the GPU, so each replay uses fresh stochastic-rounding / RHT seeds. Use the usual recipe: warm up on a side stream, `zero_grad(set_to_none=True)` before capture, `capturable=True` optimizers. |
-| DDP / FSDP | DDP and FSDP2 tested (see §4), including fused wgrad accumulation. FSDP1 (`FullyShardedDataParallel`) has not been tested. |
+| DDP / FSDP | DDP, FSDP1 and FSDP2 tested (see §4), including fused wgrad accumulation. Pass FSDP2 a mesh built from your process group (`DeviceMesh.from_group`) when it isn't NCCL. PyTorch 2.7's FSDP2 sums gradients over gloo where 2.14 averages them (same for `nn.Linear`). |
 | Memory | Saved activations are NVFP4 (~0.56 bytes per element) instead of BF16; peak memory of a block step is 7–14% below BF16. |
 | Shapes | `in_features` / `out_features` must be multiples of 128. Token counts are arbitrary (padded internally). Very small layers (< 128 wide) should stay BF16. |
 | Precision recipe | Keep embeddings, the LM head and the last 1–2 blocks in BF16. Measured quality gap at 124M / 507M parameters: +1.0–1.4% validation loss, constant over training; at 124M over three seeds +0.019 ± 0.002 nats (+1.28%) (RESULTS.md §4–5). Validate on your own model before relying on it. |
@@ -141,6 +154,8 @@ NVIDIA driver up to date.
 | Symptom | Cause / fix |
 |---|---|
 | `nvfp4 CUDA extension not built` | Install with `pip install --no-build-isolation .` against the PyTorch you run with. |
+| `CUDA_FORCE_PTX_JIT is set ...`, or `no kernel image is available` from any PyTorch op | The environment variable `CUDA_FORCE_PTX_JIT=1` (left behind by some old TensorFlow / CUDA guides) makes the driver ignore compiled GPU code; neither this extension nor PyTorch's wheels ship sm_120 PTX. Remove the variable. |
+| `torch.compile` fails with `cannot import name ... from 'torch._inductor...'` | Leftover files from another PyTorch version in `site-packages/torch` (a downgrade over a newer install). Reinstall PyTorch into a clean folder. |
 | `nvfp4 kernels run on compute capability (12, 0) ... only` | Not an RTX 50-series GPU. Use `backend="emulate"` or BF16. |
 | `NVFP4Linear needs in/out features divisible by 128` | Keep that layer in `nn.Linear`; `convert_linears` skips such layers automatically. |
 | `x must be bf16 or fp32` (low-level ops) | Cast first; `NVFP4Linear` casts for you. |

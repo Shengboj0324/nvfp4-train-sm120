@@ -10,3 +10,4 @@ logs/
 *.ckpt
 experiments/data/
 bench/scratch/
+nvfp4/_C*.pyd

@@ -26,16 +26,24 @@ Full details and raw data are in [docs/RESULTS.md](docs/RESULTS.md).
 | GPT-124M (d=768) pretraining, 49M tokens | val loss **1.5062 vs 1.4892** BF16 (constant ~0.017 gap, no divergence), **+27% tokens/s, −22% GPU energy** |
 | Same, three seeds (v0.5) | gap **+0.019 ± 0.002** nats (+1.28%), constant over training for every seed; +27.7% tokens/s |
 | Framework integration (v0.5) | `torch.compile(fullgraph=True)` without graph breaks (bit-identical to eager), CUDA-graph capture of whole training steps, no host syncs, DDP and FSDP2 bit-exact vs single process |
-| Correctness | quantizers and fused LayerNorm/GELU **bit-exact** vs the reference spec; GEMM = fp64 reference to ~1e-7; 321 tests; compute-sanitizer clean (memcheck, racecheck, synccheck, initcheck); 8-minute soak with bit-exact replays |
+| Platforms (v0.6) | Linux / WSL2 and **native Windows** (MSVC build, tests on the GPU, CI compile job); DDP, **FSDP1** and FSDP2 bit-exact; bitwise-reproducible training with PyTorch's flash attention in deterministic mode |
+| Correctness | quantizers and fused LayerNorm/GELU **bit-exact** vs the reference spec; GEMM = fp64 reference to ~1e-7; 324 tests; compute-sanitizer clean (memcheck, racecheck, synccheck, initcheck); 8-minute soak with bit-exact replays |
 
 ![loss curves](experiments/results/v0.3_wide/loss.png)
 
-## Quick start (WSL2 or Linux, RTX 50-series)
+## Quick start (RTX 50-series)
 
 ```bash
+# WSL2 or Linux
 sudo tools/setup_wsl.sh            # CUDA 13.0 toolkit + venv with PyTorch 2.14 cu130 (~/nvfp4)
 pip install --no-build-isolation . # build the extension for sm_120a (or: pip wheel ... for a wheel)
 tools/check.sh                     # run all tests; `tools/check.sh release` adds sanitizers + soak
+```
+
+```bat
+:: native Windows (CUDA >= 12.8, Visual Studio 2022 C++, a CUDA build of PyTorch >= 2.7)
+tools\build.cmd
+tools\check.cmd
 ```
 
 **Integrating into a training stack:** read [docs/USAGE.md](docs/USAGE.md) (requirements, options,
@@ -64,8 +72,8 @@ d = gemm(qa, qb)                                          # D = A @ B^T on FP4 t
 ```
 
 Requirements: an sm_120 GPU (RTX 5090/5080/5070/5060 or their laptop parts), CUDA ≥ 12.8 (tested
-with 13.0), and a CUDA build of PyTorch (tested with 2.14.1+cu130, which needs C++20). Native Windows
-builds haven't been tried. On a machine without such a GPU, `NVFP4Linear(..., backend="emulate")`
+with 13.0, and 12.9 on Windows), and a CUDA build of PyTorch (tested with 2.14.1+cu130 and, on
+Windows, 2.7.1+cu128). On a machine without such a GPU, `NVFP4Linear(..., backend="emulate")`
 runs the same recipe through the pure-PyTorch reference.
 
 ## Layout
@@ -99,8 +107,8 @@ it. The known gaps are listed in
 - the fused sub-blocks cover pre-LN blocks with bias-free linears and tanh-GELU; attention-side
   producers aren't fused;
 - hardware stochastic rounding (`cvt.rs`) isn't available on sm_120a, so SR runs in software;
-- multi-process tests run two ranks on one GPU (gloo); FSDP1 is untested;
-- only Linux/WSL2 is supported.
+- tested on one GPU model; multi-process tests run two ranks on one GPU over gloo, so NCCL across
+  several GPUs has only run with one rank.
 
 ## License
 

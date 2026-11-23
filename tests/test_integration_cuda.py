@@ -9,7 +9,7 @@ import pytest
 import torch
 import torch.nn.functional as F
 
-from conftest import requires_sm120
+from conftest import COMPILE_BACKEND, requires_sm120
 from nvfp4 import ops
 from nvfp4 import reference as ref
 from nvfp4.fused import layernorm_mlp
@@ -100,7 +100,7 @@ def test_compile_fullgraph_matches_eager_bitwise():
     eager = run(m)
     torch._dynamo.reset()
     with inductor_config.patch(fallback_random=True):
-        compiled = run(torch.compile(m, fullgraph=True))
+        compiled = run(torch.compile(m, fullgraph=True, backend=COMPILE_BACKEND))
     assert all(torch.equal(a, b) for a, b in zip(eager, compiled))
 
 
@@ -113,7 +113,7 @@ def test_compile_fullgraph_fused_block():
             return (layernorm_mlp(t, ln, fc1, fc2) + qkv(t)).float()
 
     torch._dynamo.reset()
-    cf = torch.compile(f, fullgraph=True)
+    cf = torch.compile(f, fullgraph=True, backend=COMPILE_BACKEND)
     xe, xc = x.clone().requires_grad_(), x.clone().requires_grad_()
     torch.manual_seed(1)
     ye = f(xe)
@@ -128,6 +128,40 @@ def test_compile_fullgraph_fused_block():
     rel = lambda a, b: ((a - b).norm() / b.norm()).item()  # noqa: E731
     assert rel(yc, ye) < 1e-2  # inductor's own random stream / fused elementwise ops: rounding-level only
     assert all(rel(a, b) < 0.25 for a, b in zip(gc, ge)) and all(torch.isfinite(a).all() for a in gc)
+
+
+# --- bitwise-reproducible training with PyTorch's default (flash) attention ----------------------------
+
+def test_deterministic_mode_block_with_flash_attention(monkeypatch):
+    """Under torch.use_deterministic_algorithms(True) (error mode, so any op without a deterministic
+    implementation would raise) a block with NVFP4 layers and PyTorch's default SDPA backend reproduces
+    its gradients bit for bit. Without it, flash attention's backward accumulates dQ with atomics."""
+    monkeypatch.setenv("CUBLAS_WORKSPACE_CONFIG", ":4096:8")
+    ln, fc1, fc2, _ = _block()
+    qkv, proj = NVFP4Linear(256, 768).to(DEV), NVFP4Linear(256, 256, bias=False).to(DEV)
+    params = [p for m in (ln, fc1, fc2, qkv, proj) for p in m.parameters()]
+    x = torch.randn(4, 256, 256, device=DEV)
+
+    def step():
+        for p in params:
+            p.grad = None
+        torch.manual_seed(3)
+        with torch.autocast("cuda", dtype=torch.bfloat16):
+            q, k, v = qkv(F.layer_norm(x, (256,))).view(4, 256, 3, 4, 64).permute(2, 0, 3, 1, 4)
+            a = F.scaled_dot_product_attention(q, k, v, is_causal=True).transpose(1, 2).reshape(4, 256, 256)
+            h = x + proj(a)
+            loss = (h + layernorm_mlp(h, ln, fc1, fc2)).float().square().mean()
+        loss.backward()
+        return [p.grad.clone() for p in params]
+
+    was = torch.are_deterministic_algorithms_enabled()
+    torch.use_deterministic_algorithms(True)
+    try:
+        first = step()
+        for _ in range(5):
+            assert all(torch.equal(a, b) for a, b in zip(first, step()))
+    finally:
+        torch.use_deterministic_algorithms(was)
 
 
 # --- CUDA graphs: whole training steps -----------------------------------------------------------------
@@ -325,15 +359,36 @@ def _gather_dim0(shard):
     return torch.cat(parts).to(shard.device)
 
 
-def _check_fsdp2(rank, world):
+def _fsdp2_reduction_scale(mesh, world):
+    """What FSDP2 makes of the per-rank gradients in this PyTorch build, measured on a plain nn.Linear:
+    1 if it averages them (2.14), `world` if it sums them (2.7 over gloo)."""
+    import torch.distributed as dist
     from torch.distributed.fsdp import fully_shard
-    expected = _expected(world)
+    lin = torch.nn.Linear(8, 2 * world, bias=False, device=DEV)
+    fully_shard(lin, mesh=mesh)
+    lin(torch.full((1, 8), float(dist.get_rank() + 1), device=DEV)).sum().backward()
+    v = _gather_dim0(lin.weight.grad.to_local())  # every element: sum over ranks of (rank + 1), maybe / world
+    mean = sum(r + 1 for r in range(world)) / world
+    scale = v[0, 0].item() / mean
+    assert scale in (1.0, float(world)) and torch.all(v == v[0, 0]), v
+    return scale
+
+
+def _check_fsdp2(rank, world):
+    import torch.distributed as dist
+    from torch.distributed.device_mesh import DeviceMesh
+    from torch.distributed.fsdp import fully_shard
+    # the mesh over the existing (gloo) group; by default fully_shard would create a CUDA mesh with
+    # its own NCCL group, which Windows builds of PyTorch don't have
+    mesh = DeviceMesh.from_group(dist.group.WORLD, "cuda")
+    scale = _fsdp2_reduction_scale(mesh, world)
+    expected = [e * scale for e in _expected(world)]  # (x 1 or x 2: exact in floating point)
     for fuse in (False, True):
         m = _model(fuse)
         names = [n for n, _ in m.named_parameters()]
         for layer in (m[0], m[2]):
-            fully_shard(layer)
-        fully_shard(m)
+            fully_shard(layer, mesh=mesh)
+        fully_shard(m, mesh=mesh)
         for mb in range(N_MB):
             m.set_requires_gradient_sync(mb == N_MB - 1)
             x, dy = _data(rank, mb)
@@ -342,7 +397,46 @@ def _check_fsdp2(rank, world):
         got = [_gather_dim0(p.grad.to_local()) for p in m.parameters()]
         assert names == [n for n, _ in m.named_parameters()]
         for a, b in zip(got, expected):
-            assert torch.equal(a, b), (rank, fuse, (a - b).abs().max().item())
+            assert torch.equal(a, b), (rank, fuse, (a - b).abs().max().item(), (a.norm() / b.norm()).item())
+
+
+def _check_fsdp1(rank, world):
+    """FullyShardedDataParallel (flat parameters), with and without use_orig_params. The layers see
+    views of the flat parameter, so fused accumulation falls back to the ordinary path (no fusion),
+    and the gradients must still be exact."""
+    from torch.distributed.fsdp import FullyShardedDataParallel as FSDP
+    expected = _expected(world)
+    hits = _count_fusions()
+    for orig_params in (False, True):
+        for fuse in (False, True):
+            hits[0] = 0
+            m = _model(fuse)
+            names = [n for n, _ in m.named_parameters()]
+            fsdp = FSDP(m, device_id=torch.cuda.current_device(), use_orig_params=orig_params)
+            for _step in range(2):
+                fsdp.zero_grad(set_to_none=True)
+                for mb in range(N_MB):
+                    x, dy = _data(rank, mb)
+                    torch.manual_seed(1000 + mb)
+                    with fsdp.no_sync() if mb < N_MB - 1 else contextlib.nullcontext():
+                        fsdp(x).backward(dy)
+                if orig_params:
+                    with FSDP.summon_full_params(fsdp, with_grads=True):
+                        got = {n.replace("_fsdp_wrapped_module.", ""): p.grad.clone()
+                               for n, p in fsdp.named_parameters()}
+                    assert sorted(got) == sorted(names), (sorted(got), names)
+                    got = [got[n] for n in names]
+                else:  # one flat parameter (padded, dim-0 sharded) holding every gradient in order
+                    flat_params = list(fsdp.parameters())
+                    assert len(flat_params) == 1
+                    flat = _gather_dim0(flat_params[0].grad)
+                    want = torch.cat([e.flatten() for e in expected])
+                    assert flat.numel() >= want.numel() and not flat[want.numel():].any()
+                    got = list(torch.split(flat[:want.numel()], [e.numel() for e in expected]))
+                    got = [g.view_as(e) for g, e in zip(got, expected)]
+                for n, a, b in zip(names, got, expected):
+                    assert torch.equal(a, b), (rank, orig_params, fuse, n, (a - b).abs().max().item())
+            assert hits[0] == 0, hits[0]
 
 
 def _dist_worker(rank, world, port, mode):
@@ -354,6 +448,8 @@ def _dist_worker(rank, world, port, mode):
     try:
         if mode == "fsdp2":
             _check_fsdp2(rank, world)
+        elif mode == "fsdp1":
+            _check_fsdp1(rank, world)
         else:
             _check_ddp(rank, world, bucket_view=mode == "ddp_bucket_view")
     finally:
@@ -366,7 +462,7 @@ def _free_port():
         return s.getsockname()[1]
 
 
-@pytest.mark.parametrize("mode", ["ddp", "ddp_bucket_view", "fsdp2"])
+@pytest.mark.parametrize("mode", ["ddp", "ddp_bucket_view", "fsdp1", "fsdp2"])
 def test_two_process_data_parallel(mode):
     import torch.distributed as dist
     import torch.multiprocessing as mp
