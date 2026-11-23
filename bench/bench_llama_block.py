@@ -98,10 +98,14 @@ def main():
     rows = []
     for d in (int(w) for w in a.widths.split(",")):
         r = {"d": d, "hidden": hidden_size(d)}
-        for v in VARIANTS:
-            sec, mib = step_time(d, v)
-            r[f"{v}_ms"], r[f"peak_mib_{v}"] = sec * 1e3, mib
-            torch.cuda.empty_cache()
+        # two passes in opposite orders, best of both: the power-limited laptop GPU runs hotter (and slower)
+        # the longer it has been busy, which would otherwise favour whichever variant runs first
+        for order in (VARIANTS, VARIANTS[::-1]):
+            for v in order:
+                sec, mib = step_time(d, v)
+                r[f"{v}_ms"] = min(r.get(f"{v}_ms", float("inf")), sec * 1e3)
+                r.setdefault(f"peak_mib_{v}", mib)
+                torch.cuda.empty_cache()
         for v in VARIANTS[1:]:
             r[f"speedup_{v}"] = r["bf16_ms"] / r[f"{v}_ms"]
         rows.append(r)

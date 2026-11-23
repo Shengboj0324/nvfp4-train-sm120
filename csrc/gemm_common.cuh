@@ -150,6 +150,20 @@ __device__ __forceinline__ void store_pair(float* base, int row, int col, int M,
   }
 }
 
+// Prefetch the [BM, BN] tile at (m0, n0) of a row-major [M, N] matrix (ld N, elem_bytes per element) into
+// L2, for an epilogue that reads it (the old values of an accumulating GEMM, a residual): each of the
+// first BM threads issues one bulk prefetch of its row (rows past M are skipped; a ragged right edge
+// prefetches the valid columns rounded down to 16 bytes; rows that are not 16-byte aligned are skipped).
+__device__ __forceinline__ void prefetch_tile_l2(const void* base, int elem_bytes, const Args& p, int m0, int n0) {
+  const int r = threadIdx.x;
+  if (r >= BM || m0 + r >= p.M || (static_cast<int64_t>(p.N) * elem_bytes) % 16 != 0) return;
+  const uint32_t bytes = static_cast<uint32_t>(min(BN, p.N - n0) * elem_bytes) & ~15u;
+  if (bytes == 0) return;
+  const char* src = static_cast<const char*>(base) + (static_cast<int64_t>(m0 + r) * p.N + n0) * elem_bytes;
+  if (reinterpret_cast<uintptr_t>(src) & 15) return;  // e.g. a residual view at an odd offset
+  asm volatile("cp.async.bulk.prefetch.L2.global [%0], %1;\n" ::"l"(src), "r"(bytes) : "memory");
+}
+
 // Split-K: every split stores its raw fp32 partial; the last CTA of a tile to arrive sums all partials
 // in split order 0..S-1 (its own from registers), so the result does not depend on arrival order.
 // Returns false in CTAs that are not last (they have nothing more to do). Called by the 256 MMA threads.
@@ -193,27 +207,29 @@ __device__ __forceinline__ void store_tile(const Args& p, float (&acc)[MI][NI][4
                                            int lane) {
   const float alpha = (*p.gdec_a) * (*p.gdec_b);
   if constexpr (kAccum) {
-    // Loads for one m16 row group are issued together (a load cannot be moved past a store to the
-    // same array, so a load-add-store loop would serialize their latency).
+    // All of a thread's old values are loaded before any store (a load cannot be moved past a store to
+    // the same array, so a load-add-store loop would serialize their latency; the main loop's fragment
+    // registers are free by now). The tile was prefetched into L2 when the work unit started.
     float* d = reinterpret_cast<float*>(p.d);
     const int g = lane >> 2, tig = lane & 3;
+    float2 old[MI][NI][2];
 #pragma unroll
-    for (int i = 0; i < MI; ++i) {
-      float2 old[NI][2];
+    for (int i = 0; i < MI; ++i)
 #pragma unroll
       for (int j = 0; j < NI; ++j)
 #pragma unroll
         for (int h = 0; h < 2; ++h)
-          old[j][h] = load_pair(d, m0 + wm * WM + i * 16 + g + 8 * h, n0 + wn * WN + j * 8 + 2 * tig, p.M, p.N);
+          old[i][j][h] = load_pair(d, m0 + wm * WM + i * 16 + g + 8 * h, n0 + wn * WN + j * 8 + 2 * tig, p.M, p.N);
+#pragma unroll
+    for (int i = 0; i < MI; ++i)
 #pragma unroll
       for (int j = 0; j < NI; ++j)
 #pragma unroll
         for (int h = 0; h < 2; ++h) {
           const int row = m0 + wm * WM + i * 16 + g + 8 * h, col = n0 + wn * WN + j * 8 + 2 * tig;
-          store_pair(d, row, col, p.M, p.N, __fadd_rn(old[j][h].x, __fmul_rn(acc[i][j][2 * h], alpha)),
-                     __fadd_rn(old[j][h].y, __fmul_rn(acc[i][j][2 * h + 1], alpha)));
+          store_pair(d, row, col, p.M, p.N, __fadd_rn(old[i][j][h].x, __fmul_rn(acc[i][j][2 * h], alpha)),
+                     __fadd_rn(old[i][j][h].y, __fmul_rn(acc[i][j][2 * h + 1], alpha)));
         }
-    }
   } else {
     const bool epi = p.bias != nullptr || p.res != nullptr;
     for_each_pair(m0, n0, wm, wn, lane, [&](int i, int j, int h, int row, int col) {

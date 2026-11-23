@@ -60,9 +60,16 @@ def main():
     a = ap.parse_args()
     rows = []
     for d in (768, 1024, 2048, 3072, 4096):
-        (tb, mb), (tq, mq), (tw, mw), (tf, mf), (tc, mc), (tr, mr), (trc, mrc) = (
-            step_time(d, p) for p in ("bf16", "nvfp4", "nvfp4_fused_wgrad", "nvfp4_fused", "nvfp4_fused_cached",
-                                      "nvfp4_fused_res", "nvfp4_fused_res_cached"))
+        names = ("bf16", "nvfp4", "nvfp4_fused_wgrad", "nvfp4_fused", "nvfp4_fused_cached", "nvfp4_fused_res",
+                 "nvfp4_fused_res_cached")
+        # two passes in opposite orders, best of both (the power-limited GPU slows as it heats up)
+        best = {}
+        for order in (names, names[::-1]):
+            for p in order:
+                t, m = step_time(d, p)
+                best[p] = (min(best.get(p, (float("inf"),))[0], t), best.get(p, (0, m))[1])
+                torch.cuda.empty_cache()
+        (tb, mb), (tq, mq), (tw, mw), (tf, mf), (tc, mc), (tr, mr), (trc, mrc) = (best[p] for p in names)
         lin_flops = 6 * 8192 * 12 * d * d  # fwd+bwd FLOPs of the four linears
         rows.append({"d": d, "bf16_ms": tb * 1e3, "nvfp4_ms": tq * 1e3, "nvfp4_fused_wgrad_ms": tw * 1e3,
                      "nvfp4_fused_ms": tf * 1e3, "nvfp4_fused_cached_ms": tc * 1e3,

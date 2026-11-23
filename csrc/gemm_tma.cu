@@ -460,6 +460,9 @@ __global__ void __launch_bounds__(THREADS, 1)
   for (int u = blockIdx.x; u < gd.total; u += gridDim.x) {
     const Unit w = unit_of(p, u, gd.tiles_n, gd.tiles);
     ps.nk = w.nk;
+    // the epilogue reads the old output (accumulate) or the residual: start fetching it into L2 now
+    if (kAccum && p.splits == 1) prefetch_tile_l2(p.d, 4, p, w.m0, w.n0);
+    if (!kAccum && p.res != nullptr) prefetch_tile_l2(p.res, p.res_bf16 ? 2 : 4, p, w.m0, w.n0);
     float acc[MI][NI][4];
 #pragma unroll
     for (int i = 0; i < MI; ++i)
