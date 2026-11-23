@@ -24,7 +24,7 @@ Full details and raw data are in [docs/RESULTS.md](docs/RESULTS.md).
 | Transformer block fwd+bwd | **1.80× (d=768) → 2.42× (d=2048) → 3.10× (d=4096)** vs BF16, with 7–14% less memory |
 | GPT-507M (d=2048) pretraining | val loss **1.6954 vs 1.6786** BF16 (+1.0%), **1.62× tokens/s, −39% GPU energy** |
 | GPT-124M (d=768) pretraining, 49M tokens | val loss **1.5062 vs 1.4892** BF16 (constant ~0.017 gap, no divergence), **+27% tokens/s, −22% GPU energy** |
-| Correctness | quantizers and fused LayerNorm/GELU **bit-exact** vs the reference spec; GEMM = fp64 reference to ~1e-7; 271 tests |
+| Correctness | quantizers and fused LayerNorm/GELU **bit-exact** vs the reference spec; GEMM = fp64 reference to ~1e-7; 305 tests; compute-sanitizer clean (memcheck, racecheck, synccheck, initcheck); 8-minute soak with bit-exact replays |
 
 ![loss curves](experiments/results/v0.3_wide/loss.png)
 
@@ -32,12 +32,16 @@ Full details and raw data are in [docs/RESULTS.md](docs/RESULTS.md).
 
 ```bash
 sudo tools/setup_wsl.sh            # CUDA 13.0 toolkit + venv with PyTorch 2.14 cu130 (~/nvfp4)
-tools/check.sh                     # build the extension for sm_120a + run all tests
+pip install --no-build-isolation . # build the extension for sm_120a (or: pip wheel ... for a wheel)
+tools/check.sh                     # run all tests; `tools/check.sh release` adds sanitizers + soak
 ```
+
+**Integrating into a training stack:** read [docs/USAGE.md](docs/USAGE.md) (requirements, options,
+guarantees, production caveats, troubleshooting). Changes per version: [CHANGELOG.md](CHANGELOG.md).
 
 ```python
 import torch
-from nvfp4.linear import NVFP4Linear, convert_linears
+from nvfp4 import NVFP4Linear, convert_linears
 
 layer = NVFP4Linear(4096, 4096, bias=False).cuda()        # in/out features must be multiples of 128
 y = layer(torch.randn(8192, 4096, device="cuda", dtype=torch.bfloat16))
@@ -46,7 +50,7 @@ y = layer(torch.randn(8192, 4096, device="cuda", dtype=torch.bfloat16))
 convert_linears(model.blocks, skip=("10.", "11."))
 
 # pre-LN sub-blocks with LayerNorm / GELU fused into the NVFP4 quantizers
-from nvfp4.fused import layernorm_linear, layernorm_mlp
+from nvfp4 import layernorm_linear, layernorm_mlp
 qkv = layernorm_linear(x, block.ln1, block.qkv)           # block.qkv: NVFP4Linear (bias-free)
 out = layernorm_mlp(x, block.ln2, block.fc1, block.fc2)   # fc2(gelu_tanh(fc1(ln2(x))))
 
@@ -78,12 +82,15 @@ tests/                 bit-exact / reference tests (GPU tests auto-skip without 
 bench/                 GEMM, quantizer and transformer-block benchmarks (+ results/)
 experiments/           TinyStories GPT pretraining: BF16 vs NVFP4 (+ results/)
 tools/guard.py         runs jobs under GPU temperature / memory / host-RAM limits, with cooldowns
-docs/                  DESIGN.md, RESULTS.md, research/ (why this project exists)
+tools/sanitize.sh      compute-sanitizer over every kernel variant; tools/soak.py: long-run soak test
+docs/                  USAGE.md (integration guide), DESIGN.md, RESULTS.md, research/
 ```
 
 ## Status and limitations
 
-This is a research-grade implementation, verified on one GPU. The known gaps are listed in
+Verified on one GPU model (RTX 5090 Laptop) with the test, sanitizer and soak suites above and two
+end-to-end pretraining comparisons; validate the precision recipe on your own model before relying on
+it. The known gaps are listed in
 [docs/DESIGN.md §6](docs/DESIGN.md#6-known-limitations-and-next-steps):
 - at equal clocks the GEMM keeps the tensor pipe 69% busy vs cuBLASLt's 90% (the gap disappears at
   this laptop's power limit, but would show on a GPU with more power headroom);

@@ -134,7 +134,7 @@ __device__ __forceinline__ float load_tile(const T* __restrict__ x, const Params
 #pragma unroll
     for (int i = 0; i < VEC; ++i) {
       tile[row][col + i] = v[i];
-      m = fmaxf(m, fabsf(v[i]));
+      m = nan_max(m, fabsf(v[i]));
     }
   }
   return m;
@@ -142,7 +142,7 @@ __device__ __forceinline__ float load_tile(const T* __restrict__ x, const Params
 
 __device__ __forceinline__ float warp_max(float m) {
 #pragma unroll
-  for (int o = 16; o > 0; o >>= 1) m = fmaxf(m, __shfl_xor_sync(0xffffffffu, m, o));
+  for (int o = 16; o > 0; o >>= 1) m = nan_max(m, __shfl_xor_sync(0xffffffffu, m, o));
   return m;
 }
 
@@ -184,7 +184,7 @@ __global__ void __launch_bounds__(THREADS) amax_flat_kernel(const T* __restrict_
       v[3] = __uint_as_float(u.w);
     }
 #pragma unroll
-    for (int k = 0; k < VEC; ++k) m = fmaxf(m, fabsf(v[k]));
+    for (int k = 0; k < VEC; ++k) m = nan_max(m, fabsf(v[k]));
   }
   m = block_max(m);
   if (threadIdx.x == 0) atomicMax(out, __float_as_uint(m));
@@ -203,7 +203,7 @@ __global__ void __launch_bounds__(THREADS) amax_tile_kernel(const T* __restrict_
   for (int t = blockIdx.x; t < ntiles; t += gridDim.x) {
     const int r0 = (t / tiles_c) * TILE, c0 = (t % tiles_c) * TILE;
     __syncthreads();  // previous iteration's column reads are done
-    m_plain = fmaxf(m_plain, load_tile<T, PRO>(x, p, pa, r0, c0, tile));
+    m_plain = nan_max(m_plain, load_tile<T, PRO>(x, p, pa, r0, c0, tile));
     if (!p.col_rht) continue;
     __syncthreads();
     float v[kBlock];
@@ -211,7 +211,7 @@ __global__ void __launch_bounds__(THREADS) amax_tile_kernel(const T* __restrict_
     for (int i = 0; i < kBlock; ++i) v[i] = tile[b * kBlock + i][c];
     rht16(v, p.rht_mask);
 #pragma unroll
-    for (int i = 0; i < kBlock; ++i) m_rht = fmaxf(m_rht, fabsf(v[i]));
+    for (int i = 0; i < kBlock; ++i) m_rht = nan_max(m_rht, fabsf(v[i]));
   }
   m_plain = block_max(m_plain);
   m_rht = block_max(m_rht);

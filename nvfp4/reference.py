@@ -14,7 +14,7 @@ Value of element ``(r, c)`` = ``e2m1(data) * e4m3(scales[r, c // 16]) * gdec``.
 
 Recipe (matches NVIDIA's published NVFP4 recipe, two-level scaling):
 
-    genc  = (448 * 6) / amax(tensor)          (1.0 if amax == 0);  gdec = 1 / genc
+    genc  = (448 * 6) / amax(tensor)          (1.0 if amax == 0, NaN if amax is NaN);  gdec = 1 / genc
     s_b   = e4m3_rn( min(amax(block) / 6 * genc, 448) )
     q     = round_e2m1( x * (genc / s_b) )     (q = 0 where s_b == 0)
 
@@ -161,6 +161,9 @@ def global_scales(amax: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
     num = torch.full_like(amax, E4M3_MAX * E2M1_MAX)
     genc = torch.where(amax > 0, torch.div(num, torch.where(amax > 0, amax, torch.ones_like(amax))),
                        torch.ones_like(amax))
+    # A NaN anywhere must not quantize to finite values: it makes the decode scale (and so every
+    # GEMM output using this tensor) NaN. An inf amax gives genc 0 and gdec inf, likewise non-finite.
+    genc = torch.where(torch.isnan(amax), torch.full_like(amax, float("nan")), genc)
     return genc, torch.div(torch.ones_like(genc), genc)
 
 

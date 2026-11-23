@@ -3,8 +3,12 @@
 Set NVFP4_SKIP_CUDA=1 to install only the pure-Python reference (used by CI without a GPU).
 """
 import os
+import re
 
 from setuptools import find_packages, setup
+
+HERE = os.path.dirname(os.path.abspath(__file__))
+VERSION = re.search(r'__version__ = "([^"]+)"', open(os.path.join(HERE, "nvfp4", "__init__.py")).read()).group(1)
 
 ext_modules, cmdclass = [], {}
 if os.environ.get("NVFP4_SKIP_CUDA") != "1":
@@ -27,10 +31,23 @@ if os.environ.get("NVFP4_SKIP_CUDA") != "1":
 
 setup(
     name="nvfp4-train-sm120",
-    version="0.1.0",
-    description="NVFP4 training kernels for consumer Blackwell (sm_120)",
+    version=VERSION,
+    description="NVFP4 (4-bit) training kernels for consumer Blackwell GPUs (RTX 50-series, sm_120)",
+    long_description=open(os.path.join(HERE, "README.md"), encoding="utf-8").read(),
+    long_description_content_type="text/markdown",
+    license="Apache-2.0",
+    url="https://github.com/Shengboj0324/nvfp4-train-sm120",
     packages=find_packages(include=["nvfp4", "nvfp4.*"]),
     python_requires=">=3.10",
+    install_requires=["torch>=2.7"],  # the CUDA build needs the same torch it was compiled against
     ext_modules=ext_modules,
     cmdclass=cmdclass,
+    classifiers=[
+        "License :: OSI Approved :: Apache Software License",
+        "Programming Language :: Python :: 3",
+        "Programming Language :: C++",
+        "Environment :: GPU :: NVIDIA CUDA :: 13",
+        "Operating System :: POSIX :: Linux",
+        "Topic :: Scientific/Engineering :: Artificial Intelligence",
+    ],
 )

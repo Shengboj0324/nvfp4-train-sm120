@@ -15,8 +15,34 @@ except ImportError:  # pragma: no cover - CPU-only installs
 _DEFAULT_SPLITS = int(os.environ.get("NVFP4_GEMM_SPLITS", "0"))  # 1 disables split-K (ablations)
 
 
-def available() -> bool:
-    return _C is not None and torch.cuda.is_available() and torch.cuda.get_device_capability() >= (12, 0)
+# The kernels are compiled for the arch-specific target sm_120a, whose code runs on compute
+# capability 12.0 only (RTX 50-series); 'a' targets are not forward compatible.
+SUPPORTED_CAPABILITY = (12, 0)
+_device_ok: dict[int, bool] = {}
+
+
+def available(device: int | torch.device | None = None) -> bool:
+    """True if the extension is built and ``device`` (default: current) is an sm_120 GPU."""
+    if _C is None or not torch.cuda.is_available():
+        return False
+    return torch.cuda.get_device_capability(device) == SUPPORTED_CAPABILITY
+
+
+def _require(t: torch.Tensor) -> None:
+    """Fail early with a clear message instead of a CUDA launch error deep inside a kernel."""
+    if _C is None:
+        raise RuntimeError("nvfp4 CUDA extension not built (pip install -e . on a machine with CUDA >= 12.8); "
+                           "use NVFP4Linear(..., backend='emulate') to run the recipe without it")
+    if not t.is_cuda:
+        raise RuntimeError(f"nvfp4 CUDA ops need CUDA tensors, got a tensor on {t.device}")
+    idx = t.device.index if t.device.index is not None else torch.cuda.current_device()
+    ok = _device_ok.get(idx)
+    if ok is None:
+        ok = _device_ok[idx] = torch.cuda.get_device_capability(idx) == SUPPORTED_CAPABILITY
+    if not ok:
+        cap = torch.cuda.get_device_capability(idx)
+        raise RuntimeError(f"nvfp4 kernels run on compute capability {SUPPORTED_CAPABILITY} (RTX 50-series) only; "
+                           f"cuda:{idx} is {cap}. Use NVFP4Linear(..., backend='emulate') elsewhere")
 
 
 @dataclass
@@ -46,8 +72,7 @@ class NVFP4Tensor:
 def quantize(x: torch.Tensor, *, transpose: bool = False, block_2d: bool = False, stochastic: bool = False,
              sr_seed: int = 0, rht_seed: int | None = None) -> NVFP4Tensor:
     """Quantize ``x`` (or ``x.T`` if ``transpose``) along the last dim. ``rht_seed`` enables the 16-point RHT."""
-    if _C is None:
-        raise RuntimeError("nvfp4 CUDA extension not built")
+    _require(x)
     if not x.is_contiguous():
         x = x.contiguous()
     d, s, g = _C.quantize(x, transpose, block_2d, stochastic, int(sr_seed), rht_seed is not None,
@@ -65,8 +90,7 @@ def quantize_dual(x: torch.Tensor, *, row: bool = True, col: bool = True, block_
     output. With ``block_2d`` both use 16x16 tiles, so the col output is the exact transpose of the row
     output. Bit-identical to ``reference.quantize_dual``.
     """
-    if _C is None:
-        raise RuntimeError("nvfp4 CUDA extension not built")
+    _require(x)
     if not x.is_contiguous() or x.data_ptr() % 16:
         x = x.contiguous() if not x.is_contiguous() else x.clone()
     rd, rs, rg, cd, cs, cg = _C.quantize_dual(
@@ -103,8 +127,7 @@ def layernorm_quantize_dual(x: torch.Tensor, weight: torch.Tensor, bias: torch.T
     Returns ``(mean, rstd, row, col)``: the per-row statistics ([R] fp32, what the LayerNorm backward
     needs) and the two quantize_dual outputs of ``((x - mean) * rstd) * weight + bias`` in fp32.
     """
-    if _C is None:
-        raise RuntimeError("nvfp4 CUDA extension not built")
+    _require(x)
     outs = _C.layernorm_quantize_dual(_aligned(x), weight.float().contiguous(), bias.float().contiguous(), float(eps),
                                       *_dual_flags(row, col, row_sr_seed, col_sr_seed, rht_seed, col_pad))
     return (outs[0], outs[1], *_pair(outs[2:], row, col))
@@ -113,8 +136,7 @@ def layernorm_quantize_dual(x: torch.Tensor, weight: torch.Tensor, bias: torch.T
 def gelu_quantize_dual(h: torch.Tensor, *, row: bool = True, col: bool = True, row_sr_seed: int | None = None,
                        col_sr_seed: int | None = None, rht_seed: int | None = None, col_pad: int = 16):
     """Quantize ``gelu(h)`` (tanh approximation, bf16 ``h``) without writing it."""
-    if _C is None:
-        raise RuntimeError("nvfp4 CUDA extension not built")
+    _require(h)
     outs = _C.gelu_quantize_dual(_aligned(h.to(torch.bfloat16)),
                                  *_dual_flags(row, col, row_sr_seed, col_sr_seed, rht_seed, col_pad))
     return _pair(outs, row, col)
@@ -124,8 +146,7 @@ def gelu_backward_quantize_dual(dy: torch.Tensor, h: torch.Tensor, *, row: bool 
                                 row_sr_seed: int | None = None, col_sr_seed: int | None = None,
                                 rht_seed: int | None = None, col_pad: int = 16):
     """Quantize the GELU input gradient ``dy * gelu'(h)`` (bf16 ``dy``, ``h``) without writing it."""
-    if _C is None:
-        raise RuntimeError("nvfp4 CUDA extension not built")
+    _require(dy)
     outs = _C.gelu_backward_quantize_dual(_aligned(dy.to(torch.bfloat16)), _aligned(h.to(torch.bfloat16)),
                                           *_dual_flags(row, col, row_sr_seed, col_sr_seed, rht_seed, col_pad))
     return _pair(outs, row, col)
@@ -142,8 +163,7 @@ def gemm(a: NVFP4Tensor, b: NVFP4Tensor, out_dtype: torch.dtype = torch.bfloat16
     ``splits``: number of K splits (0 = chosen from the grid size; None = $NVFP4_GEMM_SPLITS, default 0).
     The split-K reduction is deterministic but sums in a different order than an unsplit GEMM.
     """
-    if _C is None:
-        raise RuntimeError("nvfp4 CUDA extension not built")
+    _require(a.data)
     if out is not None:
         out_dtype = out.dtype
     impl_id = {"auto": 0, "cp.async": 1, "tma": 2}[impl]

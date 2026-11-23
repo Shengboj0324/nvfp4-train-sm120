@@ -166,13 +166,11 @@ __global__ void __launch_bounds__(THREADS, 1) nvfp4_gemm_kernel(Args p) {
   finish_tile<OutT, kAccum>(p, acc, m0, n0, wm, wn, lane, reinterpret_cast<int*>(smem + STAGES * STAGE_BYTES));
 }
 
-// One static per instantiation: each kernel needs its own max-dynamic-smem attribute.
+// One flag set per instantiation: each kernel needs its own max-dynamic-smem attribute, per device.
 template <typename OutT, bool kAccum>
 void launch(const Args& p, dim3 grid, cudaStream_t stream) {
-  static const bool attr = (cudaFuncSetAttribute(nvfp4_gemm_kernel<OutT, kAccum>,
-                                                 cudaFuncAttributeMaxDynamicSharedMemorySize, SMEM_BYTES),
-                            true);
-  (void)attr;
+  static std::atomic<uint64_t> configured{0};
+  C10_CUDA_CHECK(ensure_smem_attr(nvfp4_gemm_kernel<OutT, kAccum>, SMEM_BYTES, configured));
   nvfp4_gemm_kernel<OutT, kAccum><<<grid, THREADS, SMEM_BYTES, stream>>>(p);
 }
 

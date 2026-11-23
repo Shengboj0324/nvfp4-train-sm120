@@ -22,6 +22,9 @@
 #include <cudaTypedefs.h>
 #include <cuda_runtime.h>
 
+#include <stdexcept>
+#include <string>
+
 #include "gemm_common.cuh"
 
 namespace nvfp4 {
@@ -355,10 +358,9 @@ bool make_map(CUtensorMap* map, const void* ptr, int64_t rows, int64_t cols, int
 
 template <typename OutT, bool kAccum>
 void launch(const Args& p, const CUtensorMap (&maps)[4], dim3 grid, cudaStream_t stream) {
-  static const bool attr = (cudaFuncSetAttribute(nvfp4_gemm_tma_kernel<OutT, kAccum>,
-                                                 cudaFuncAttributeMaxDynamicSharedMemorySize, SMEM_BYTES),
-                            true);
-  (void)attr;
+  static std::atomic<uint64_t> configured{0};
+  const cudaError_t err = ensure_smem_attr(nvfp4_gemm_tma_kernel<OutT, kAccum>, SMEM_BYTES, configured);
+  if (err != cudaSuccess) throw std::runtime_error(std::string("nvfp4 TMA GEMM: ") + cudaGetErrorString(err));
   nvfp4_gemm_tma_kernel<OutT, kAccum><<<grid, THREADS, SMEM_BYTES, stream>>>(p, maps[0], maps[1], maps[2], maps[3]);
 }
 
