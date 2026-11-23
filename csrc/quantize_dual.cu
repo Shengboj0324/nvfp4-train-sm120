@@ -20,10 +20,16 @@
 // persistent with one atomic per CTA.
 //
 // Producer fusion: the tile loader can apply the op that produced X, so that X itself is never
-// written to memory (Pro below): LayerNorm (from x and per-row mean / rstd computed by ln_stats_kernel),
-// tanh-GELU (from its input h), or the GELU backward (dY * gelu'(h), from dY and h). The amax pass
-// and the quantize pass both apply it; each is bit-identical to the reference op followed by
-// reference.quantize_dual.
+// written to memory (Pro below): LayerNorm / RMSNorm (from x and per-row statistics computed by
+// ln_stats_kernel), tanh-GELU (from its input h), the GELU backward (dY * gelu'(h), from dY and h),
+// SwiGLU (silu(g) * u, from the gate and up projections) and its two backward halves (the gradients
+// w.r.t. g and u, from dY, g and u). The GELUs (tanh or exact erf) can add a per-column bias to their
+// input first (the producing linear's bias). The amax pass and the quantize pass both apply it; each
+// is bit-identical to the reference op followed by reference.quantize_dual.
+//
+// Column sums: the quantize pass can also write per-tile column sums of op(X) (Outputs::colsum,
+// [tiles along R, C], summed in a fixed order: deterministic, no atomics), from which the host gets
+// a bias gradient (sum over rows of the GELU input gradient) without op(X) ever being written.
 
 #include <ATen/cuda/CUDAContext.h>
 #include <c10/cuda/CUDAGuard.h>
@@ -78,18 +84,32 @@ __device__ __forceinline__ Seeds resolve_seeds(const Params& p, const int64_t (&
 struct Outputs {
   uint8_t *row_data, *row_scales, *col_data, *col_scales;
   float *row_gdec, *col_gdec;
+  float* colsum;  // optional [gridDim.y, C]: per-tile column sums of op(X)
 };
 
 // Producer op applied to every loaded element (zero padding stays zero).
-enum Pro : int { kNone = 0, kLayerNorm = 1, kGelu = 2, kGeluBwd = 3 };
+enum Pro : int {
+  kNone = 0,
+  kLayerNorm = 1,      // X = x:  ((x - mean) * rstd) * gamma + beta
+  kGelu = 2,           // X = h:  gelu_tanh(h)
+  kGeluBwd = 3,        // X = dY: dY * gelu_tanh'(h),          aux = h
+  kRmsNorm = 4,        // X = x:  (x * rstd) * gamma
+  kSwiglu = 5,         // X = g:  silu(g) * u,                 aux = u
+  kSwigluBwdGate = 6,  // X = dY: dY * u * silu'(g),           aux = g, aux2 = u
+  kSwigluBwdUp = 7,    // X = dY: dY * silu(g),                aux = g
+  kGeluErf = 8,        // X = h:  gelu_erf(h)
+  kGeluErfBwd = 9,     // X = dY: dY * gelu_erf'(h),           aux = h
+};
+// The four GELU variants add the per-column bias ProArgs::beta (if set) to h first.
 
 template <typename T>
 struct ProArgs {
   const float* mean;   // [R]   LayerNorm
-  const float* rstd;   // [R]   LayerNorm
-  const float* gamma;  // [C]   LayerNorm weight
-  const float* beta;   // [C]   LayerNorm bias
-  const T* aux;        // [R,C] GELU backward: h (X is dY)
+  const float* rstd;   // [R]   LayerNorm / RMSNorm
+  const float* gamma;  // [C]   LayerNorm / RMSNorm weight
+  const float* beta;   // [C]   LayerNorm bias / bias added to the GELU input (optional)
+  const T* aux;        // [R,C] second input (see Pro)
+  const T* aux2;       // [R,C] third input (see Pro)
 };
 
 __device__ __forceinline__ void unpack8(const uint4& u, float* v) {
@@ -125,14 +145,42 @@ __device__ __forceinline__ void apply_pro(float* v, const ProArgs<T>& pa, int64_
 #pragma unroll
     for (int i = 0; i < VEC; ++i)
       v[i] = layernorm_apply(v[i], m, rs, __ldg(pa.gamma + gc + i), __ldg(pa.beta + gc + i));
-  } else if constexpr (PRO == kGelu) {
+  } else if constexpr (PRO == kGelu || PRO == kGeluErf) {
+    if (pa.beta) {
 #pragma unroll
-    for (int i = 0; i < VEC; ++i) v[i] = gelu_tanh(v[i]);
-  } else if constexpr (PRO == kGeluBwd) {
+      for (int i = 0; i < VEC; ++i) v[i] = __fadd_rn(v[i], __ldg(pa.beta + gc + i));
+    }
+#pragma unroll
+    for (int i = 0; i < VEC; ++i) v[i] = PRO == kGelu ? gelu_tanh(v[i]) : gelu_erf(v[i]);
+  } else if constexpr (PRO == kGeluBwd || PRO == kGeluErfBwd) {
     float h[VEC];
     load_vec(pa.aux + off, h);
+    if (pa.beta) {
 #pragma unroll
-    for (int i = 0; i < VEC; ++i) v[i] = gelu_tanh_backward(v[i], h[i]);
+      for (int i = 0; i < VEC; ++i) h[i] = __fadd_rn(h[i], __ldg(pa.beta + gc + i));
+    }
+#pragma unroll
+    for (int i = 0; i < VEC; ++i) v[i] = PRO == kGeluBwd ? gelu_tanh_backward(v[i], h[i]) : gelu_erf_backward(v[i], h[i]);
+  } else if constexpr (PRO == kRmsNorm) {
+    const float rs = __ldg(pa.rstd + gr);
+#pragma unroll
+    for (int i = 0; i < VEC; ++i) v[i] = rmsnorm_apply(v[i], rs, __ldg(pa.gamma + gc + i));
+  } else if constexpr (PRO == kSwiglu) {
+    float u[VEC];
+    load_vec(pa.aux + off, u);
+#pragma unroll
+    for (int i = 0; i < VEC; ++i) v[i] = swiglu(v[i], u[i]);
+  } else if constexpr (PRO == kSwigluBwdGate) {
+    float g[VEC], u[VEC];
+    load_vec(pa.aux + off, g);
+    load_vec(pa.aux2 + off, u);
+#pragma unroll
+    for (int i = 0; i < VEC; ++i) v[i] = swiglu_backward_gate(v[i], g[i], u[i]);
+  } else if constexpr (PRO == kSwigluBwdUp) {
+    float g[VEC];
+    load_vec(pa.aux + off, g);
+#pragma unroll
+    for (int i = 0; i < VEC; ++i) v[i] = swiglu_backward_up(v[i], g[i]);
   }
 }
 
@@ -313,6 +361,12 @@ __global__ void __launch_bounds__(THREADS) dual_quantize_kernel(const T* __restr
   if (my_seed_ptr) s_seed[threadIdx.x] = my_seed;
   __syncthreads();
   const Seeds seeds = resolve_seeds(p, s_seed);
+  if (o.colsum != nullptr && threadIdx.x < TILE && c0 + static_cast<int>(threadIdx.x) < p.C) {
+    float cs = 0.0f;  // rows past R are zero padding
+#pragma unroll 8
+    for (int r = 0; r < TILE; ++r) cs = __fadd_rn(cs, tile[r][threadIdx.x]);
+    o.colsum[static_cast<int64_t>(blockIdx.y) * p.C + c0 + threadIdx.x] = cs;
+  }
 
   const int b = threadIdx.x / TILE;  // block index within the tile (0..3)
   const int k = threadIdx.x % TILE;  // row (row phase) / column (col phase) within the tile
@@ -363,7 +417,8 @@ __global__ void __launch_bounds__(THREADS) dual_quantize_kernel(const T* __restr
 // LayerNorm row statistics: mean and rstd = 1 / sqrt(var + eps) (biased variance), one warp per row,
 // two passes over the row (the second hits L1). Sums are warp-shuffle trees, so the result is
 // deterministic; it matches torch.layer_norm's statistics to fp32 rounding, not bit for bit.
-template <typename T>
+// kRms: RMSNorm's rstd = 1 / sqrt(mean(x^2) + eps) (one pass, no mean written).
+template <typename T, bool kRms>
 __global__ void __launch_bounds__(THREADS) ln_stats_kernel(const T* __restrict__ x, int R, int C, float eps,
                                                            float* __restrict__ mean, float* __restrict__ rstd) {
   constexpr int VEC = 16 / sizeof(T);
@@ -371,16 +426,19 @@ __global__ void __launch_bounds__(THREADS) ln_stats_kernel(const T* __restrict__
   const int r = blockIdx.x * (THREADS / 32) + (threadIdx.x >> 5);
   if (r >= R) return;
   const T* row = x + static_cast<int64_t>(r) * C;
-  float s = 0.0f;
-  for (int c = lane * VEC; c < C; c += 32 * VEC) {
-    float v[VEC];
-    load_vec(row + c, v);
+  float m = 0.0f;
+  if constexpr (!kRms) {
+    float s = 0.0f;
+    for (int c = lane * VEC; c < C; c += 32 * VEC) {
+      float v[VEC];
+      load_vec(row + c, v);
 #pragma unroll
-    for (int i = 0; i < VEC; ++i) s = __fadd_rn(s, v[i]);
+      for (int i = 0; i < VEC; ++i) s = __fadd_rn(s, v[i]);
+    }
+#pragma unroll
+    for (int o = 16; o > 0; o >>= 1) s = __fadd_rn(s, __shfl_xor_sync(0xffffffffu, s, o));
+    m = __fdiv_rn(s, static_cast<float>(C));
   }
-#pragma unroll
-  for (int o = 16; o > 0; o >>= 1) s = __fadd_rn(s, __shfl_xor_sync(0xffffffffu, s, o));
-  const float m = __fdiv_rn(s, static_cast<float>(C));
   float q = 0.0f;
   for (int c = lane * VEC; c < C; c += 32 * VEC) {
     float v[VEC];
@@ -394,7 +452,7 @@ __global__ void __launch_bounds__(THREADS) ln_stats_kernel(const T* __restrict__
 #pragma unroll
   for (int o = 16; o > 0; o >>= 1) q = __fadd_rn(q, __shfl_xor_sync(0xffffffffu, q, o));
   if (lane == 0) {
-    mean[r] = m;
+    if constexpr (!kRms) mean[r] = m;
     rstd[r] = __frsqrt_rn(__fadd_rn(__fdiv_rn(q, static_cast<float>(C)), eps));
   }
 }
@@ -421,10 +479,12 @@ const int64_t* seed_ptr(const OptTensor& t, const torch::Tensor& x, const char* 
 
 // Shared host path of all quantize_dual entry points. `pro` selects the producer op; LayerNorm needs
 // mean / rstd / gamma / beta, the GELU backward needs `aux` (h).
-std::vector<torch::Tensor> run_dual(const torch::Tensor& x, int pro, const torch::Tensor* aux, const float* mean,
+std::vector<torch::Tensor> run_dual(const torch::Tensor& x, int pro, const torch::Tensor* aux,
+                                    const torch::Tensor* aux2, const float* mean,
                                     const float* rstd, const float* gamma, const float* beta, bool do_row, bool do_col,
                                     bool block_2d, bool row_sr, int64_t row_seed, bool col_sr, int64_t col_seed,
-                                    bool col_rht, int64_t rht_seed, int64_t col_pad, const SeedTensors& seeds) {
+                                    bool col_rht, int64_t rht_seed, int64_t col_pad, const SeedTensors& seeds,
+                                    bool col_sums = false) {
   TORCH_CHECK(x.is_cuda() && x.dim() == 2 && x.is_contiguous(), "x must be a contiguous 2D CUDA tensor");
   TORCH_CHECK(x.scalar_type() == at::kBFloat16 || x.scalar_type() == at::kFloat, "x must be bf16 or fp32");
   TORCH_CHECK(reinterpret_cast<uintptr_t>(x.data_ptr()) % 16 == 0, "x must be 16-byte aligned");
@@ -462,6 +522,8 @@ std::vector<torch::Tensor> run_dual(const torch::Tensor& x, int pro, const torch
   cd = torch::empty({do_col ? p.C : 0, p.R_pad / 2}, u8);
   cs = torch::empty({do_col ? p.C : 0, p.R_pad / kBlock}, u8);
   cg = torch::empty({do_col ? 1 : 0}, f32);
+  const dim3 grid((p.C + TILE - 1) / TILE, (p.R_tiles + TILE - 1) / TILE);
+  torch::Tensor csum = torch::zeros({col_sums ? std::max<int>(1, grid.y) : 0, p.C}, f32);
   if (p.R == 0 || p.C == 0) {
     rg.fill_(1.0f);  // empty tensor: amax 0 -> genc 1 -> gdec 1
     cg.fill_(1.0f);
@@ -469,22 +531,24 @@ std::vector<torch::Tensor> run_dual(const torch::Tensor& x, int pro, const torch
       cd.zero_();
       cs.zero_();
     }
+    if (col_sums) return {rd, rs, rg, cd, cs, cg, csum};
     return {rd, rs, rg, cd, cs, cg};
   }
 
   auto amax = torch::zeros({2}, x.options().dtype(at::kInt));
   auto* amax_ptr = reinterpret_cast<unsigned int*>(amax.data_ptr<int>());
   auto stream = at::cuda::getCurrentCUDAStream();
-  const dim3 grid((p.C + TILE - 1) / TILE, (p.R_tiles + TILE - 1) / TILE);
   Outputs o{do_row ? rd.data_ptr<uint8_t>() : nullptr, do_row ? rs.data_ptr<uint8_t>() : nullptr,
             do_col ? cd.data_ptr<uint8_t>() : nullptr, do_col ? cs.data_ptr<uint8_t>() : nullptr,
-            do_row ? rg.data_ptr<float>() : nullptr,   do_col ? cg.data_ptr<float>() : nullptr};
+            do_row ? rg.data_ptr<float>() : nullptr,   do_col ? cg.data_ptr<float>() : nullptr,
+            col_sums ? csum.data_ptr<float>() : nullptr};
   const unsigned int* amax_col = p.col_rht ? amax_ptr + 1 : amax_ptr;
 
   auto run = [&](auto* xp, auto pro_c) {
     using T = std::remove_cv_t<std::remove_pointer_t<decltype(xp)>>;
     constexpr int PRO = decltype(pro_c)::value;
-    ProArgs<T> pa{mean, rstd, gamma, beta, aux ? reinterpret_cast<const T*>(aux->data_ptr()) : nullptr};
+    ProArgs<T> pa{mean, rstd, gamma, beta, aux ? reinterpret_cast<const T*>(aux->data_ptr()) : nullptr,
+                  aux2 ? reinterpret_cast<const T*>(aux2->data_ptr()) : nullptr};
     // amax passes are persistent: ~4 CTAs per SM, grid-stride
     const int max_ctas = 4 * at::cuda::getCurrentDeviceProperties()->multiProcessorCount;
     if (p.col_rht || PRO != kNone) {
@@ -518,11 +582,43 @@ std::vector<torch::Tensor> run_dual(const torch::Tensor& x, int pro, const torch
       TORCH_CHECK(bf16, "the GELU gradient must be bf16");
       run(xb, std::integral_constant<int, kGeluBwd>{});
       break;
+    case kRmsNorm:
+      if (bf16) run(xb, std::integral_constant<int, kRmsNorm>{}); else run(xf, std::integral_constant<int, kRmsNorm>{});
+      break;
+    case kSwiglu:
+      TORCH_CHECK(bf16, "the SwiGLU inputs must be bf16");
+      run(xb, std::integral_constant<int, kSwiglu>{});
+      break;
+    case kSwigluBwdGate:
+      TORCH_CHECK(bf16, "the SwiGLU gradient must be bf16");
+      run(xb, std::integral_constant<int, kSwigluBwdGate>{});
+      break;
+    case kSwigluBwdUp:
+      TORCH_CHECK(bf16, "the SwiGLU gradient must be bf16");
+      run(xb, std::integral_constant<int, kSwigluBwdUp>{});
+      break;
+    case kGeluErf:
+      TORCH_CHECK(bf16, "the GELU input must be bf16");
+      run(xb, std::integral_constant<int, kGeluErf>{});
+      break;
+    case kGeluErfBwd:
+      TORCH_CHECK(bf16, "the GELU gradient must be bf16");
+      run(xb, std::integral_constant<int, kGeluErfBwd>{});
+      break;
     default:
       TORCH_CHECK(false, "unknown producer op");
   }
   C10_CUDA_KERNEL_LAUNCH_CHECK();
+  if (col_sums) return {rd, rs, rg, cd, cs, cg, csum};
   return {rd, rs, rg, cd, cs, cg};
+}
+
+const float* bias_ptr(const OptTensor& bias, const torch::Tensor& x) {
+  if (!bias.has_value() || !bias->defined()) return nullptr;
+  TORCH_CHECK(bias->is_cuda() && bias->device() == x.device() && bias->scalar_type() == at::kFloat &&
+                  bias->is_contiguous() && bias->dim() == 1 && bias->size(0) == x.size(1),
+              "bias must be a contiguous fp32 CUDA tensor with x.shape[1] elements");
+  return bias->data_ptr<float>();
 }
 
 }  // namespace
@@ -534,7 +630,8 @@ std::vector<torch::Tensor> nvfp4_quantize_dual(torch::Tensor x, bool do_row, boo
                                                bool col_rht, int64_t rht_seed, int64_t col_pad,
                                                const OptTensor& row_seed_t, const OptTensor& col_seed_t,
                                                const OptTensor& rht_seed_t) {
-  return run_dual(x, kNone, nullptr, nullptr, nullptr, nullptr, nullptr, do_row, do_col, block_2d, row_sr, row_seed,
+  return run_dual(x, kNone, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, do_row, do_col, block_2d, row_sr,
+                  row_seed,
                   col_sr, col_seed, col_rht, rht_seed, col_pad, {row_seed_t, col_seed_t, rht_seed_t});
 }
 
@@ -563,42 +660,125 @@ std::vector<torch::Tensor> nvfp4_layernorm_quantize_dual(torch::Tensor x, torch:
     const int blocks = static_cast<int>((R + THREADS / 32 - 1) / (THREADS / 32));
     auto stream = at::cuda::getCurrentCUDAStream();
     if (x.scalar_type() == at::kBFloat16)
-      ln_stats_kernel<__nv_bfloat16><<<blocks, THREADS, 0, stream>>>(
+      ln_stats_kernel<__nv_bfloat16, false><<<blocks, THREADS, 0, stream>>>(
           reinterpret_cast<const __nv_bfloat16*>(x.data_ptr()), static_cast<int>(R), static_cast<int>(C),
           static_cast<float>(eps), mean.data_ptr<float>(), rstd.data_ptr<float>());
     else
-      ln_stats_kernel<float><<<blocks, THREADS, 0, stream>>>(x.data_ptr<float>(), static_cast<int>(R),
+      ln_stats_kernel<float, false><<<blocks, THREADS, 0, stream>>>(x.data_ptr<float>(), static_cast<int>(R),
                                                              static_cast<int>(C), static_cast<float>(eps),
                                                              mean.data_ptr<float>(), rstd.data_ptr<float>());
     C10_CUDA_KERNEL_LAUNCH_CHECK();
   }
-  auto q = run_dual(x, kLayerNorm, nullptr, mean.data_ptr<float>(), rstd.data_ptr<float>(), gamma.data_ptr<float>(),
+  auto q = run_dual(x, kLayerNorm, nullptr, nullptr, mean.data_ptr<float>(), rstd.data_ptr<float>(),
+                    gamma.data_ptr<float>(),
                     beta.data_ptr<float>(), do_row, do_col, false, row_sr, row_seed, col_sr, col_seed, col_rht,
                     rht_seed, col_pad, {row_seed_t, col_seed_t, rht_seed_t});
   q.insert(q.begin(), {mean, rstd});
   return q;
 }
 
-// tanh-GELU fused into the dual quantizer: quantizes gelu(h) (bf16 h) without writing it.
+// GELU fused into the dual quantizer: quantizes gelu(h + bias) (bf16 h, optional fp32 per-column bias;
+// tanh approximation, or the exact erf form if `exact`) without writing it.
 std::vector<torch::Tensor> nvfp4_gelu_quantize_dual(torch::Tensor h, bool do_row, bool do_col, bool row_sr,
                                                     int64_t row_seed, bool col_sr, int64_t col_seed, bool col_rht,
                                                     int64_t rht_seed, int64_t col_pad, const OptTensor& row_seed_t,
-                                                    const OptTensor& col_seed_t, const OptTensor& rht_seed_t) {
-  return run_dual(h, kGelu, nullptr, nullptr, nullptr, nullptr, nullptr, do_row, do_col, false, row_sr, row_seed,
+                                                    const OptTensor& col_seed_t, const OptTensor& rht_seed_t,
+                                                    const OptTensor& bias, bool exact) {
+  return run_dual(h, exact ? kGeluErf : kGelu, nullptr, nullptr, nullptr, nullptr, nullptr, bias_ptr(bias, h), do_row,
+                  do_col, false, row_sr, row_seed,
                   col_sr, col_seed, col_rht, rht_seed, col_pad, {row_seed_t, col_seed_t, rht_seed_t});
 }
 
-// GELU backward fused into the dual quantizer: quantizes dh = dy * gelu'(h) (bf16 dy and h) without
-// writing it.
+// GELU backward fused into the dual quantizer: quantizes dh = dy * gelu'(h + bias) (bf16 dy and h) without
+// writing it. With col_sums, a 7th output holds per-tile column sums of dh ([tiles, C] fp32; their sum
+// over dim 0 is the bias gradient).
 std::vector<torch::Tensor> nvfp4_gelu_backward_quantize_dual(torch::Tensor dy, torch::Tensor h, bool do_row,
                                                              bool do_col, bool row_sr, int64_t row_seed, bool col_sr,
                                                              int64_t col_seed, bool col_rht, int64_t rht_seed,
                                                              int64_t col_pad, const OptTensor& row_seed_t,
                                                              const OptTensor& col_seed_t,
-                                                             const OptTensor& rht_seed_t) {
+                                                             const OptTensor& rht_seed_t, const OptTensor& bias,
+                                                             bool exact, bool col_sums) {
   TORCH_CHECK(h.is_cuda() && h.scalar_type() == at::kBFloat16 && h.is_contiguous() && h.sizes() == dy.sizes() &&
                   reinterpret_cast<uintptr_t>(h.data_ptr()) % 16 == 0,
               "h must be a contiguous, 16-byte aligned bf16 tensor shaped like dy");
-  return run_dual(dy, kGeluBwd, &h, nullptr, nullptr, nullptr, nullptr, do_row, do_col, false, row_sr, row_seed,
-                  col_sr, col_seed, col_rht, rht_seed, col_pad, {row_seed_t, col_seed_t, rht_seed_t});
+  return run_dual(dy, exact ? kGeluErfBwd : kGeluBwd, &h, nullptr, nullptr, nullptr, nullptr, bias_ptr(bias, dy),
+                  do_row, do_col, false, row_sr, row_seed, col_sr, col_seed, col_rht, rht_seed, col_pad,
+                  {row_seed_t, col_seed_t, rht_seed_t}, col_sums);
+}
+
+namespace {
+
+void check_like(const torch::Tensor& t, const torch::Tensor& x, const char* what) {
+  TORCH_CHECK(t.is_cuda() && t.scalar_type() == at::kBFloat16 && t.is_contiguous() && t.sizes() == x.sizes() &&
+                  t.device() == x.device() && reinterpret_cast<uintptr_t>(t.data_ptr()) % 16 == 0,
+              what, " must be a contiguous, 16-byte aligned bf16 tensor shaped like the first input");
+}
+
+}  // namespace
+
+// RMSNorm fused into the dual quantizer: quantizes y = (x * rstd) * gamma, rstd = 1 / sqrt(mean(x^2) + eps),
+// without writing y. Returns {rstd, <the six quantize_dual outputs>}; rstd ([R] fp32) is what the
+// RMSNorm backward needs.
+std::vector<torch::Tensor> nvfp4_rmsnorm_quantize_dual(torch::Tensor x, torch::Tensor gamma, double eps, bool do_row,
+                                                       bool do_col, bool row_sr, int64_t row_seed, bool col_sr,
+                                                       int64_t col_seed, bool col_rht, int64_t rht_seed, int64_t col_pad,
+                                                       const OptTensor& row_seed_t, const OptTensor& col_seed_t,
+                                                       const OptTensor& rht_seed_t) {
+  TORCH_CHECK(x.is_cuda() && x.dim() == 2 && x.is_contiguous(), "x must be a contiguous 2D CUDA tensor");
+  TORCH_CHECK(x.scalar_type() == at::kBFloat16 || x.scalar_type() == at::kFloat, "x must be bf16 or fp32");
+  const int64_t R = x.size(0), C = x.size(1);
+  TORCH_CHECK(gamma.is_cuda() && gamma.scalar_type() == at::kFloat && gamma.is_contiguous() && gamma.dim() == 1 &&
+                  gamma.size(0) == C,
+              "RMSNorm weight must be a contiguous fp32 [C] CUDA tensor");
+  const c10::cuda::CUDAGuard guard(x.device());
+  auto rstd = torch::empty({R}, x.options().dtype(at::kFloat));
+  if (R > 0 && C > 0) {
+    TORCH_CHECK(C % 16 == 0 && reinterpret_cast<uintptr_t>(x.data_ptr()) % 16 == 0,
+                "x must be 16-byte aligned with x.shape[1] % 16 == 0");
+    const int blocks = static_cast<int>((R + THREADS / 32 - 1) / (THREADS / 32));
+    auto stream = at::cuda::getCurrentCUDAStream();
+    if (x.scalar_type() == at::kBFloat16)
+      ln_stats_kernel<__nv_bfloat16, true><<<blocks, THREADS, 0, stream>>>(
+          reinterpret_cast<const __nv_bfloat16*>(x.data_ptr()), static_cast<int>(R), static_cast<int>(C),
+          static_cast<float>(eps), nullptr, rstd.data_ptr<float>());
+    else
+      ln_stats_kernel<float, true><<<blocks, THREADS, 0, stream>>>(x.data_ptr<float>(), static_cast<int>(R),
+                                                                   static_cast<int>(C), static_cast<float>(eps), nullptr,
+                                                                   rstd.data_ptr<float>());
+    C10_CUDA_KERNEL_LAUNCH_CHECK();
+  }
+  auto q = run_dual(x, kRmsNorm, nullptr, nullptr, nullptr, rstd.data_ptr<float>(), gamma.data_ptr<float>(), nullptr,
+                    do_row, do_col, false, row_sr, row_seed, col_sr, col_seed, col_rht, rht_seed, col_pad,
+                    {row_seed_t, col_seed_t, rht_seed_t});
+  q.insert(q.begin(), rstd);
+  return q;
+}
+
+// SwiGLU fused into the dual quantizer: quantizes silu(g) * u (bf16 gate / up projections) without
+// writing it.
+std::vector<torch::Tensor> nvfp4_swiglu_quantize_dual(torch::Tensor g, torch::Tensor u, bool do_row, bool do_col,
+                                                      bool row_sr, int64_t row_seed, bool col_sr, int64_t col_seed,
+                                                      bool col_rht, int64_t rht_seed, int64_t col_pad,
+                                                      const OptTensor& row_seed_t, const OptTensor& col_seed_t,
+                                                      const OptTensor& rht_seed_t) {
+  check_like(u, g, "u");
+  return run_dual(g, kSwiglu, &u, nullptr, nullptr, nullptr, nullptr, nullptr, do_row, do_col, false, row_sr,
+                  row_seed, col_sr, col_seed, col_rht, rht_seed, col_pad, {row_seed_t, col_seed_t, rht_seed_t});
+}
+
+// SwiGLU backward fused into the dual quantizer: quantizes the gradient w.r.t. the gate projection,
+// dy * u * silu'(g) (gate = true), or w.r.t. the up projection, dy * silu(g) (gate = false), from the
+// bf16 gradient dy of silu(g) * u, without writing it.
+std::vector<torch::Tensor> nvfp4_swiglu_backward_quantize_dual(torch::Tensor dy, torch::Tensor g, torch::Tensor u,
+                                                               bool gate, bool do_row, bool do_col, bool row_sr,
+                                                               int64_t row_seed, bool col_sr, int64_t col_seed,
+                                                               bool col_rht, int64_t rht_seed, int64_t col_pad,
+                                                               const OptTensor& row_seed_t, const OptTensor& col_seed_t,
+                                                               const OptTensor& rht_seed_t) {
+  check_like(g, dy, "g");
+  if (gate) check_like(u, dy, "u");
+  return run_dual(dy, gate ? kSwigluBwdGate : kSwigluBwdUp, &g, gate ? &u : nullptr, nullptr, nullptr, nullptr,
+                  nullptr, do_row, do_col, false, row_sr, row_seed, col_sr, col_seed, col_rht, rht_seed, col_pad,
+                  {row_seed_t, col_seed_t, rht_seed_t});
 }

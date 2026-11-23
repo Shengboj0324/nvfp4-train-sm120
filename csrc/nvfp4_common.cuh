@@ -135,6 +135,44 @@ __device__ __forceinline__ float gelu_tanh_backward(float dy, float x) {
   return __fmul_rn(dy, __fadd_rn(left_d, right_d));
 }
 
+// reference.gelu_erf / gelu_erf_backward: exact GELU (BERT, ViT; torch's default approximate="none"),
+// x * 0.5 * (1 + erf(x / sqrt(2))), in torch's order; erff / expf are the libdevice functions torch uses.
+constexpr float kSqrt1_2 = 0.7071067811865476f;        // 1 / sqrt(2)
+constexpr float kInvSqrt2Pi = 0.3989422804014327f;     // 1 / sqrt(2 pi)
+
+__device__ __forceinline__ float gelu_erf(float x) {
+  return __fmul_rn(__fmul_rn(x, 0.5f), __fadd_rn(1.0f, erff(__fmul_rn(x, kSqrt1_2))));
+}
+
+__device__ __forceinline__ float gelu_erf_backward(float dy, float x) {
+  const float cdf = __fmul_rn(0.5f, __fadd_rn(1.0f, erff(__fmul_rn(x, kSqrt1_2))));
+  const float pdf = __fmul_rn(expf(__fmul_rn(__fmul_rn(-0.5f, x), x)), kInvSqrt2Pi);
+  return __fmul_rn(dy, __fadd_rn(cdf, __fmul_rn(x, pdf)));
+}
+
+// reference.silu / swiglu / swiglu_backward_*: SiLU(g) = g / (1 + exp(-g)) (Llama's SwiGLU MLP computes
+// silu(gate) * up), one IEEE-rounded op at a time; expf is the libdevice function torch.exp uses on CUDA.
+__device__ __forceinline__ float silu_sigmoid(float g) { return __fdiv_rn(1.0f, __fadd_rn(1.0f, expf(-g))); }
+
+__device__ __forceinline__ float silu(float g) { return __fdiv_rn(g, __fadd_rn(1.0f, expf(-g))); }
+
+// silu(g) * u
+__device__ __forceinline__ float swiglu(float g, float u) { return __fmul_rn(silu(g), u); }
+
+// d/dg of silu(g) * u, times dy: (dy * u) * (s * (1 + g * (1 - s))), s = sigmoid(g)
+__device__ __forceinline__ float swiglu_backward_gate(float dy, float g, float u) {
+  const float s = silu_sigmoid(g);
+  return __fmul_rn(__fmul_rn(dy, u), __fmul_rn(s, __fadd_rn(1.0f, __fmul_rn(g, __fsub_rn(1.0f, s)))));
+}
+
+// d/du of silu(g) * u, times dy: dy * silu(g)
+__device__ __forceinline__ float swiglu_backward_up(float dy, float g) { return __fmul_rn(dy, silu(g)); }
+
+// reference.rmsnorm_apply for one element: (x * rstd) * gamma.
+__device__ __forceinline__ float rmsnorm_apply(float x, float rstd, float gamma) {
+  return __fmul_rn(__fmul_rn(x, rstd), gamma);
+}
+
 // reference.layernorm_apply for one element: ((x - mean) * rstd) * gamma + beta.
 __device__ __forceinline__ float layernorm_apply(float x, float mean, float rstd, float gamma, float beta) {
   return __fadd_rn(__fmul_rn(__fmul_rn(__fsub_rn(x, mean), rstd), gamma), beta);

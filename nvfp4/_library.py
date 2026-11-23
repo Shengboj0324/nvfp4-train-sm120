@@ -8,7 +8,7 @@ so Dynamo traces NVFP4 layers into the graph instead of breaking the graph at ea
 operator schemas from the annotations.)
 """
 import os
-from typing import Optional, Tuple
+from typing import List, Optional, Tuple
 
 import torch
 from torch import Tensor
@@ -81,23 +81,62 @@ def _layernorm_quantize_dual_impl(x: Tensor, weight: Tensor, bias: Tensor, eps: 
                                             col_pad, row_seed_t, col_seed_t, rht_seed_t))
 
 
+def _bias(b: Optional[Tensor]) -> Optional[Tensor]:
+    return None if b is None else b.float().contiguous()
+
+
 def _gelu_quantize_dual_impl(h: Tensor, do_row: bool, do_col: bool, row_sr: bool, row_seed: int, col_sr: bool,
                              col_seed: int, col_rht: bool, rht_seed: int, col_pad: int,
                              row_seed_t: Optional[Tensor], col_seed_t: Optional[Tensor],
-                             rht_seed_t: Optional[Tensor]) -> _DUAL:
+                             rht_seed_t: Optional[Tensor], bias: Optional[Tensor], exact: bool) -> _DUAL:
     require(h)
     return tuple(_C.gelu_quantize_dual(aligned(h.to(torch.bfloat16)), do_row, do_col, row_sr, row_seed, col_sr,
-                                       col_seed, col_rht, rht_seed, col_pad, row_seed_t, col_seed_t, rht_seed_t))
+                                       col_seed, col_rht, rht_seed, col_pad, row_seed_t, col_seed_t, rht_seed_t,
+                                       _bias(bias), exact))
 
 
 def _gelu_backward_quantize_dual_impl(dy: Tensor, h: Tensor, do_row: bool, do_col: bool, row_sr: bool, row_seed: int,
                                       col_sr: bool, col_seed: int, col_rht: bool, rht_seed: int, col_pad: int,
                                       row_seed_t: Optional[Tensor], col_seed_t: Optional[Tensor],
-                                      rht_seed_t: Optional[Tensor]) -> _DUAL:
+                                      rht_seed_t: Optional[Tensor], bias: Optional[Tensor], exact: bool,
+                                      col_sums: bool) -> List[Tensor]:
     require(dy)
-    return tuple(_C.gelu_backward_quantize_dual(aligned(dy.to(torch.bfloat16)), aligned(h.to(torch.bfloat16)),
-                                                do_row, do_col, row_sr, row_seed, col_sr, col_seed, col_rht, rht_seed,
-                                                col_pad, row_seed_t, col_seed_t, rht_seed_t))
+    return list(_C.gelu_backward_quantize_dual(aligned(dy.to(torch.bfloat16)), aligned(h.to(torch.bfloat16)),
+                                               do_row, do_col, row_sr, row_seed, col_sr, col_seed, col_rht, rht_seed,
+                                               col_pad, row_seed_t, col_seed_t, rht_seed_t, _bias(bias), exact,
+                                               col_sums))
+
+
+def _rmsnorm_quantize_dual_impl(x: Tensor, weight: Tensor, eps: float, do_row: bool, do_col: bool, row_sr: bool,
+                                row_seed: int, col_sr: bool, col_seed: int, col_rht: bool, rht_seed: int, col_pad: int,
+                                row_seed_t: Optional[Tensor], col_seed_t: Optional[Tensor],
+                                rht_seed_t: Optional[Tensor]
+                                ) -> Tuple[Tensor, Tensor, Tensor, Tensor, Tensor, Tensor, Tensor]:
+    require(x)
+    return tuple(_C.rmsnorm_quantize_dual(aligned(x), weight.float().contiguous(), eps, do_row, do_col, row_sr,
+                                          row_seed, col_sr, col_seed, col_rht, rht_seed, col_pad, row_seed_t,
+                                          col_seed_t, rht_seed_t))
+
+
+def _swiglu_quantize_dual_impl(g: Tensor, u: Tensor, do_row: bool, do_col: bool, row_sr: bool, row_seed: int,
+                               col_sr: bool, col_seed: int, col_rht: bool, rht_seed: int, col_pad: int,
+                               row_seed_t: Optional[Tensor], col_seed_t: Optional[Tensor],
+                               rht_seed_t: Optional[Tensor]) -> _DUAL:
+    require(g)
+    return tuple(_C.swiglu_quantize_dual(aligned(g.to(torch.bfloat16)), aligned(u.to(torch.bfloat16)), do_row, do_col,
+                                         row_sr, row_seed, col_sr, col_seed, col_rht, rht_seed, col_pad, row_seed_t,
+                                         col_seed_t, rht_seed_t))
+
+
+def _swiglu_backward_quantize_dual_impl(dy: Tensor, g: Tensor, u: Tensor, gate: bool, do_row: bool, do_col: bool,
+                                        row_sr: bool, row_seed: int, col_sr: bool, col_seed: int, col_rht: bool,
+                                        rht_seed: int, col_pad: int, row_seed_t: Optional[Tensor],
+                                        col_seed_t: Optional[Tensor], rht_seed_t: Optional[Tensor]) -> _DUAL:
+    require(dy)
+    return tuple(_C.swiglu_backward_quantize_dual(aligned(dy.to(torch.bfloat16)), aligned(g.to(torch.bfloat16)),
+                                                  aligned(u.to(torch.bfloat16)), gate, do_row, do_col, row_sr,
+                                                  row_seed, col_sr, col_seed, col_rht, rht_seed, col_pad, row_seed_t,
+                                                  col_seed_t, rht_seed_t))
 
 
 def _gemm_impl(a: Tensor, sfa: Tensor, gdec_a: Tensor, b: Tensor, sfb: Tensor, gdec_b: Tensor, out_dtype: torch.dtype,
@@ -121,6 +160,12 @@ _gelu_quantize_dual_op = torch.library.custom_op("nvfp4::gelu_quantize_dual", _g
                                                  mutates_args=())
 _gelu_backward_quantize_dual_op = torch.library.custom_op("nvfp4::gelu_backward_quantize_dual",
                                                           _gelu_backward_quantize_dual_impl, mutates_args=())
+_rmsnorm_quantize_dual_op = torch.library.custom_op("nvfp4::rmsnorm_quantize_dual", _rmsnorm_quantize_dual_impl,
+                                                    mutates_args=())
+_swiglu_quantize_dual_op = torch.library.custom_op("nvfp4::swiglu_quantize_dual", _swiglu_quantize_dual_impl,
+                                                   mutates_args=())
+_swiglu_backward_quantize_dual_op = torch.library.custom_op("nvfp4::swiglu_backward_quantize_dual",
+                                                            _swiglu_backward_quantize_dual_impl, mutates_args=())
 _gemm_op = torch.library.custom_op("nvfp4::gemm", _gemm_impl, mutates_args=())
 _gemm_out_op = torch.library.custom_op("nvfp4::gemm_out", _gemm_out_impl, mutates_args=("out",))
 
@@ -147,12 +192,34 @@ def _(x, weight, bias, eps, do_row, do_col, row_sr, row_seed, col_sr, col_seed, 
 
 
 @_gelu_quantize_dual_op.register_fake
-def _(h, do_row, do_col, row_sr, row_seed, col_sr, col_seed, col_rht, rht_seed, col_pad, *seed_tensors):
+def _(h, do_row, do_col, row_sr, row_seed, col_sr, col_seed, col_rht, rht_seed, col_pad, row_seed_t, col_seed_t,
+      rht_seed_t, bias, exact):
     return _dual_fake(h, do_row, do_col, col_pad)
 
 
 @_gelu_backward_quantize_dual_op.register_fake
-def _(dy, h, do_row, do_col, row_sr, row_seed, col_sr, col_seed, col_rht, rht_seed, col_pad, *seed_tensors):
+def _(dy, h, do_row, do_col, row_sr, row_seed, col_sr, col_seed, col_rht, rht_seed, col_pad, row_seed_t, col_seed_t,
+      rht_seed_t, bias, exact, col_sums):
+    outs = list(_dual_fake(dy, do_row, do_col, col_pad))
+    if col_sums:
+        R, C = dy.shape
+        rows = (R + col_pad - 1) // col_pad * col_pad if do_col else R
+        outs.append(dy.new_empty((max(1, (rows + 63) // 64), C), dtype=torch.float32))
+    return outs
+
+
+@_rmsnorm_quantize_dual_op.register_fake
+def _(x, weight, eps, do_row, do_col, row_sr, row_seed, col_sr, col_seed, col_rht, rht_seed, col_pad, *seed_tensors):
+    return (x.new_empty((x.shape[0],), dtype=torch.float32), *_dual_fake(x, do_row, do_col, col_pad))
+
+
+@_swiglu_quantize_dual_op.register_fake
+def _(g, u, do_row, do_col, row_sr, row_seed, col_sr, col_seed, col_rht, rht_seed, col_pad, *seed_tensors):
+    return _dual_fake(g, do_row, do_col, col_pad)
+
+
+@_swiglu_backward_quantize_dual_op.register_fake
+def _(dy, g, u, gate, do_row, do_col, row_sr, row_seed, col_sr, col_seed, col_rht, rht_seed, col_pad, *seed_tensors):
     return _dual_fake(dy, do_row, do_col, col_pad)
 
 
@@ -181,5 +248,8 @@ quantize_dual = _pick(_quantize_dual_impl, _quantize_dual_op)
 layernorm_quantize_dual = _pick(_layernorm_quantize_dual_impl, _layernorm_quantize_dual_op)
 gelu_quantize_dual = _pick(_gelu_quantize_dual_impl, _gelu_quantize_dual_op)
 gelu_backward_quantize_dual = _pick(_gelu_backward_quantize_dual_impl, _gelu_backward_quantize_dual_op)
+rmsnorm_quantize_dual = _pick(_rmsnorm_quantize_dual_impl, _rmsnorm_quantize_dual_op)
+swiglu_quantize_dual = _pick(_swiglu_quantize_dual_impl, _swiglu_quantize_dual_op)
+swiglu_backward_quantize_dual = _pick(_swiglu_backward_quantize_dual_impl, _swiglu_backward_quantize_dual_op)
 gemm = _pick(_gemm_impl, _gemm_op)
 gemm_out = _pick(_gemm_out_impl, _gemm_out_op)

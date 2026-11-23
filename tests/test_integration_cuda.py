@@ -298,10 +298,10 @@ def _data(r, mb):
     return (torch.randn(192, 256, device=DEV, generator=g), torch.randn(192, 256, device=DEV, generator=g))
 
 
-def _model(fuse):
+def _model(fuse, cache=False):
     torch.manual_seed(0)  # identical initialization on every rank
-    return torch.nn.Sequential(NVFP4Linear(256, 512, bias=False, fuse_wgrad_accumulation=fuse), torch.nn.GELU(),
-                               NVFP4Linear(512, 256, bias=False, fuse_wgrad_accumulation=fuse)).to(DEV)
+    kw = dict(bias=False, fuse_wgrad_accumulation=fuse, cache_weight_quantization=cache)
+    return torch.nn.Sequential(NVFP4Linear(256, 512, **kw), torch.nn.GELU(), NVFP4Linear(512, 256, **kw)).to(DEV)
 
 
 def _expected(world):
@@ -445,6 +445,50 @@ def _check_fsdp1(rank, world):
             assert hits[0] == 0, hits[0]
 
 
+def _check_weight_cache(rank, world):
+    """Weight-quantization cache under DDP and FSDP2 (which re-gathers the weights for every forward):
+    two optimizer steps of N_MB micro-batches give bit-identical parameters with and without it."""
+    import torch.distributed as dist
+    from torch.distributed.device_mesh import DeviceMesh
+    from torch.distributed.fsdp import fully_shard
+    from torch.nn.parallel import DistributedDataParallel as DDP
+
+    def run(wrap, cache):
+        m = _model(True, cache)
+        if wrap == "ddp":
+            net, sync = DDP(m), None
+        else:
+            mesh = DeviceMesh.from_group(dist.group.WORLD, "cuda")
+            for layer in (m[0], m[2]):
+                fully_shard(layer, mesh=mesh)
+            net, sync = fully_shard(m, mesh=mesh), m
+        opt = torch.optim.AdamW(m.parameters(), lr=1e-2, fused=True)
+        for step in range(2):
+            opt.zero_grad(set_to_none=True)
+            for mb in range(N_MB):
+                last = mb == N_MB - 1
+                x, dy = _data(rank, 10 * step + mb)
+                torch.manual_seed(1000 + 10 * step + mb)
+                if wrap == "ddp":
+                    with contextlib.nullcontext() if last else net.no_sync():
+                        net(x).backward(dy)
+                else:
+                    sync.set_requires_gradient_sync(last)
+                    net(x).backward(dy)
+            opt.step()
+        local = [(p.to_local() if hasattr(p, "to_local") else p).detach().clone() for p in m.parameters()]
+        hits = sum(lin.weight_quant_cache.hits for lin in (m[0], m[2]))
+        return local, hits
+
+    for wrap in ("ddp", "fsdp2"):
+        plain, _ = run(wrap, False)
+        cached, hits = run(wrap, True)
+        assert all(torch.equal(a, b) for a, b in zip(plain, cached)), (rank, wrap)
+        # DDP keeps the weights resident: reused within each step. FSDP2 gathers every weight into fresh
+        # storage for each forward, so the cache never hits there (and must never be wrong).
+        assert (hits > 0) if wrap == "ddp" else (hits == 0), (rank, wrap, hits)
+
+
 def _dist_worker(rank, world, port, mode, backend="gloo"):
     import datetime
 
@@ -460,6 +504,8 @@ def _dist_worker(rank, world, port, mode, backend="gloo"):
             _check_fsdp2(rank, world)
         elif mode == "fsdp1":
             _check_fsdp1(rank, world)
+        elif mode == "weight_cache":
+            _check_weight_cache(rank, world)
         else:
             _check_ddp(rank, world, bucket_view=mode == "ddp_bucket_view")
     finally:
@@ -472,7 +518,7 @@ def _free_port():
         return s.getsockname()[1]
 
 
-@pytest.mark.parametrize("mode", ["ddp", "ddp_bucket_view", "fsdp1", "fsdp2"])
+@pytest.mark.parametrize("mode", ["ddp", "ddp_bucket_view", "fsdp1", "fsdp2", "weight_cache"])
 def test_two_process_data_parallel(mode):
     import torch.distributed as dist
     import torch.multiprocessing as mp
@@ -482,7 +528,7 @@ def test_two_process_data_parallel(mode):
     mp.spawn(_dist_worker, args=(2, _free_port(), mode), nprocs=2, join=True)
 
 
-@pytest.mark.parametrize("mode", ["ddp", "ddp_bucket_view", "fsdp1", "fsdp2"])
+@pytest.mark.parametrize("mode", ["ddp", "ddp_bucket_view", "fsdp1", "fsdp2", "weight_cache"])
 def test_multi_gpu_nccl_data_parallel(mode):
     """The same checks with one process per GPU over NCCL (needs two sm_120 GPUs). Two ranks, so every
     reduction is a single addition and the result must still be bit-identical to the reference."""

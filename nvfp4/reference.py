@@ -252,6 +252,28 @@ def gelu_tanh_backward(dy: torch.Tensor, x: torch.Tensor) -> torch.Tensor:
     return dy * (left_d + right_d)
 
 
+SQRT1_2 = 0.7071067811865476      # 1 / sqrt(2)
+INV_SQRT_2PI = 0.3989422804014327  # 1 / sqrt(2 pi)
+
+
+def gelu_erf(x: torch.Tensor) -> torch.Tensor:
+    """Exact GELU in fp32: (x * 0.5) * (1 + erf(x / sqrt(2)))."""
+    x = x.float()
+    return (x * 0.5) * (torch.erf(x * SQRT1_2) + 1.0)
+
+
+def gelu_erf_backward(dy: torch.Tensor, x: torch.Tensor) -> torch.Tensor:
+    """dy * gelu'(x) in fp32 for the exact GELU: dy * (cdf + x * pdf)."""
+    dy, x = dy.float(), x.float()
+    cdf = (torch.erf(x * SQRT1_2) + 1.0) * 0.5
+    pdf = torch.exp((x * -0.5) * x) * INV_SQRT_2PI
+    return dy * (cdf + x * pdf)
+
+
+def _gelu_input(h, bias):
+    return h.float() if bias is None else h.float() + bias.float()
+
+
 def layernorm_stats(x: torch.Tensor, eps: float) -> tuple[torch.Tensor, torch.Tensor]:
     """Per-row mean and 1 / sqrt(biased var + eps) (the kernel's reduction order differs: compare with a tolerance)."""
     x = x.double()
@@ -271,14 +293,70 @@ def layernorm_quantize_dual(x, weight, bias, mean, rstd, **kw):
     return quantize_dual(layernorm_apply(x, mean, rstd, weight, bias), **kw)
 
 
-def gelu_quantize_dual(h, **kw):
+def gelu_quantize_dual(h, *, bias=None, approximate="tanh", **kw):
     """Spec of ops.gelu_quantize_dual."""
-    return quantize_dual(gelu_tanh(h), **kw)
+    x = _gelu_input(h, bias)
+    return quantize_dual(gelu_tanh(x) if approximate == "tanh" else gelu_erf(x), **kw)
 
 
-def gelu_backward_quantize_dual(dy, h, **kw):
-    """Spec of ops.gelu_backward_quantize_dual."""
-    return quantize_dual(gelu_tanh_backward(dy, h), **kw)
+def gelu_backward(dy, h, *, bias=None, approximate="tanh"):
+    """dy * gelu'(h + bias) in fp32."""
+    x = _gelu_input(h, bias)
+    return gelu_tanh_backward(dy, x) if approximate == "tanh" else gelu_erf_backward(dy, x)
+
+
+def gelu_backward_quantize_dual(dy, h, *, bias=None, approximate="tanh", **kw):
+    """Spec of ops.gelu_backward_quantize_dual (without the bias gradient: gelu_backward(...).sum(0))."""
+    return quantize_dual(gelu_backward(dy, h, bias=bias, approximate=approximate), **kw)
+
+
+def rmsnorm_stats(x: torch.Tensor, eps: float) -> torch.Tensor:
+    """Per-row 1 / sqrt(mean(x^2) + eps) (the kernel's reduction order differs: compare with a tolerance)."""
+    x = x.double()
+    return (1.0 / torch.sqrt((x * x).mean(-1) + eps)).float()
+
+
+def rmsnorm_apply(x: torch.Tensor, rstd: torch.Tensor, weight: torch.Tensor) -> torch.Tensor:
+    """(x * rstd) * weight in fp32, with the per-row statistic given."""
+    return (x.float() * rstd.float()[:, None]) * weight.float()
+
+
+def rmsnorm_quantize_dual(x, weight, rstd, **kw):
+    """Spec of ops.rmsnorm_quantize_dual given its statistic: quantize_dual(rmsnorm_apply(...))."""
+    return quantize_dual(rmsnorm_apply(x, rstd, weight), **kw)
+
+
+def silu(g: torch.Tensor) -> torch.Tensor:
+    """g / (1 + exp(-g)) in fp32 (exp is libdevice expf on CUDA, like the kernel)."""
+    g = g.float()
+    return g / (torch.exp(-g) + 1.0)
+
+
+def swiglu(g: torch.Tensor, u: torch.Tensor) -> torch.Tensor:
+    """silu(g) * u in fp32 (Llama's MLP activation)."""
+    return silu(g) * u.float()
+
+
+def swiglu_backward_gate(dy: torch.Tensor, g: torch.Tensor, u: torch.Tensor) -> torch.Tensor:
+    """d(silu(g) * u)/dg times dy: (dy * u) * (s * (1 + g * (1 - s))), s = sigmoid(g)."""
+    dy, g, u = dy.float(), g.float(), u.float()
+    s = 1.0 / (torch.exp(-g) + 1.0)
+    return (dy * u) * (s * (g * (1.0 - s) + 1.0))
+
+
+def swiglu_backward_up(dy: torch.Tensor, g: torch.Tensor) -> torch.Tensor:
+    """d(silu(g) * u)/du times dy: dy * silu(g)."""
+    return dy.float() * silu(g)
+
+
+def swiglu_quantize_dual(g, u, **kw):
+    """Spec of ops.swiglu_quantize_dual."""
+    return quantize_dual(swiglu(g, u), **kw)
+
+
+def swiglu_backward_quantize_dual(dy, g, u, *, gate: bool, **kw):
+    """Spec of ops.swiglu_backward_quantize_dual."""
+    return quantize_dual(swiglu_backward_gate(dy, g, u) if gate else swiglu_backward_up(dy, g), **kw)
 
 
 def unpack_codes(data: torch.Tensor) -> torch.Tensor:

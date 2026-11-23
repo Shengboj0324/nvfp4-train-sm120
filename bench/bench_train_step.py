@@ -2,6 +2,9 @@
 
     python bench/bench_train_step.py [--out bench/results/train_step.json]
 
+"nvfp4_fused_cached" also caches the quantized weights: its steps are what every micro-batch after the
+first costs under gradient accumulation (the weights don't change between them).
+
 Isolates the part NVFP4 accelerates: a pre-LN GPT block (qkv, attention via SDPA, out-proj, 4x MLP)
 on 8192 tokens (16 x 512). The LM head / embeddings are excluded on purpose - in a real model they
 stay BF16 and their share shrinks as width and depth grow.
@@ -34,6 +37,9 @@ def step_time(d: int, precision: str, b: int = 16, t: int = 512) -> tuple[float,
     elif precision == "nvfp4_fused":  # LayerNorm / GELU inside the quantizers + fused wgrad accumulation
         convert_linears(blk, fuse_wgrad_accumulation=True)
         assert fuse_producers([blk]) == 1
+    elif precision == "nvfp4_fused_cached":  # + weight-quantization cache: a micro-batch after the first
+        convert_linears(blk, fuse_wgrad_accumulation=True, cache_weight_quantization=True)
+        assert fuse_producers([blk]) == 1
     x = torch.randn(b, t, d, device="cuda", requires_grad=True)
 
     def step():
@@ -54,14 +60,15 @@ def main():
     a = ap.parse_args()
     rows = []
     for d in (768, 1024, 2048, 3072, 4096):
-        (tb, mb), (tq, mq), (tw, mw), (tf, mf) = (step_time(d, p) for p in
-                                                  ("bf16", "nvfp4", "nvfp4_fused_wgrad", "nvfp4_fused"))
+        (tb, mb), (tq, mq), (tw, mw), (tf, mf), (tc, mc) = (
+            step_time(d, p) for p in ("bf16", "nvfp4", "nvfp4_fused_wgrad", "nvfp4_fused", "nvfp4_fused_cached"))
         lin_flops = 6 * 8192 * 12 * d * d  # fwd+bwd FLOPs of the four linears
         rows.append({"d": d, "bf16_ms": tb * 1e3, "nvfp4_ms": tq * 1e3, "nvfp4_fused_wgrad_ms": tw * 1e3,
-                     "nvfp4_fused_ms": tf * 1e3, "speedup": tb / tq, "speedup_fused_wgrad": tb / tw,
-                     "speedup_fused": tb / tf,
+                     "nvfp4_fused_ms": tf * 1e3, "nvfp4_fused_cached_ms": tc * 1e3, "speedup": tb / tq,
+                     "speedup_fused_wgrad": tb / tw, "speedup_fused": tb / tf, "speedup_fused_cached": tb / tc,
                      "linear_tflops_bf16": lin_flops / tb / 1e12, "linear_tflops_nvfp4": lin_flops / tq / 1e12,
-                     "peak_mib_bf16": mb, "peak_mib_nvfp4": mq, "peak_mib_nvfp4_fused": mf})
+                     "peak_mib_bf16": mb, "peak_mib_nvfp4": mq, "peak_mib_nvfp4_fused": mf,
+                     "peak_mib_nvfp4_fused_cached": mc})
         print(json.dumps({k: round(v, 3) if isinstance(v, float) else v for k, v in rows[-1].items()}), flush=True)
         torch.cuda.empty_cache()
     os.makedirs(os.path.dirname(a.out), exist_ok=True)
