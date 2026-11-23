@@ -1,0 +1,8 @@
+[build-system]
+# The CUDA extension compiles against the installed PyTorch, so build without isolation:
+#   pip install --no-build-isolation .        (or: python -m build --wheel --no-isolation)
+requires = ["setuptools>=64", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]

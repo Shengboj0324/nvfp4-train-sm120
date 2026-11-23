@@ -318,6 +318,10 @@ zero-filled copies, and stores are guarded. `K` must be a multiple of 128 (256 f
 | Fused producers | `tests/test_fused_producers_cuda.py` | **bit-exact** vs reference LayerNorm / GELU / GELU-backward + `quantize_dual` (4 configurations × 5 shapes × 2 dtypes); LayerNorm statistics vs fp64 |
 | Fused sub-blocks | `tests/test_fused_modules.py` | forward == explicit op composition bit for bit; every gradient's cosine with fp32 ≥ the unfused NVFP4 path's − 0.01; seeded determinism; partial gradients; fused wgrad accumulation |
 | Layer | `tests/test_linear.py` | CUDA == emulated recipe (same seeds); cosine with full precision > 0.97–0.98; SR noise averages out; only NVFP4 tensors saved for backward (exact byte count); no-grad / frozen-weight / no-input-grad paths; fused wgrad accumulation == autograd bit for bit |
+| Robustness | `tests/test_robustness_cuda.py` | NaN / ±inf anywhere → non-finite outputs (quantize, dual, fused producers, GEMM, layers, gradients); clear errors on misuse; any leading shape incl. empty; fp32/bf16/fp16 and non-contiguous inputs; bf16 weights; state dict ↔ `nn.Linear`; activation checkpointing bit-exact; `torch.compile` == eager; CUDA-graph replay == eager; concurrent streams with split-K; DDP |
+| Memory / race safety | `tools/sanitize.sh` | compute-sanitizer memcheck, racecheck, synccheck, initcheck over every kernel variant (ragged shapes, TMA and cp.async loops, split-K, accumulate, all producer ops): 0 findings |
+| Long-run stability | `tools/soak.py` | 8 minutes: 18,401 fused + unfused training iterations, 3,682 bit-exact gradient replays, 92,005 GEMMs re-checked bit for bit, no non-finite values, no hang |
+| Packaging | wheel built and installed into an isolated directory | imports and trains from outside the repository |
 | Hardware ISA | CI `cuda-compile` job | `OMMA.SF.16864...UE4M3.4X` present in SASS |
 | End to end | `experiments/train_gpt.py` | loss curves vs BF16 (see [RESULTS.md](RESULTS.md)) |
 
@@ -325,6 +329,8 @@ Every benchmark checks correctness against the reference before it times anythin
 
 ## 6. Known limitations and next steps
 
+Done in v0.4: NaN propagation (a NaN used to be quantized to finite values), per-device kernel
+attributes, exact-architecture checks, sanitizer / soak / packaging verification (§5).
 Done in v0.3: the TMA GEMM main loop (§4.1), split-K (§4.2) and LayerNorm/GELU fused into
 quantization (§3.4). Done in v0.2: one fused read per operand, NVFP4-saved activations, in-place wgrad
 accumulation.
@@ -342,4 +348,8 @@ accumulation.
    could be cached per optimizer step, but a safe invalidation rule is needed: `param.data` writes
    don't bump `_version`.
 5. **Fused sub-blocks** cover pre-LN blocks with bias-free linears and tanh-GELU.
-6. **Platform.** Linux/WSL2 only. The native Windows build hasn't been tried.
+6. **Framework coverage.** `torch.compile` graph-breaks at each NVFP4 layer (custom autograd
+   Functions); registering the ops as `torch.library` custom ops would remove that. FSDP and
+   training-step CUDA-graph capture are untested (in a captured graph the host-drawn SR/RHT seeds
+   would be frozen).
+7. **Platform.** Linux/WSL2 only, one GPU model tested. The native Windows build hasn't been tried.
