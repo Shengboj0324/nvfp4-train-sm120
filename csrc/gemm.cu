@@ -163,7 +163,8 @@ __global__ void __launch_bounds__(THREADS, 1) nvfp4_gemm_kernel(Args p) {
     }
   }
   cp_async_wait<0>();
-  finish_tile<OutT, kAccum>(p, acc, m0, n0, wm, wn, lane, reinterpret_cast<int*>(smem + STAGES * STAGE_BYTES));
+  finish_tile<OutT, kAccum>(p, acc, m0, n0, wm, wn, lane, reinterpret_cast<int*>(smem + STAGES * STAGE_BYTES),
+                            blockIdx.z, blockIdx.y * gridDim.x + blockIdx.x);
 }
 
 // One flag set per instantiation: each kernel needs its own max-dynamic-smem attribute, per device.
@@ -201,9 +202,12 @@ int choose_splits(int tiles, int KT, int sms) {
 
 // D = A @ B^T (into a new tensor, or into `out`); with accumulate, out += A @ B^T (fp32 only).
 // impl: 0 = auto, 1 = cp.async loop, 2 = TMA loop (error if unsupported). splits: 0 = auto.
+// bias / residual: the linear-layer epilogue (see Args): D = residual + (bf16(A @ B^T) + bias), with bias the
+// fp32 values of bias.to(dt) and bias_round = (dt == bf16); D has out_dtype (residual: bf16 or fp32).
 torch::Tensor nvfp4_gemm(torch::Tensor a, torch::Tensor sfa, torch::Tensor gdec_a, torch::Tensor b, torch::Tensor sfb,
                          torch::Tensor gdec_b, c10::ScalarType out_dtype, c10::optional<torch::Tensor> out,
-                         bool accumulate, int64_t impl, int64_t splits) {
+                         bool accumulate, int64_t impl, int64_t splits, c10::optional<torch::Tensor> bias,
+                         c10::optional<torch::Tensor> residual, bool bias_round) {
   using namespace nvfp4::gemm;
   for (auto* t : {&a, &sfa, &b, &sfb})
     TORCH_CHECK(t->is_cuda() && t->scalar_type() == at::kByte && t->dim() == 2 && t->is_contiguous(),
@@ -232,15 +236,36 @@ torch::Tensor nvfp4_gemm(torch::Tensor a, torch::Tensor sfa, torch::Tensor gdec_
   if (M == 0 || N == 0) return d;
   Args p{a.data_ptr<uint8_t>(), b.data_ptr<uint8_t>(), sfa.data_ptr<uint8_t>(), sfb.data_ptr<uint8_t>(),
          gdec_a.data_ptr<float>(), gdec_b.data_ptr<float>(), d.data_ptr(), nullptr, nullptr, M, N, K, 1};
-  // The 2-stage TMA loop needs a few k-tiles to reach steady state; below K = 1024 the 4-stage cp.async
-  // loop with 128-deep tiles is as fast (8192x3072x768: 273 vs 268 TFLOPS).
-  const bool use_tma = impl == 2 || (impl == 0 && K >= 1024 && tma_supported(p));
-  TORCH_CHECK(impl != 2 || tma_supported(p), "TMA GEMM needs K % 256 == 0 and 16-byte aligned operands");
-  const int KT = K / (use_tma ? tma_k_tile() : legacy::BK);
+  const bool has_bias = bias.has_value() && bias->defined(), has_res = residual.has_value() && residual->defined();
+  TORCH_CHECK(!accumulate || !(has_bias || has_res), "bias / residual cannot be combined with accumulate");
+  if (has_bias) {
+    TORCH_CHECK(bias->is_cuda() && bias->device() == a.device() && bias->scalar_type() == at::kFloat &&
+                    bias->is_contiguous() && bias->dim() == 1 && bias->size(0) == N,
+                "bias must be a contiguous fp32 [N] tensor on the same device");
+    p.bias = bias->data_ptr<float>();
+    p.bias_round = bias_round ? 1 : 0;
+  }
+  if (has_res) {
+    TORCH_CHECK(residual->is_cuda() && residual->device() == a.device() && residual->is_contiguous() &&
+                    residual->dim() == 2 && residual->size(0) == M && residual->size(1) == N &&
+                    (residual->scalar_type() == at::kBFloat16 || residual->scalar_type() == at::kFloat),
+                "residual must be a contiguous bf16 / fp32 [M, N] tensor on the same device");
+    p.res = residual->data_ptr();
+    p.res_bf16 = residual->scalar_type() == at::kBFloat16 ? 1 : 0;
+  }
+  // The persistent TMA loop carries its pipeline across tiles, so it wins on short K too once each CTA has
+  // several tiles (8192x3072x768: 281 vs 248 TFLOPS); with few tiles per SM or K < 512 the 4-stage cp.async
+  // loop with 128-deep tiles is as fast or faster (8192x768x768: 217 vs 227).
   const int tiles_n = (N + BN - 1) / BN, tiles_m = (M + BM - 1) / BM;
+  const int sms = at::cuda::getCurrentDeviceProperties()->multiProcessorCount;
+  const bool use_tma = impl == 2 || (impl == 0 && (K >= 1024 || (K >= 512 && tiles_m * tiles_n >= 8 * sms)) &&
+                                     tma_supported(p));
+  TORCH_CHECK(impl != 2 || tma_supported(p), "TMA GEMM needs K % 256 == 0, K > 0 and 16-byte aligned operands");
+  const int KT = K / (use_tma ? tma_k_tile() : legacy::BK);
   int s = static_cast<int>(splits);
-  if (s == 0) s = choose_splits(tiles_m * tiles_n, KT, at::cuda::getCurrentDeviceProperties()->multiProcessorCount);
+  if (s == 0) s = choose_splits(tiles_m * tiles_n, KT, sms);
   s = std::max(1, std::min(s, KT));
+  TORCH_CHECK(static_cast<int64_t>(KT) * s < (int64_t{1} << 31), "K too large");
   torch::Tensor ws;
   auto stream = at::cuda::getCurrentCUDAStream();
   if (s > 1) {  // one allocation: fp32 partials, then the arrival counters (zeroed here, self-resetting)

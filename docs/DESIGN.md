@@ -119,7 +119,11 @@ bit-identical to the reference:
   zero-magnitude nibbles, matching the reference.
 - **Stochastic rounding** has no hardware path on sm_120a: `ptxas` rejects `cvt.rs` (".rs not
   supported on sm_120a"). It is done in software with no division and no int→float conversion:
-  - the 24-bit uniform `(h >> 8) · 2^-24` is assembled from mantissa bits;
+  - one 32-bit hash per **pair** of elements gives both their uniforms, 16 bits each
+    (`(h & 0xFFFF) · 2^-16`, `(h >> 16) · 2^-16`), assembled from mantissa bits (v0.8; until v0.7
+    every element hashed twice for a 24-bit uniform). The hash is most of SR's cost: SR now adds
+    34–43% to the plain dual quantizer instead of 48–61%. 16 bits bound the rounding bias at 2^-17 of
+    a grid step;
   - the lower grid point is `a` with its mantissa truncated to 1 bit (for `a ≥ 1`);
   - the step's reciprocal comes from the exponent bits, a power of two, so `(a − lo) / step` is exact
     as a multiply;
@@ -138,8 +142,10 @@ bit-identical to the reference:
   so CPU and CUDA references and the kernels agree. `test_scale_rounding_tie` and
   `test_block_scale_uses_ieee_division` cover it. In PyTorch, `2688.0 / tensor` is likewise
   `reciprocal(tensor) * 2688`, so `global_scales` uses `torch.div`.
-- **Stochastic rounding is reproducible:** it uses a counter-based hash (`lowbias32`) of
-  (seed, element index), so SR is seedable and identical between CPU and GPU.
+- **Stochastic rounding is reproducible:** it uses a counter-based hash (`lowbias32`, applied twice
+  so the seed's high half is mixed in after the first round: different seeds do not give shifted
+  copies of one stream) of (seed, element-pair index), so SR is seedable and identical between CPU and
+  GPU. (The SR noise differs from v0.7's for the same seed.)
 
 ### 3.3 The single-output quantizer
 
@@ -165,18 +171,21 @@ The dual quantizer's tile loader can instead apply the producer op itself (`Pro`
 | GELU backward | dY, h, optional bias[c] | `dY · gelu'(h + bias)` |
 | GELU (exact, v0.7) | h, optional bias[c] | `(x · 0.5) · (1 + erf(x / √2))` and its backward `dY · (Φ + x · φ)` |
 | RMSNorm (v0.7) | x, rstd[r], γ | `(x · rstd) · γ` |
-| SwiGLU (v0.7) | g, u | `silu(g) · u`, silu(g) = `g / (1 + exp(−g))` |
-| SwiGLU backward (v0.7) | dY, g, u | gate: `(dY · u) · (s · (1 + g · (1 − s)))`, s = sigmoid(g); up: `dY · silu(g)` |
+| SwiGLU (v0.7) | g, u, optional biases b_g[c], b_u[c] (v0.8) | `silu(g) · u` on g + b_g, u + b_u; silu(g) = `g / (1 + exp(−g))` |
+| SwiGLU backward (v0.7) | dY, g, u, optional biases | gate: `(dY · u) · (s · (1 + g · (1 − s)))`, s = sigmoid(g); up: `dY · silu(g)` |
+| Multi-part input (v0.8) | 1–3 tensors [R, C/n] | their concatenation along C, read in place (the q, k, v gradients) |
 
 **Bias gradients without writing the gradient (v0.7).** fc1's bias sits before the GELU, so its
 gradient is the column sum of the GELU input gradient, which the fused path never writes. The
 quantize kernel already holds each 64×64 tile of it in shared memory; when asked, 64 threads sum the
 tile's columns in a fixed order and write one row of per-tile partial sums ([tiles along R, C]),
-which the host sums. Deterministic (no atomics), and the gradient costs one small extra write.
+which the host sums. Deterministic (no atomics), and the gradient costs one small extra write. v0.8
+uses the same column sums for the SwiGLU gate / up biases and, from the plain output-gradient
+quantizer, for every bias added in a GEMM epilogue (§3.6).
 
 - **LayerNorm statistics** come from a small kernel (`ln_stats_kernel`: one warp per row, two passes,
-  deterministic shuffle-tree sums). The LayerNorm backward then runs PyTorch's
-  `native_layer_norm_backward` with these statistics, so forward and backward agree.
+  deterministic shuffle-tree sums). The backward uses the same statistics, so forward and backward
+  agree (v0.3–v0.7: PyTorch's `native_layer_norm_backward`; v0.8: this library's kernel, §3.6).
 - **Zero padding stays zero:** the padded token rows of the wgrad operand are not passed through the
   op (LayerNorm of a zero row would be β).
 - **Bit-exact:** every op is written one rounded operation at a time, without FMA contraction, and
@@ -197,7 +206,8 @@ directly. Without that, peak memory of the d=768 block rose 20%; with it, it is 
 its RHT-transposed copy for the weight gradients) feeds both the gate and the up GEMM. The SwiGLU
 producer reads both projections and the backward runs the gate and up halves as two quantizer
 calls whose RHT seed matches x^T's, and accumulates both dgrad GEMMs into one fp32 buffer. The
-RMSNorm backward is PyTorch's fused kernel (`aten._fused_rms_norm_backward`) fed with our statistic.
+RMSNorm backward was PyTorch's fused kernel (`aten._fused_rms_norm_backward`) fed with our statistic
+in v0.7, and is this library's norm-backward kernel since v0.8 (§3.6).
 
 ### 3.5 Seeds on the GPU, and what that buys (v0.5)
 
@@ -251,29 +261,74 @@ capture the cache switches itself off for good, since replays change weights wit
 does internally, instead of a reshape view. FSDP2 warns about modules that return views, because an
 in-place op on one would bypass its pre-backward hook.
 
+### 3.6 Residual connections, biases and the q / k / v hand-off (v0.8)
+
+With the producers fused, what remained around the GEMMs of a block was glue: the residual adds, the
+sum of the two gradients of every residual-stream tensor, the bias adds, and the q / k / v plumbing.
+In a d=4096 Llama block step (0.7 fused path, 39.4 ms of GPU time) the profiler attributed ~3.4 ms
+(8.5%) to it: the stack of dq, dk, dv into the qkv gradient (0.85 ms) and the copy that made it
+contiguous (0.64 ms), the two forward residual adds (0.79 ms), the two gradient sums (0.79 ms) and the
+bf16 cast of the fp32 residual gradient for the bf16 branch (0.25 ms).
+
+- **GEMM epilogue** (`Args::bias`, `Args::res`): the store computes `y = bf16(alpha · acc)`, adds
+  `bias[col]` (rounding to bf16 when the layer outputs bf16) and then `res[row, col]`, writing the
+  result in the residual's dtype. That is exactly `res + (gemm_bf16.to(dt) + bias.to(dt))` in PyTorch,
+  bit for bit (`tests/test_epilogue_cuda.py`, every main loop and split-K). `NVFP4Linear` uses it for
+  its bias and for `forward(x, residual=r)`; the MLPs use it for the down projection's bias and the
+  residual (`residual=True`). A bias's gradient comes from the column sums of the output-gradient
+  quantizer (§3.4), so the bias costs neither a forward nor a backward pass of its own.
+- **Residual gradients summed in the norm backward.** In `x + mlp(norm(x))` the gradient of x is
+  `dout + norm_backward(...)`. The MLP Function owns both paths, so its backward passes `dout` to the
+  norm-backward kernel, which adds it while writing dx. For the attention half the residual add
+  happens in o_proj's epilogue, outside the qkv function; `return_residual=True` therefore returns x
+  itself as an extra output (autograd makes it a view, the "residual handle"). Passed as o_proj's
+  residual, its gradient (the residual gradient, passed through as is) comes back to the qkv
+  function's backward, which adds it in its norm backward the same way. No elementwise pass is left.
+- **fp32 residual gradients are quantized as they are**, without the bf16 cast the unfused graph
+  inserts before a bf16 branch (one pass less, and slightly more accurate).
+- **q / k / v hand-off.** `chunks=3` returns q, k and v as views of the GEMM output. PyTorch's flash
+  attention allocates its input gradients contiguous in (b, t, h, d) order, so after the view
+  backwards the three gradients reach the qkv function as contiguous [tokens, d] tensors, and the
+  output-gradient quantizer reads them in place as one [tokens, 3d] tensor (`quantize_dual` of a list,
+  the `kParts` loader). The unfused path stacked them into a new tensor and copied it once more.
+  (Indexing an array of part pointers in the kernel-parameter struct at run time made the compiler
+  copy the struct to local memory in every plain quantizer: 72-byte stack frames and up to 80% slower
+  row-only quantization. The multi-part loader is its own template variant with named pointers.)
+- **The norm-backward kernel** (`csrc/norm.cu`, LayerNorm and RMSNorm) replaces PyTorch's:
+  one CTA per 16 rows; each row (C ≤ 8192) is read once into registers (C/8 threads rounded to a warp,
+  up to 256, 8 elements per chunk), the two row sums are warp-shuffle trees summed over warps in a
+  fixed order, dx is written with the residual gradient added, and the thread's dw (and db) partial
+  sums accumulate over the group's rows in registers, one [groups, C] partial row per CTA (summed on
+  the host). Deterministic. At d=4096 an RMSNorm backward with dw and the residual gradient takes
+  0.69 ms, where PyTorch's dx and dw kernels took 0.69 + 0.32 ms plus 0.4 ms for the separate add.
+  Longer rows fall back to a two-pass warp kernel plus a column-sum kernel.
+- **Post-norm blocks** (BERT's original layout: `LN(h + mlp(h))`) need the normalized tensor itself
+  as the residual, so there is no norm to fuse into the MLP's input; `layernorm_mlp(h, None, ...)`
+  (or `gelu_mlp`, `swiglu_mlp`) with `residual=True` fuses everything up to the user's LayerNorm.
+
 ## 4. GEMM (`csrc/gemm.cu`, `csrc/gemm_tma.cu`, `csrc/gemm_common.cuh`)
 
 Two main loops share one epilogue. Both use 128×128 CTA tiles and 8 MMA warps (2 along M × 4 along N,
 each computing a 64×32 output tile, 16 MMAs per 64-wide K step), one CTA per SM.
 
-| | TMA loop (`gemm_tma.cu`, default for K ≥ 1024) | cp.async loop (`gemm.cu`) |
+| | TMA loop (`gemm_tma.cu`) | cp.async loop (`gemm.cu`) |
 |---|---|---|
+| Used for | K ≥ 1024, or K ≥ 512 with ≥ 8 output tiles per SM | the rest |
+| Grid | persistent (v0.8): one CTA per SM looping over output tiles (§4.2) | one CTA per tile |
 | K tile | 256 (128 bytes per row) | 128 (64 bytes per row) |
-| Loads | TMA (`cp.async.bulk.tensor`), issued by one thread; full/empty mbarriers | every thread issues `cp.async` |
+| Loads | TMA (`cp.async.bulk.tensor`), issued by the last warp to release a stage; full/empty mbarriers | every thread issues `cp.async` |
 | Buffers | 2 × 32 KB A/B stages + 2 × 16 KB scale buffers = 96 KB | 4 × 18 KB stages = 72 KB |
 | Swizzle | TMA 128B for A/B, 64B for scales | XOR `chunk ^ ((row >> 1) & 3)` |
-| Registers | 220, no spills | 180, no spills |
+| Registers | 245, no spills | 180, no spills |
 | Requires | K % 256 == 0, 16-byte aligned operands | K % 128 == 0 |
 
-Below K = 1024 the cp.async loop is used: the 2-stage TMA loop needs a few k-tiles to reach steady
-state (8192×3072×768: 273 vs 268 TFLOPS).
-
-**Epilogue** (`finish_tile`): `alpha = gdec_A · gdec_B` in fp32, then a bf16 or fp32 store, or
-`D += alpha·acc` into an existing fp32 tensor (`accumulate=True`, used by fused wgrad accumulation).
-The add is two separate IEEE ops (no FMA contraction), so it is bit-identical to autograd's
-`grad + dW`. The old values of one m16 row group are loaded together before any store: a
-load-add-store loop serialized 32 memory latencies per warp and made the fused version slower than
-the separate add it replaced.
+**Epilogue** (`finish_tile`): `alpha = gdec_A · gdec_B` in fp32, then a bf16 or fp32 store, the
+bias / residual epilogue of §3.6, or `D += alpha·acc` into an existing fp32 tensor
+(`accumulate=True`, used by fused wgrad accumulation). The add is two separate IEEE ops (no FMA
+contraction), so it is bit-identical to autograd's `grad + dW`. All of a thread's old values are
+loaded before any store (a load cannot be moved past a store to the same array, so a load-add-store
+loop serializes the latencies), and the TMA loop starts a bulk L2 prefetch of the tile's old values
+(or of the residual) when it starts the tile.
 
 ### 4.1 Closing the gap to cuBLASLt (v0.3)
 
@@ -322,15 +377,51 @@ of a driver reset.
 
 Measured the same and dropped: four stages of 128-deep k-tiles in the same 96 KB (4.44 vs 4.55 ms),
 releasing a stage right after its last `ldmatrix` instead of after its MMAs, and B-reuse or
-serpentine MMA orders. The remaining locked-clock gap (69% vs 90% tensor-pipe activity with the same
-`ldmatrix` count as cuBLASLt, so the same warp tiling) is in instruction scheduling: the top stall
-is "wait", fixed-latency dependencies between tensor instructions.
+serpentine MMA orders. v0.3 left a locked-clock gap of 69% vs 90% tensor-pipe activity; §4.2 is what
+v0.8 recovered of it.
 
 **At real clocks the gap is closed.** Training runs at the 175 W board limit, where kernels compete
 for power rather than issue slots. There the TMA loop measures 404–433 TFLOPS on long-K shapes, equal
 to or above cuBLASLt (401–426), and it stays far ahead on short K (RESULTS.md §1).
 
-### 4.2 Split-K for small output grids
+### 4.2 Persistent tiles and early refills (v0.8)
+
+Measured at locked clocks (8192×8192×K, Nsight Compute), v0.7's TMA loop took 0.41M + 0.586M cycles
+per 1024 of K: **~8K cycles of overhead per output tile** (pipeline fill, CTA launch and barrier setup,
+epilogue), 8% of the time at K = 8192 and 40% at K = 1024, on top of a main loop at ~70% of the tensor
+pipe. cuBLASLt's NVFP4 kernel is persistent and warp-specialized (384 threads, 168 registers on
+average, 88 KB of shared memory, one CTA per SM) and took 3.65M cycles at 8192³ to v0.7's 5.10M.
+
+- **Persistent CTAs.** One CTA per SM loops over work units (an output tile, or one K split of it) in
+  the order the hardware would have launched them. The data stages and scale buffers form one ring
+  across a CTA's units, so while the warps run a tile's last k-steps and its epilogue, the next tile's
+  first k-tiles and scales are already loading. (The first version re-decoded the unit — with a 64-bit
+  division, i.e. a subroutine call — on every refill and was slower than v0.7; the cursors now keep
+  the decoded unit and use 32-bit arithmetic.)
+- **Refills start when a stage is free.** Stall sampling showed warps sleeping on the full barriers
+  for 11.6% of the samples: only thread 0 refilled stages, and only after issuing its own MMAs for the
+  k-tile. Now each warp counts its release of a stage with a shared-memory atomic, and the warp that
+  releases it last issues the refill (after the empty-barrier wait, which then completes at once and
+  orders the TMA writes after every warp's reads). The sequence of loads is fixed, so every warp keeps
+  its own copy of the load cursors and advances it at the same points; nothing else is shared. (A
+  shared cursor, handed from one last warp to the next through fences and the atomic, is correct under
+  the PTX memory model but invisible to racecheck, which reported it.) Sleep fell to 6.8%.
+- **The accumulating epilogue** lost 35–40% inside the unit loop, where loading the old gradient one
+  row group at a time exposed its DRAM latency four times per tile. Loading all of a thread's old
+  values first and starting a bulk L2 prefetch of the tile when the unit starts made it 3–28% faster
+  than v0.7's.
+
+Result at locked clocks, against v0.7: 17% fewer cycles at K = 1024, 15% at 2048, 8–9% from 4096 to
+16384; tensor-pipe activity at 8192³ 64% → 71%. cuBLASLt still needs 21% fewer cycles there (3.65M vs
+4.64M). The rest is per-warp issue: ptxas spaces each warp's OMMAs 16 cycles apart (an 11-cycle stall
+plus a filler instruction; the filler's "wait" is 23% of the stall samples), and with two MMA warps
+per scheduler any other instruction or stall leaves the tensor pipe idle. cuBLASLt's layout (one
+producer and two consumer warpgroups, registers rebalanced with `setmaxnreg` to roughly 40 / 232)
+would need `setmaxnreg`, which ptxas ignores here because taking the address of a `__grid_constant__`
+tensor map inserts a call (§4.1); the descriptors would have to live in global memory instead. Left
+for a GPU with power headroom, where it would show (RESULTS.md §1).
+
+### 4.3 Split-K for small output grids
 
 A wgrad GEMM with a small M×N, such as the 768×768 attention projection at d=768 (36 CTA tiles on 82
 SMs), leaves most of the GPU idle. With `splits = S`, CTA z covers k-tiles
@@ -349,7 +440,7 @@ arrive** (atomic counter) sums all S partials in split order 0..S−1 and runs t
   d=768 block step that is about 1% of the step.
 - `NVFP4_GEMM_SPLITS=1` disables automatic splitting (for ablations).
 
-### 4.3 Fragment layouts, swizzles, bounds
+### 4.4 Fragment layouts, swizzles, bounds
 
 **Fragment layouts.** These come from CUTLASS `MMA_Traits<SM120_16x8x64_TN_VS>` and were confirmed
 on the GPU by the GEMM tests. `g = lane / 4`, `t = lane % 4`.
@@ -386,12 +477,14 @@ zero-filled copies, and stores are guarded. `K` must be a multiple of 128 (256 f
 | GEMM | `tests/test_gemm_cuda.py` | vs fp64 reference: max error ≤ 1e-5 · max\|ref\|, ragged shapes, extreme scales; TMA loop == cp.async loop bit for bit; split-K deterministic across runs, accumulate == add |
 | Fused producers | `tests/test_fused_producers_cuda.py` | **bit-exact** vs reference LayerNorm / GELU / GELU-backward + `quantize_dual` (4 configurations × 5 shapes × 2 dtypes); LayerNorm statistics vs fp64 |
 | Fused sub-blocks | `tests/test_fused_modules.py`, `tests/test_fused_llama.py` | GPT / BERT style (incl. biases, exact GELU) and Llama style (RMSNorm, SwiGLU; norm-module variants): forward == explicit op composition bit for bit; every gradient's cosine with fp32 ≥ the unfused NVFP4 path's − 0.01; seeded determinism; partial gradients (incl. bias-only); fused wgrad accumulation; compile |
+| Epilogue, multi-part input, norm backward (v0.8) | `tests/test_epilogue_cuda.py` | bias / residual epilogue == `reference.linear_epilogue` bit for bit (TMA, cp.async, split-K; bf16 / fp32 outputs and residuals); multi-part quantization == quantizing the concatenation bit for bit (incl. device seeds), column sums == sums; SwiGLU biases bit-exact; norm backward == reference and PyTorch autograd for 1–4 register chunks and the long-row path, deterministic |
+| Residual fusion (v0.8) | `tests/test_fused_residual.py` | Llama and GPT blocks with chunks + residual handles + fused residual adds: forward == the 0.7 composition bit for bit, gradients as close to fp32 as unfused NVFP4; chunk gradients bit-identical to the concatenated path; residual-handle gradient summed exactly; `NVFP4Linear(residual=)` bit-exact; norm-free MLPs; SwiGLU biases incl. partial / bias-only training; fused accumulation + cache bit-identical; compile (fullgraph) |
 | Weight cache | `tests/test_weight_cache_cuda.py` (+ two-process DDP / FSDP2) | bit-identical to uncached over optimizer steps (fused / foreach AdamW, SGD); reused within a step; every update path noticed (and the documented `.data` exception); CUDA-graph capture bypasses it; checkpointing, compile, deepcopy / pickle |
 | Layer | `tests/test_linear.py` | CUDA == emulated recipe (same seeds); cosine with full precision > 0.97–0.98; SR noise averages out; only NVFP4 tensors saved for backward (exact byte count); no-grad / frozen-weight / no-input-grad paths; fused wgrad accumulation == autograd bit for bit |
 | Robustness | `tests/test_robustness_cuda.py` | NaN / ±inf anywhere → non-finite outputs (quantize, dual, fused producers, GEMM, layers, gradients); clear errors on misuse; any leading shape incl. empty; fp32/bf16/fp16 and non-contiguous inputs; bf16 weights; state dict ↔ `nn.Linear`; activation checkpointing bit-exact; `torch.compile` == eager; CUDA-graph replay == eager; concurrent streams with split-K; DDP |
 | Integration | `tests/test_integration_cuda.py` | GPU seed tensors == integer seeds bit for bit (all four quantizers); no host sync in a training step; `torch.compile(fullgraph=True)` with no graph breaks, bit-identical to eager; CUDA-graph capture of fwd+bwd (fresh seeds per replay, noise averages out) and of a full Adam step (loss falls); fused accumulation in place with hooks firing, and under `torch.autograd.grad`; outputs not views; **two-process DDP (plain and bucket views), FSDP1 (flat and `use_orig_params`) and FSDP2** over gloo, fused and unfused, bit-exact vs a single-process reference; deterministic mode + flash attention reproduces a block's gradients bit for bit |
-| Memory / race safety | `tools/sanitize.sh` | compute-sanitizer memcheck, racecheck, synccheck, initcheck over every kernel variant (ragged shapes, TMA and cp.async loops, split-K, accumulate, all producer ops, GPU-resident seeds, a layer forward + backward): 0 findings |
-| Long-run stability | `tools/soak.py` | 8 minutes: 18,401 fused + unfused training iterations, 3,682 bit-exact gradient replays, 92,005 GEMMs re-checked bit for bit, no non-finite values, no hang |
+| Memory / race safety | `tools/sanitize.sh` | compute-sanitizer memcheck, racecheck, synccheck, initcheck over every kernel variant (ragged shapes, TMA and cp.async loops, persistent grids with more units than SMs, split-K, accumulate, the bias / residual epilogue, all producer ops, multi-part inputs, the norm backward, GPU-resident seeds, layer and v0.8 block forward + backward): 0 findings |
+| Long-run stability | `tools/soak.py` | 8 minutes (v0.7): 18,401 fused + unfused training iterations, 3,682 bit-exact gradient replays, 92,005 GEMMs re-checked bit for bit; 5 minutes (v0.8, residual-fused blocks): 14,474 iterations, 2,896 replays, 72,370 GEMMs; no non-finite values, no hang |
 | Packaging | wheel built and installed into an isolated directory | imports and trains from outside the repository |
 | Hardware ISA | CI `cuda-compile` job | `OMMA.SF.16864...UE4M3.4X` present in SASS |
 | End to end | `experiments/train_gpt.py` | loss curves vs BF16 (see [RESULTS.md](RESULTS.md)) |
@@ -400,6 +493,11 @@ Every benchmark checks correctness against the reference before it times anythin
 
 ## 6. Known limitations and next steps
 
+Done in v0.8: residual adds, biases and the q / k / v hand-off fused (§3.6, item 2 of v0.7),
+SwiGLU gate / up biases and norm-free MLPs for post-norm blocks (item 5), a persistent GEMM with early
+refills that recovers about half of the locked-clock gap (§4.2, item 1), stochastic rounding at half
+the hashing cost (item 3), and weight-cache hits under FSDP2 when the all-gathered weight returns to
+the same address within a step (item 4).
 Done in v0.7: weight-quantization cache (item 4 of v0.6), Llama-style fused blocks (RMSNorm,
 SwiGLU), biases and exact GELU in the fused GPT blocks (item 5), two-GPU NCCL tests and a
 multi-GPU session script (run once a multi-GPU machine is available).
@@ -410,23 +508,28 @@ training steps, fused accumulation compatible with DDP / FSDP2, FSDP2 and multi-
 three-seed quality study ([RESULTS.md §4.1](RESULTS.md)).
 Done in v0.4: NaN propagation (a NaN used to be quantized to finite values), per-device kernel
 attributes, exact-architecture checks, sanitizer / soak / packaging verification (§5).
-Done in v0.3: the TMA GEMM main loop (§4.1), split-K (§4.2) and LayerNorm/GELU fused into
+Done in v0.3: the TMA GEMM main loop (§4.1), split-K (§4.3) and LayerNorm/GELU fused into
 quantization (§3.4). Done in v0.2: one fused read per operand, NVFP4-saved activations, in-place wgrad
 accumulation.
 
-1. **Locked-clock GEMM efficiency.** At equal clocks the TMA loop keeps the tensor pipe 69% busy vs
-   cuBLASLt's 90%; the difference is instruction scheduling inside the MMA warps (§4.1). It doesn't
-   show at this laptop's power limit, but it would on a GPU with more power headroom (a desktop RTX
-   5090). A tile-contiguous scale layout, which is what cuBLASLt's "blocked" scale format provides,
-   would remove the rest of the scale traffic; it changes the NVFP4 tensor format, so it was left out.
-2. **Attention-side producers.** The attention output (the projection's input) and the residual adds
-   are not fused; attention itself is PyTorch's BF16 SDPA.
-3. **Stochastic rounding is ALU-bound.** It needs two 32-bit hashes per element, because sm_120a has
-   no `cvt.rs`. A cheaper generator, such as one hash per two elements, would need a spec change.
-4. **Weight cache limits.** In-place writes through `param.data` outside an optimizer step are not
-   detected (documented, with an explicit invalidation call); under FSDP2 the cache never hits.
-5. **Fused sub-blocks** cover GPT / BERT-style and Llama-style pre-norm blocks; biases on the SwiGLU
-   gate / up projections and post-norm blocks are not fused.
+1. **Locked-clock GEMM efficiency.** At equal clocks the TMA loop now keeps the tensor pipe 71% busy
+   vs cuBLASLt's ~90% (v0.7: 64%); what remains is per-warp OMMA issue spacing with two MMA warps per
+   scheduler (§4.2). Closing it needs cuBLASLt's warpgroup layout and `setmaxnreg`, i.e. tensor maps
+   in global memory instead of kernel parameters. It does not show at this laptop's power limit but
+   would on a GPU with more headroom (a desktop RTX 5090). A tile-contiguous scale layout (cuBLASLt's
+   "blocked" format) would remove the remaining scale traffic but changes the NVFP4 tensor format.
+2. **Attention itself** is PyTorch's BF16 SDPA (flash attention). The q / k / v hand-off and the
+   residual adds around it are fused (§3.6); attention-score quantization (FP8 / FP4 attention) is out
+   of scope.
+3. **Stochastic rounding is still software** (sm_120a has no `cvt.rs`): one 32-bit hash per element
+   pair, +34–43% on the plain dual quantizer.
+4. **Weight cache limits.** In-place writes through `param.data` outside an optimizer step cannot be
+   detected (`.data` deliberately gives the tensor a fresh autograd version counter); call
+   `invalidate_weight_caches`. Under FSDP2 the cache hits only when the all-gathered weight lands at
+   the same address within a step (the allocator's choice; correct either way).
+5. **Fused sub-blocks** cover GPT / BERT / ViT-style and Llama-style blocks, pre-norm or (via the
+   norm-free MLPs) post-norm, with biases anywhere. Mixture-of-experts layers (grouped GEMMs) are not
+   covered.
 6. **Framework coverage.** DDP, FSDP1 and FSDP2 are tested, but with two ranks on one GPU over gloo:
    NCCL across several GPUs has only run with one rank (no multi-GPU machine available).
    `DTensor.full_tensor()` over gloo with CUDA tensors crashes in PyTorch 2.14 (also for plain

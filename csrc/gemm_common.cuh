@@ -45,7 +45,46 @@ struct Args {
   int* counters;       // split-K arrival counters, one per output tile, zero on entry and on exit
   int M, N, K;
   int splits;          // gridDim.z; split z covers k-tiles [KT*z/splits, KT*(z+1)/splits)
+  // Linear-layer epilogue (non-accumulating stores only), active if bias or res is set:
+  //   y = bf16(alpha * acc);  y = y + bias[col] (rounded to bf16 if bias_round);  D = res[row, col] + y
+  // i.e. exactly `res + (gemm_bf16.to(dt) + bias.to(dt))` in PyTorch, with bias holding bias.to(dt) as fp32.
+  const float* bias;   // [N] or null
+  const void* res;     // [M, N] (ld N), bf16 if res_bf16 else fp32, or null
+  int res_bf16;
+  int bias_round;
 };
+
+__device__ __forceinline__ float bf16_round(float v) { return __bfloat162float(__float2bfloat16_rn(v)); }
+
+// The epilogue above for the pair D[row, col], D[row, col + 1] (row < M; col + 1 may be >= N).
+__device__ __forceinline__ void linear_epilogue(const Args& p, int row, int col, float& v0, float& v1) {
+  const bool c1 = col + 1 < p.N;
+  v0 = bf16_round(v0);
+  v1 = bf16_round(v1);
+  if (p.bias != nullptr) {
+    v0 = __fadd_rn(v0, __ldg(p.bias + col));
+    if (c1) v1 = __fadd_rn(v1, __ldg(p.bias + col + 1));
+    if (p.bias_round) {
+      v0 = bf16_round(v0);
+      v1 = bf16_round(v1);
+    }
+  }
+  if (p.res != nullptr) {
+    const int64_t off = static_cast<int64_t>(row) * p.N + col;
+    float r0, r1 = 0.0f;
+    if (p.res_bf16) {
+      const __nv_bfloat16* r = reinterpret_cast<const __nv_bfloat16*>(p.res) + off;
+      r0 = __bfloat162float(r[0]);
+      if (c1) r1 = __bfloat162float(r[1]);
+    } else {
+      const float* r = reinterpret_cast<const float*>(p.res) + off;
+      r0 = r[0];
+      if (c1) r1 = r[1];
+    }
+    v0 = __fadd_rn(r0, v0);
+    v1 = __fadd_rn(r1, v1);
+  }
+}
 
 __device__ __forceinline__ uint32_t smem_u32(const void* p) {
   return static_cast<uint32_t>(__cvta_generic_to_shared(p));
@@ -111,6 +150,20 @@ __device__ __forceinline__ void store_pair(float* base, int row, int col, int M,
   }
 }
 
+// Prefetch the [BM, BN] tile at (m0, n0) of a row-major [M, N] matrix (ld N, elem_bytes per element) into
+// L2, for an epilogue that reads it (the old values of an accumulating GEMM, a residual): each of the
+// first BM threads issues one bulk prefetch of its row (rows past M are skipped; a ragged right edge
+// prefetches the valid columns rounded down to 16 bytes; rows that are not 16-byte aligned are skipped).
+__device__ __forceinline__ void prefetch_tile_l2(const void* base, int elem_bytes, const Args& p, int m0, int n0) {
+  const int r = threadIdx.x;
+  if (r >= BM || m0 + r >= p.M || (static_cast<int64_t>(p.N) * elem_bytes) % 16 != 0) return;
+  const uint32_t bytes = static_cast<uint32_t>(min(BN, p.N - n0) * elem_bytes) & ~15u;
+  if (bytes == 0) return;
+  const char* src = static_cast<const char*>(base) + (static_cast<int64_t>(m0 + r) * p.N + n0) * elem_bytes;
+  if (reinterpret_cast<uintptr_t>(src) & 15) return;  // e.g. a residual view at an odd offset
+  asm volatile("cp.async.bulk.prefetch.L2.global [%0], %1;\n" ::"l"(src), "r"(bytes) : "memory");
+}
+
 // Split-K: every split stores its raw fp32 partial; the last CTA of a tile to arrive sums all partials
 // in split order 0..S-1 (its own from registers), so the result does not depend on arrival order.
 // Returns false in CTAs that are not last (they have nothing more to do). Called by the 256 MMA threads.
@@ -154,31 +207,35 @@ __device__ __forceinline__ void store_tile(const Args& p, float (&acc)[MI][NI][4
                                            int lane) {
   const float alpha = (*p.gdec_a) * (*p.gdec_b);
   if constexpr (kAccum) {
-    // Loads for one m16 row group are issued together (a load cannot be moved past a store to the
-    // same array, so a load-add-store loop would serialize their latency).
+    // All of a thread's old values are loaded before any store (a load cannot be moved past a store to
+    // the same array, so a load-add-store loop would serialize their latency; the main loop's fragment
+    // registers are free by now). The tile was prefetched into L2 when the work unit started.
     float* d = reinterpret_cast<float*>(p.d);
     const int g = lane >> 2, tig = lane & 3;
+    float2 old[MI][NI][2];
 #pragma unroll
-    for (int i = 0; i < MI; ++i) {
-      float2 old[NI][2];
+    for (int i = 0; i < MI; ++i)
 #pragma unroll
       for (int j = 0; j < NI; ++j)
 #pragma unroll
         for (int h = 0; h < 2; ++h)
-          old[j][h] = load_pair(d, m0 + wm * WM + i * 16 + g + 8 * h, n0 + wn * WN + j * 8 + 2 * tig, p.M, p.N);
+          old[i][j][h] = load_pair(d, m0 + wm * WM + i * 16 + g + 8 * h, n0 + wn * WN + j * 8 + 2 * tig, p.M, p.N);
+#pragma unroll
+    for (int i = 0; i < MI; ++i)
 #pragma unroll
       for (int j = 0; j < NI; ++j)
 #pragma unroll
         for (int h = 0; h < 2; ++h) {
           const int row = m0 + wm * WM + i * 16 + g + 8 * h, col = n0 + wn * WN + j * 8 + 2 * tig;
-          store_pair(d, row, col, p.M, p.N, __fadd_rn(old[j][h].x, __fmul_rn(acc[i][j][2 * h], alpha)),
-                     __fadd_rn(old[j][h].y, __fmul_rn(acc[i][j][2 * h + 1], alpha)));
+          store_pair(d, row, col, p.M, p.N, __fadd_rn(old[i][j][h].x, __fmul_rn(acc[i][j][2 * h], alpha)),
+                     __fadd_rn(old[i][j][h].y, __fmul_rn(acc[i][j][2 * h + 1], alpha)));
         }
-    }
   } else {
+    const bool epi = p.bias != nullptr || p.res != nullptr;
     for_each_pair(m0, n0, wm, wn, lane, [&](int i, int j, int h, int row, int col) {
-      if (row >= p.M) return;
-      const float v0 = acc[i][j][2 * h] * alpha, v1 = acc[i][j][2 * h + 1] * alpha;
+      if (row >= p.M || col >= p.N) return;
+      float v0 = acc[i][j][2 * h] * alpha, v1 = acc[i][j][2 * h + 1] * alpha;
+      if (epi) linear_epilogue(p, row, col, v0, v1);
       OutT* out = reinterpret_cast<OutT*>(p.d) + static_cast<int64_t>(row) * p.N + col;
       if constexpr (std::is_same_v<OutT, float>) {
         if (col + 1 < p.N && (p.N % 2 == 0)) {
@@ -199,13 +256,12 @@ __device__ __forceinline__ void store_tile(const Args& p, float (&acc)[MI][NI][4
   }
 }
 
-// Common tail of both kernels: split-K reduction (if any), then the output store.
+// Common tail of both kernels: split-K reduction (if any) of split `z` of output tile `tile`, then the
+// output store.
 template <typename OutT, bool kAccum>
 __device__ __forceinline__ void finish_tile(const Args& p, float (&acc)[MI][NI][4], int m0, int n0, int wm, int wn,
-                                            int lane, int* flag) {
-  if (p.splits > 1 &&
-      !splitk_reduce(p, acc, m0, n0, wm, wn, lane, blockIdx.z, blockIdx.y * gridDim.x + blockIdx.x, flag))
-    return;
+                                            int lane, int* flag, int z, int tile) {
+  if (p.splits > 1 && !splitk_reduce(p, acc, m0, n0, wm, wn, lane, z, tile, flag)) return;
   store_tile<OutT, kAccum>(p, acc, m0, n0, wm, wn, lane);
 }
 

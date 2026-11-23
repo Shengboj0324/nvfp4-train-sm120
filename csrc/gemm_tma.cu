@@ -22,9 +22,12 @@
 #include <cudaTypedefs.h>
 #include <cuda_runtime.h>
 
+#include <algorithm>
 #include <cstring>
 #include <stdexcept>
 #include <string>
+
+#include <c10/cuda/CUDAException.h>
 
 #include "gemm_common.cuh"
 
@@ -47,13 +50,15 @@ constexpr int STAGE_BYTES = A_BYTES + B_BYTES;           // 32 KB (16 KB at BK =
 constexpr int SA_BYTES = BM * QB, SB_BYTES = BN * QB;
 constexpr int QUAD_BYTES = SA_BYTES + SB_BYTES;          // 16 KB
 constexpr int SCALE_BASE = STAGES * STAGE_BYTES;         // quads follow the data stages
-constexpr int BAR_BASE = SCALE_BASE + 2 * QUAD_BYTES;    // full[STAGES], empty[STAGES], sfull[2], flag
+constexpr int BAR_BASE = SCALE_BASE + 2 * QUAD_BYTES;    // full[STAGES], empty[STAGES], sfull[2], flag,
+                                                         // release counters, load cursors
 // 8 MMA warps and no dedicated producer: thread 0 issues the TMA copies. A 9th warp would put 3 warps
 // on one scheduler and cap every thread at 168 registers (3 x 32 x R <= 16K), which made the MMA warps
 // spill and lose their fragment double-buffering; setmaxnreg could rebalance that, but ptxas drops it
 // in kernels that take the address of a __grid_constant__ tensor map.
 constexpr int THREADS = MMA_THREADS;
-constexpr int SMEM_BYTES = BAR_BASE + (2 * STAGES + 2) * 8 + 16 /*flag*/ + 1024 /*alignment slack*/;
+constexpr int CNT_OFF = BAR_BASE + (2 * STAGES + 2) * 8 + 16;  // unsigned[STAGES]: stage releases so far
+constexpr int SMEM_BYTES = CNT_OFF + 64 + 1024 /*alignment slack*/;
 static_assert(SMEM_BYTES <= 101376, "sm_120 allows at most 99 KB of dynamic shared memory per block");
 
 __device__ __forceinline__ void mbar_init(uint32_t bar, uint32_t count) {
@@ -122,24 +127,93 @@ __device__ __forceinline__ uint32_t full_bar(uint32_t bars, int s) { return bars
 __device__ __forceinline__ uint32_t empty_bar(uint32_t bars, int s) { return bars + (STAGES + s) * 8; }
 __device__ __forceinline__ uint32_t sfull_bar(uint32_t bars, int q) { return bars + (2 * STAGES + q) * 8; }
 
-// Load k-tile kt of A and B into data stage s.
-__device__ __forceinline__ void issue_stage(uint32_t base, uint32_t bars, int s, int kt, int m0, int n0,
-                                            const Maps& mp) {
-  const uint32_t stage = base + s * STAGE_BYTES, full = full_bar(bars, s);
-  mbar_expect_tx(full, STAGE_BYTES);
-  tma_load_2d(stage, mp.a, kt * BKB, m0, full);
-  tma_load_2d(stage + A_BYTES, mp.b, kt * BKB, n0, full);
+// --- Work units ---------------------------------------------------------------------------------------
+// The kernel is persistent: CTA c processes work units c, c + gridDim.x, ... (one output tile, or one K
+// split of a tile), in the order the hardware would launch non-persistent CTAs (n tiles fastest), so the
+// tiles in flight at any time are the same neighbours as before. The data stages and scale quads form one
+// ring across all of a CTA's units: while the MMA warps finish a tile (last k-steps, epilogue), thread 0
+// is already loading the next tile's first k-tiles and scales, so the pipeline never drains between
+// tiles (a non-persistent CTA paid the full load latency, plus launch and barrier setup, per tile).
+
+struct Unit {
+  int m0, n0, kt0, nk, z, tile;
+};
+
+__device__ __forceinline__ Unit unit_of(const Args& p, int u, int tiles_n, int tiles) {
+  Unit w;
+  w.z = u / tiles;
+  w.tile = u % tiles;
+  w.m0 = (w.tile / tiles_n) * BM;
+  w.n0 = (w.tile % tiles_n) * BN;
+  const int KT = p.K / BK;  // KT * splits < 2^31 (host check): 32-bit division, no 64-bit division call
+  w.kt0 = KT * w.z / p.splits;
+  w.nk = KT * (w.z + 1) / p.splits - w.kt0;
+  return w;
 }
 
-// Load the scales of local k-tiles 4q .. 4q+3 into quad buffer q & 1 (past the end of K the box is
-// zero-filled; those bytes are never read).
-__device__ __forceinline__ void issue_quad(uint32_t base, uint32_t bars, int q, int kt0, int m0, int n0,
-                                           const Maps& mp) {
-  const uint32_t buf = base + SCALE_BASE + (q & 1) * QUAD_BYTES, full = sfull_bar(bars, q & 1);
-  const int x = (kt0 + QUAD * q) * SFK;
-  mbar_expect_tx(full, QUAD_BYTES);
-  tma_load_2d(buf, mp.sa, x, m0, full);
-  tma_load_2d(buf + SA_BYTES, mp.sb, x, n0, full);
+__device__ __forceinline__ int quads_of(int nk) { return (nk + QUAD - 1) / QUAD; }
+
+struct Grid {
+  int tiles_n, tiles, total;
+};
+
+// The load cursors: the next k-tile and the next scale quad to load (unit, index within the unit, and the
+// unit decoded once per unit, not per load), and their sequence numbers in the CTA's ring (sequence n goes
+// to data stage n % STAGES, quad sequence q to quad buffer q & 1). The sequence of loads is fixed, so every
+// warp (lane 0) keeps its own copy and advances it at the same points; whichever warp issues a load, all
+// copies agree (no shared cursor state).
+struct Producer {
+  int du, dk, dseq;  // data
+  Unit dw;
+  int qu, qq, qseq;  // scales
+  Unit qw;
+};
+
+__device__ __forceinline__ void producer_init(Producer& pr, const Args& p, const Grid& gd) {
+  pr.du = pr.qu = blockIdx.x;
+  pr.dk = pr.dseq = pr.qq = pr.qseq = 0;
+  pr.dw = pr.qw = unit_of(p, blockIdx.x, gd.tiles_n, gd.tiles);
+}
+
+// Load the next k-tile (if any; only if `issue`) into data stage dseq % STAGES and advance the cursor.
+__device__ __forceinline__ void issue_next_stage(Producer& pr, const Args& p, const Grid& gd, uint32_t base,
+                                                 uint32_t bars, const Maps& mp, bool issue = true) {
+  if (pr.du >= gd.total) return;
+  const Unit& w = pr.dw;
+  if (issue) {
+    const int s = pr.dseq % STAGES;
+    const uint32_t stage = base + s * STAGE_BYTES, full = full_bar(bars, s);
+    mbar_expect_tx(full, STAGE_BYTES);
+    tma_load_2d(stage, mp.a, (w.kt0 + pr.dk) * BKB, w.m0, full);
+    tma_load_2d(stage + A_BYTES, mp.b, (w.kt0 + pr.dk) * BKB, w.n0, full);
+  }
+  ++pr.dseq;
+  if (++pr.dk == w.nk) {
+    pr.dk = 0;
+    pr.du += gridDim.x;
+    if (pr.du < gd.total) pr.dw = unit_of(p, pr.du, gd.tiles_n, gd.tiles);
+  }
+}
+
+// Load the scales of the next 4 k-tiles (one quad; past the end of K the box is zero-filled and those
+// bytes are never read) into quad buffer qseq & 1 (only if `issue`) and advance the cursor.
+__device__ __forceinline__ void issue_next_quad(Producer& pr, const Args& p, const Grid& gd, uint32_t base,
+                                                uint32_t bars, const Maps& mp, bool issue = true) {
+  if (pr.qu >= gd.total) return;
+  const Unit& w = pr.qw;
+  if (issue) {
+    const uint32_t buf = base + SCALE_BASE + (pr.qseq & 1) * QUAD_BYTES, full = sfull_bar(bars, pr.qseq & 1);
+    const int x = (w.kt0 + QUAD * pr.qq) * SFK;
+    mbar_expect_tx(full, QUAD_BYTES);
+    tma_load_2d(buf, mp.sa, x, w.m0, full);
+    tma_load_2d(buf + SA_BYTES, mp.sb, x, w.n0, full);
+  }
+  ++pr.qseq;
+  if (++pr.qq == quads_of(w.nk)) {
+    pr.qq = 0;
+    pr.qu += gridDim.x;
+    if (pr.qu < gd.total) pr.qw = unit_of(p, pr.qu, gd.tiles_n, gd.tiles);
+  }
 }
 
 // Operand fragments of one 64-deep k-step for one warp.
@@ -182,11 +256,18 @@ struct Scales {
   uint32_t a[MI][KS], b[NI][KS];
 };
 
-// Scales of local k-tile `it` (SFK bytes per row = one word per k-step), waiting for its scale load
-// first if `it` starts one. The 64-byte scale rows are stored with the 64B swizzle (16B chunk c of row
-// r at c ^ ((r >> 1) & 3)); a k-tile's SFK bytes lie inside one 16B chunk.
-__device__ __forceinline__ void load_scales(Scales& sc, const LaneAddr& la, uint32_t bars, int it) {
-  const int q = it / QUAD, t = it % QUAD;
+// Where the current work unit sits in the CTA's ring.
+struct Pos {
+  int g0;  // sequence number of the unit's first k-tile
+  int q0;  // sequence number of the unit's first scale quad
+  int nk;  // k-tiles in the unit
+};
+
+// Scales of local k-tile `it`, waiting for its scale quad first if `it` starts one. The 64-byte scale
+// rows are stored with the 64B swizzle (16B chunk c of row r at c ^ ((r >> 1) & 3)); a k-tile's SFK bytes
+// lie inside one 16B chunk.
+__device__ __forceinline__ void load_scales(Scales& sc, const LaneAddr& la, uint32_t bars, int it, const Pos& ps) {
+  const int q = ps.q0 + it / QUAD, t = it % QUAD;
   if (t == 0) mbar_wait(sfull_bar(bars, q & 1), (q / 2) & 1);
   const uint32_t byte = t * SFK;
   const uint32_t off = (q & 1) * QUAD_BYTES + ((((byte >> 4) ^ la.sx) << 4) | (byte & 15));
@@ -212,13 +293,30 @@ __device__ __forceinline__ void load_scales(Scales& sc, const LaneAddr& la, uint
   }
 }
 
-// Consume data stage S (k-tile `it`): KS k-steps, each issuing its MMAs after the next k-step's
+template <int S>
+__device__ __forceinline__ void refill(Producer& pr, const Args& p, const Grid& gd, uint32_t base, uint32_t bars,
+                                       int it, const Pos& ps, const Maps& mp, bool issue);
+
+// What consume_stage needs to refill a stage: the release counters (shared memory) and this warp's cursors.
+struct Shared {
+  unsigned* cnt;  // [STAGES]
+  Producer* pr;
+  const Args* p;
+  const Grid* gd;
+  const Maps* mp;
+  uint32_t base;
+};
+
+// Consume data stage S (local k-tile `it`): KS k-steps, each issuing its MMAs after the next k-step's
 // fragments are requested; the last k-step prefetches the first k-step (and scales) of k-tile it + 1.
 // The stage is released as soon as its last fragments are requested: mbarrier.arrive has release
 // semantics, so those shared-memory reads are performed before the producer can observe the arrival.
+// The warp that releases it last refills it at once (an atomic count of the releases elects it): the TMA
+// load of k-tile it + STAGES then starts the moment the stage is free, rather than when one fixed thread
+// gets past its own MMAs (warps waited on late data ~12% of the time with thread 0 as the only producer).
 template <int S>
 __device__ __forceinline__ void consume_stage(float (&acc)[MI][NI][4], Frag (&fr)[2], Scales& sc, const LaneAddr& la,
-                                              uint32_t bars, int it, int nk, int lane) {
+                                              uint32_t bars, int it, const Pos& ps, int lane, const Shared& sh) {
   constexpr int SN = (S + 1) % STAGES;
 #pragma unroll
   for (int ks = 0; ks < KS; ++ks) {
@@ -231,12 +329,17 @@ __device__ __forceinline__ void consume_stage(float (&acc)[MI][NI][4], Frag (&fr
       load_frag<S>(fr[(ks + 1) & 1], la, ks + 1);
       if (ks + 2 == KS) {
         __syncwarp();
-        if (lane == 0) mbar_arrive(empty_bar(bars, S));
+        if (lane == 0) {
+          mbar_arrive(empty_bar(bars, S));
+          // the count only grows: release r of the stage's every round is warps r * 8 .. r * 8 + 7
+          const bool last = (atomicAdd(sh.cnt + S, 1u) % (WARPS_M * WARPS_N)) == WARPS_M * WARPS_N - 1;
+          refill<S>(*sh.pr, *sh.p, *sh.gd, sh.base, bars, it, ps, *sh.mp, last);
+        }
         __syncwarp();  // reconverge before the next .aligned instruction
       }
-    } else if (it + 1 < nk) {
-      mbar_wait(full_bar(bars, SN), ((it + 1) / STAGES) & 1);
-      load_scales(sc, la, bars, it + 1);
+    } else if (it + 1 < ps.nk) {
+      mbar_wait(full_bar(bars, SN), ((ps.g0 + it + 1) / STAGES) & 1);
+      load_scales(sc, la, bars, it + 1, ps);
       load_frag<SN>(fr[0], la, 0);
     }
     // (B-reuse and serpentine orders measured the same.)
@@ -247,33 +350,53 @@ __device__ __forceinline__ void consume_stage(float (&acc)[MI][NI][4], Frag (&fr
   }
 }
 
-// Thread 0, after consuming local k-tile `it` (data stage S): once all warps released it, refill stage
-// S with k-tile it + STAGES and, when `it` ends a scale load, refill that buffer with the one after next.
+// After data stage S (local k-tile `it`) is released: refill it with the next k-tile of the ring (this
+// unit's or the next unit's), and when `it` ends a scale quad, refill that quad's buffer with the next
+// quad. Its scales (and those of every earlier k-tile) were read before its fragments, so after the stage
+// release the finished quad buffer is free too. Only the last warp to release (`issue`) loads, after the
+// empty-barrier wait (acquire: the TMA writes are ordered after every warp's reads); every warp advances
+// its cursors.
 template <int S>
-__device__ __forceinline__ void refill(uint32_t base, uint32_t bars, int it, int nk, int kt0, int m0, int n0,
-                                       const Maps& mp) {
-  if (it + STAGES >= nk) return;  // nothing left to load (later scale loads start even later)
-  mbar_wait(empty_bar(bars, S), (it / STAGES) & 1);
-  issue_stage(base, bars, S, kt0 + it + STAGES, m0, n0, mp);
-  // All warps have released k-tile `it`; its scales (and those of every earlier k-tile) were read
-  // before its fragments, so the scale buffer of a finished load can be refilled.
-  if (it % QUAD == QUAD - 1 && QUAD * (it / QUAD + 2) < nk) issue_quad(base, bars, it / QUAD + 2, kt0, m0, n0, mp);
+__device__ __forceinline__ void refill(Producer& pr, const Args& p, const Grid& gd, uint32_t base, uint32_t bars,
+                                       int it, const Pos& ps, const Maps& mp, bool issue) {
+  if (pr.du >= gd.total) return;  // nothing left to load (quads run ahead of the data: none left either)
+  if (issue) mbar_wait(empty_bar(bars, S), ((ps.g0 + it) / STAGES) & 1);
+  issue_next_stage(pr, p, gd, base, bars, mp, issue);
+  if (it % QUAD == QUAD - 1 || it == ps.nk - 1) issue_next_quad(pr, p, gd, base, bars, mp, issue);
 }
 
-// k-tiles it + S, it + S + 1, ... it + STAGES - 1 (stage index is a compile-time constant).
-template <int S>
+// Local k-tiles it + J, it + J + 1, ... it + STAGES - 1 of the unit, whose first k-tile sits in stage OFF
+// (k-tile it + J in stage (OFF + J) % STAGES, a compile-time constant).
+template <int J, int OFF>
 __device__ __forceinline__ void steps(float (&acc)[MI][NI][4], Frag (&fr)[2], Scales& sc, const LaneAddr& la,
-                                      uint32_t base, uint32_t bars, int it, int nk, int kt0, int m0, int n0, int lane,
-                                      const Maps& mp) {
-  if constexpr (S < STAGES) {
-    if (it + S < nk) {
-      consume_stage<S>(acc, fr, sc, la, bars, it + S, nk, lane);
-      if (threadIdx.x == 0) refill<S>(base, bars, it + S, nk, kt0, m0, n0, mp);
-      // Lane 0 of warp 0 may have waited on the empty barrier above; ldmatrix / mma.sync are .aligned and
-      // need the whole warp converged, which independent thread scheduling does not guarantee by itself.
-      __syncwarp();
-      steps<S + 1>(acc, fr, sc, la, base, bars, it, nk, kt0, m0, n0, lane, mp);
+                                      uint32_t bars, int it, const Pos& ps, int lane, const Shared& sh) {
+  if constexpr (J < STAGES) {
+    if (it + J < ps.nk) {
+      consume_stage<(OFF + J) % STAGES>(acc, fr, sc, la, bars, it + J, ps, lane, sh);
+      steps<J + 1, OFF>(acc, fr, sc, la, bars, it, ps, lane, sh);
     }
+  }
+}
+
+// The main loop of one work unit whose first k-tile sits in stage OFF.
+template <int OFF>
+__device__ __forceinline__ void unit_loop(float (&acc)[MI][NI][4], Frag (&fr)[2], Scales& sc, const LaneAddr& la,
+                                          uint32_t bars, const Pos& ps, int lane, const Shared& sh) {
+  mbar_wait(full_bar(bars, OFF), (ps.g0 / STAGES) & 1);
+  load_scales(sc, la, bars, 0, ps);
+  load_frag<OFF>(fr[0], la, 0);
+  for (int it = 0; it < ps.nk; it += STAGES) steps<0, OFF>(acc, fr, sc, la, bars, it, ps, lane, sh);
+}
+
+template <int OFF>
+__device__ __forceinline__ void unit_loop_any(int off, float (&acc)[MI][NI][4], Frag (&fr)[2], Scales& sc,
+                                              const LaneAddr& la, uint32_t bars, const Pos& ps, int lane,
+                                              const Shared& sh) {
+  if constexpr (OFF < STAGES) {
+    if (off == OFF)
+      unit_loop<OFF>(acc, fr, sc, la, bars, ps, lane, sh);
+    else
+      unit_loop_any<OFF + 1>(off, acc, fr, sc, la, bars, ps, lane, sh);
   }
 }
 
@@ -288,14 +411,17 @@ __global__ void __launch_bounds__(THREADS, 1)
   int* flag = reinterpret_cast<int*>(smem + BAR_BASE + (2 * STAGES + 2) * 8);
   const Maps mp{reinterpret_cast<const CUtensorMap*>(&tm_a), reinterpret_cast<const CUtensorMap*>(&tm_b),
                 reinterpret_cast<const CUtensorMap*>(&tm_sa), reinterpret_cast<const CUtensorMap*>(&tm_sb)};
+  Grid gd;
+  gd.tiles_n = (p.N + BN - 1) / BN;
+  gd.tiles = gd.tiles_n * ((p.M + BM - 1) / BM);
+  gd.total = gd.tiles * p.splits;
 
   const int warp = threadIdx.x >> 5, lane = threadIdx.x & 31;
-  const int m0 = blockIdx.y * BM, n0 = blockIdx.x * BN;
-  const int KT = p.K / BK;
-  const int kt0 = static_cast<int>((static_cast<int64_t>(KT) * blockIdx.z) / p.splits);
-  const int kt1 = static_cast<int>((static_cast<int64_t>(KT) * (blockIdx.z + 1)) / p.splits);
-  const int nk = kt1 - kt0;
-
+  unsigned* cnt = reinterpret_cast<unsigned*>(smem + CNT_OFF);
+  static_assert(STAGES * sizeof(unsigned) <= 64, "shared pipeline state");
+  // every warp's lane 0 keeps the load cursors; thread 0 also issues the prologue loads
+  Producer pr;
+  producer_init(pr, p, gd);
   if (threadIdx.x == 0) {
     for (int s = 0; s < STAGES; ++s) {
       mbar_init(full_bar(bars, s), 1);
@@ -303,10 +429,15 @@ __global__ void __launch_bounds__(THREADS, 1)
     }
     for (int q = 0; q < 2; ++q) mbar_init(sfull_bar(bars, q), 1);
     asm volatile("fence.mbarrier_init.release.cluster;\n" ::: "memory");
-    for (int q = 0; q < 2 && QUAD * q < nk; ++q) issue_quad(base, bars, q, kt0, m0, n0, mp);
-    for (int s = 0; s < STAGES && s < nk; ++s) issue_stage(base, bars, s, kt0 + s, m0, n0, mp);
+    for (int s = 0; s < STAGES; ++s) cnt[s] = 0;
+  }
+  {
+    const bool issue = threadIdx.x == 0;
+    for (int q = 0; q < 2; ++q) issue_next_quad(pr, p, gd, base, bars, mp, issue);
+    for (int s = 0; s < STAGES; ++s) issue_next_stage(pr, p, gd, base, bars, mp, issue);
   }
   __syncthreads();
+  const Shared sh{cnt, &pr, &p, &gd, &mp, base};
 
   const int wm = warp / WARPS_N, wn = warp % WARPS_N;
   LaneAddr la;
@@ -325,24 +456,29 @@ __global__ void __launch_bounds__(THREADS, 1)
     la.sx = (g >> 1) & 3;  // (row >> 1) & 3 for every scale row this lane reads
   }
 
-  float acc[MI][NI][4];
+  Pos ps{0, 0, 0};
+  for (int u = blockIdx.x; u < gd.total; u += gridDim.x) {
+    const Unit w = unit_of(p, u, gd.tiles_n, gd.tiles);
+    ps.nk = w.nk;
+    // the epilogue reads the old output (accumulate) or the residual: start fetching it into L2 now
+    if (kAccum && p.splits == 1) prefetch_tile_l2(p.d, 4, p, w.m0, w.n0);
+    if (!kAccum && p.res != nullptr) prefetch_tile_l2(p.res, p.res_bf16 ? 2 : 4, p, w.m0, w.n0);
+    float acc[MI][NI][4];
 #pragma unroll
-  for (int i = 0; i < MI; ++i)
+    for (int i = 0; i < MI; ++i)
 #pragma unroll
-    for (int j = 0; j < NI; ++j)
+      for (int j = 0; j < NI; ++j)
 #pragma unroll
-      for (int r = 0; r < 4; ++r) acc[i][j][r] = 0.0f;
-
-  Frag fr[2];
-  Scales sc;
-  if (nk > 0) {
-    mbar_wait(full_bar(bars, 0), 0);
-    load_scales(sc, la, bars, 0);
-    load_frag<0>(fr[0], la, 0);
+        for (int r = 0; r < 4; ++r) acc[i][j][r] = 0.0f;
+    if (w.nk > 0) {
+      Frag fr[2];
+      Scales sc;
+      unit_loop_any<0>(ps.g0 % STAGES, acc, fr, sc, la, bars, ps, lane, sh);
+    }
+    ps.g0 += w.nk;
+    ps.q0 += quads_of(w.nk);
+    finish_tile<OutT, kAccum>(p, acc, w.m0, w.n0, wm, wn, lane, flag, w.z, w.tile);
   }
-  for (int it = 0; it < nk; it += STAGES) steps<0>(acc, fr, sc, la, base, bars, it, nk, kt0, m0, n0, lane, mp);
-
-  finish_tile<OutT, kAccum>(p, acc, m0, n0, wm, wn, lane, flag);
 }
 
 using EncodeFn = PFN_cuTensorMapEncodeTiled_v12000;
@@ -379,7 +515,13 @@ void launch(const Args& p, const CUtensorMap (&maps)[4], dim3 grid, cudaStream_t
   TmaParam prm[4];
   static_assert(sizeof(prm) == sizeof(maps), "tensor map parameter layout");
   std::memcpy(prm, maps, sizeof(prm));
-  nvfp4_gemm_tma_kernel<OutT, kAccum><<<grid, THREADS, SMEM_BYTES, stream>>>(p, prm[0], prm[1], prm[2], prm[3]);
+  // persistent: one CTA per SM (at most one fits), each looping over work units
+  const int units = static_cast<int>(grid.x * grid.y * grid.z);
+  int dev = 0, sms = 0;
+  C10_CUDA_CHECK(cudaGetDevice(&dev));
+  C10_CUDA_CHECK(cudaDeviceGetAttribute(&sms, cudaDevAttrMultiProcessorCount, dev));
+  const dim3 pgrid(std::max(1, std::min(units, sms)));
+  nvfp4_gemm_tma_kernel<OutT, kAccum><<<pgrid, THREADS, SMEM_BYTES, stream>>>(p, prm[0], prm[1], prm[2], prm[3]);
 }
 
 }  // namespace tma
@@ -388,9 +530,10 @@ int tma_k_tile() { return tma::BK; }
 
 bool tma_supported(const Args& p) {
   auto aligned = [](const void* q) { return (reinterpret_cast<uintptr_t>(q) & 15) == 0; };
-  // K % 256: the scale rows (K/16 bytes) must have a 16-byte global stride for TMA.
-  return p.K % 256 == 0 && p.K % tma::BK == 0 && aligned(p.a) && aligned(p.b) && aligned(p.sfa) && aligned(p.sfb) &&
-         tma::encode_fn() != nullptr;
+  // K % 256: the scale rows (K/16 bytes) must have a 16-byte global stride for TMA. K > 0: every work unit
+  // has at least one k-tile.
+  return p.K > 0 && p.K % 256 == 0 && p.K % tma::BK == 0 && aligned(p.a) && aligned(p.b) && aligned(p.sfa) &&
+         aligned(p.sfb) && tma::encode_fn() != nullptr;
 }
 
 // Returns false (nothing launched) if the operands can't be described as tensor maps.

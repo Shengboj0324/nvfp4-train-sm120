@@ -31,14 +31,15 @@ __host__ __device__ __forceinline__ uint32_t hash_u32(uint32_t x) {
   return x;
 }
 
-// reference.sr_uniform: (h >> 8) * 2^-24, built without an int->float conversion. With n = h >> 8 < 2^24:
-// if n >= 2^23 the result lies in [0.5, 1) and its mantissa is n - 2^23; otherwise 0x3F000000 | n is
-// 0.5 + n * 2^-24 and subtracting 0.5 is exact (Sterbenz).
-__device__ __forceinline__ float sr_uniform(uint64_t seed, uint64_t index) {
-  const uint32_t idx_lo = static_cast<uint32_t>(index);  // reference masks the int64 index to 32 bits
-  const uint32_t h = hash_u32(hash_u32(idx_lo ^ static_cast<uint32_t>(seed)) + static_cast<uint32_t>(seed >> 32));
-  const float f = __uint_as_float(0x3F000000u | ((h >> 8) & 0x7FFFFFu));
-  return (h & 0x80000000u) ? f : __fsub_rn(f, 0.5f);
+// reference.sr_uniform2: the stochastic-rounding uniforms of elements 2k and 2k + 1 from one 32-bit hash of
+// the pair index k (keyed by the 64-bit seed), 16 bits each: u0 = (h & 0xFFFF) * 2^-16, u1 = (h >> 16) * 2^-16.
+// Built without int->float conversions: 0x3F800000 | (n << 7) is 1 + n * 2^-16, and subtracting 1 is exact.
+// (One hash per two elements: sm_120a has no cvt.rs, so the hash is most of stochastic rounding's cost.)
+__device__ __forceinline__ void sr_uniform2(uint64_t seed, uint64_t pair, float& u0, float& u1) {
+  const uint32_t k = static_cast<uint32_t>(pair);  // reference masks the int64 pair index to 32 bits
+  const uint32_t h = hash_u32(hash_u32(k ^ static_cast<uint32_t>(seed)) + static_cast<uint32_t>(seed >> 32));
+  u0 = __fsub_rn(__uint_as_float(0x3F800000u | ((h & 0xFFFFu) << 7)), 1.0f);
+  u1 = __fsub_rn(__uint_as_float(0x3F800000u | ((h >> 16) << 7)), 1.0f);
 }
 
 // Stochastic rounding of y onto the signed E2M1 grid, returned as a float grid value (bit-identical to
@@ -192,7 +193,7 @@ __device__ __forceinline__ float global_encode_scale(float amax) {
 
 // reference.quantize for one 16-element block whose abs-max (over the 1x16 or 16x16 block) is bmax.
 // Returns the UE4M3 scale byte and the 16 E2M1 codes packed low-nibble-first into `packed`.
-// Stochastic rounding uses sr_uniform(sr_seed, lin0 + i), lin0 = linear index of element 0.
+// Stochastic rounding uses sr_uniform2(sr_seed, (lin0 + i) / 2), lin0 = linear index of element 0 (even).
 template <bool kStochastic>
 __device__ __forceinline__ uint8_t quantize16(const float (&v)[kBlock], float bmax, float genc, uint64_t sr_seed,
                                               uint64_t lin0, uint2& packed) {
@@ -205,8 +206,10 @@ __device__ __forceinline__ uint8_t quantize16(const float (&v)[kBlock], float bm
   for (int i = 0; i < kBlock; i += 2) {
     float y0 = __fmul_rn(v[i], enc), y1 = __fmul_rn(v[i + 1], enc);
     if constexpr (kStochastic) {  // round onto the grid first; the convert below is then exact
-      y0 = e2m1_sr_value(y0, sr_uniform(sr_seed, lin0 + i));
-      y1 = e2m1_sr_value(y1, sr_uniform(sr_seed, lin0 + i + 1));
+      float u0, u1;
+      sr_uniform2(sr_seed, (lin0 + i) >> 1, u0, u1);
+      y0 = e2m1_sr_value(y0, u0);
+      y1 = e2m1_sr_value(y1, u1);
     }
     const uint32_t b = cvt_e2m1x2_rn(y0, y1);
     if (i < 8)

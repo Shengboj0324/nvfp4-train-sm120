@@ -196,19 +196,3 @@ def test_rejects_unsupported_modules():
         rmsnorm_swiglu_mlp(_x(), norm, gate, NVFP4Linear(D, 2 * H, bias=False).cuda(), down)
     with pytest.raises(ValueError, match="last dim"):
         rmsnorm_linear(_x(), torch.nn.RMSNorm(2 * D).cuda(), lin)
-
-
-def test_rmsnorm_backward_fallback_matches_fused_kernel(monkeypatch):
-    """PyTorch < 2.9 has no fused RMSNorm backward; the fp32 fallback must give the same gradients."""
-    import nvfp4.fused as fused
-    x = torch.randn(T, D, device="cuda").bfloat16()
-    w = torch.rand(D, device="cuda") + 0.5
-    dn = torch.randn(T, D, device="cuda")
-    rstd = (x.float().square().mean(-1) + 1e-6).rsqrt()
-    if fused._fused_rms_bwd is None:
-        pytest.skip("this PyTorch has no fused RMSNorm backward")
-    a = fused._rms_backward(dn, x, rstd, w, [True, True])
-    monkeypatch.setattr(fused, "_fused_rms_bwd", None)
-    b = fused._rms_backward(dn, x, rstd, w, [True, True])
-    assert (a[0].float() - b[0].float()).abs().max().item() <= 2e-2 * b[0].float().abs().max().item()
-    assert torch.allclose(a[1], b[1], rtol=1e-4, atol=1e-3)

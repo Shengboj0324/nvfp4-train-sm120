@@ -36,7 +36,7 @@ training uses gloo.
 Verify an installation on the target machine:
 
 ```bash
-tools/check.sh            # build + 528 tests (~30 s of GPU time); Windows: tools\check.cmd
+tools/check.sh            # build + 637 tests (~35 s of GPU time); Windows: tools\check.cmd
 tools/check.sh release    # + compute-sanitizer (memcheck, racecheck, synccheck, initcheck) + 5-minute soak
 ```
 
@@ -60,7 +60,9 @@ converted = convert_linears(model.blocks, skip=("22.", "23."))
 `NVFP4Linear` is an `nn.Linear` subclass: its `state_dict` is interchangeable with `nn.Linear`, so
 checkpoints load either way, and the weights stay in their original dtype (fp32 master weights or
 bf16). Inputs of any leading shape and of dtype fp32 / bf16 / fp16 are accepted; the output has the
-autocast dtype (or the input dtype without autocast).
+autocast dtype (or the input dtype without autocast). The bias is added inside the GEMM's store, and
+`layer(x, residual=r)` returns `r + layer(x)` with the add fused there too (bit-identical to adding
+afterwards; for the attention output projection, see §3.2).
 
 Options:
 
@@ -68,41 +70,64 @@ Options:
 |---|---|---|
 | `wgrad_rht` | `True` | 16-point random Hadamard transform on the wgrad operands (NVIDIA recipe). |
 | `fuse_wgrad_accumulation` | `False` | Add the weight gradient into an existing fp32 `weight.grad` inside the GEMM, saving a read-modify-write of the gradient per micro-batch under gradient accumulation. Autograd still sees the gradient (the accumulated tensor is handed to it without a copy), so gradient hooks, DDP and FSDP2 work. A tensor hook on the weight receives the accumulated gradient rather than this micro-batch's part. Not applied under `torch.autograd.grad`, to non-fp32 gradients, or inside `torch.compile`, which take the ordinary path. |
-| `cache_weight_quantization` | `False` | Keep the NVFP4 copies of the weight and reuse them while it is unchanged: every micro-batch after the first in a gradient-accumulation step skips the weight quantizer (2–6% of a block step), bit-identical results, ~1.1 bytes per weight element of memory. Invalidated by any `torch.optim` optimizer step (also fused ones, which don't bump version counters), by in-place changes through the parameter, `load_state_dict`, `.to()` and assigning `.data`. **Not** noticed: in-place writes through `param.data` outside an optimizer step (`p.data.add_(...)`); call `nvfp4.invalidate_weight_caches(model)` after those. Off automatically for FSDP1 (non-leaf views), inside `torch.compile`, and permanently for a layer captured in a CUDA graph. Gives no speedup under FSDP2, which gathers weights into fresh memory every forward (still correct). |
+| `cache_weight_quantization` | `False` | Keep the NVFP4 copies of the weight and reuse them while it is unchanged: every micro-batch after the first in a gradient-accumulation step skips the weight quantizer (1–8% of a block step), bit-identical results, ~1.1 bytes per weight element of memory. Invalidated by any `torch.optim` optimizer step (also fused ones, which don't bump version counters), by in-place changes through the parameter, `load_state_dict`, `.to()` and assigning `.data`. **Not** noticed: in-place writes through `param.data` outside an optimizer step (`p.data.add_(...)`; PyTorch gives `.data` its own version counter, so nothing can see them); call `nvfp4.invalidate_weight_caches(model)` after those. Off automatically for FSDP1 (non-leaf views), inside `torch.compile`, and permanently for a layer captured in a CUDA graph. Under FSDP2, which gathers weights into new memory every forward, it hits only when the allocator returns the same address within a step (correct either way). |
 | `backend` | `"cuda"` | `"emulate"` runs the identical recipe with the pure-PyTorch reference on any device (slow; for verification). |
 
-### 3.2 Pre-norm blocks with fused normalization and activation
+### 3.2 Transformer blocks with fused normalization, activation and residual adds
 
 ```python
-from nvfp4 import layernorm_linear, layernorm_mlp, rmsnorm_linear, rmsnorm_swiglu_mlp
+from nvfp4 import layernorm_linear, layernorm_mlp, rmsnorm_linear, rmsnorm_swiglu_mlp, gelu_mlp, swiglu_mlp
 
-# GPT-2 / BERT / ViT style (LayerNorm, GELU; biases allowed)
-qkv = layernorm_linear(x, block.ln1, block.qkv)                       # block.qkv(block.ln1(x))
-y = x + layernorm_mlp(x, block.ln2, block.fc1, block.fc2)             # fc2(gelu_tanh(fc1(ln2(x))))
-y = x + layernorm_mlp(x, block.ln2, block.fc1, block.fc2, approximate="none")  # exact GELU (BERT, ViT)
+def attend(q, k, v):                         # your attention; q, k, v: [b, t, d]
+    b, t, d = q.shape
+    q, k, v = (z.view(b, t, heads, d // heads).transpose(1, 2) for z in (q, k, v))
+    return F.scaled_dot_product_attention(q, k, v, is_causal=True).transpose(1, 2).reshape(b, t, d)
 
-# Llama / Mistral / Qwen style (RMSNorm, SwiGLU)
-qkv = rmsnorm_linear(x, block.input_norm, block.qkv)                  # biases allowed (Qwen2)
-y = x + rmsnorm_swiglu_mlp(x, block.post_norm, block.gate, block.up, block.down)
-#                                         # down(silu(gate(n)) * up(n)), n = post_norm(x)
+# Llama / Mistral / Qwen style, pre-norm (RMSNorm, SwiGLU), fully fused (v0.8):
+q, k, v, res = rmsnorm_linear(x, blk.input_norm, blk.qkv, chunks=3, return_residual=True)
+x = blk.o_proj(attend(q, k, v), residual=res)                       # x + o_proj(attn)
+x = rmsnorm_swiglu_mlp(x, blk.post_norm, blk.gate, blk.up, blk.down, residual=True)
+#                                     # x + down(silu(gate(n)) * up(n)), n = post_norm(x)
+
+# GPT-2 / BERT / ViT style, pre-norm (LayerNorm, GELU tanh or exact; biases anywhere):
+q, k, v, res = layernorm_linear(x, blk.ln1, blk.qkv, chunks=3, return_residual=True)
+x = blk.proj(attend(q, k, v), residual=res)
+x = layernorm_mlp(x, blk.ln2, blk.fc1, blk.fc2, approximate="tanh", residual=True)
+
+# post-norm (original BERT): h = LN1(x + attn(x)); out = LN2(h + mlp(h))
+out = blk.ln2(gelu_mlp(h, blk.fc1, blk.fc2, approximate="none", residual=True))
+
+# the plain forms still work: qkv = rmsnorm_linear(x, norm, lin); y = x + layernorm_mlp(x, ln, fc1, fc2)
 ```
 
 The modules stay ordinary `nn.LayerNorm` / `nn.RMSNorm` / `NVFP4Linear` modules (same parameters,
 same state dict); only the forward call changes. Requirements: `NVFP4Linear` with `backend="cuda"`,
-normalization over the last dimension. Biases are supported everywhere except on the SwiGLU gate and
-up projections; fc1's bias is added inside the GELU kernel and its gradient comes from the same read.
+normalization over the last dimension. What each option fuses:
+
+| Option | Effect |
+|---|---|
+| `chunks=3` | q, k, v as views of the qkv GEMM output; their gradients (contiguous when they come from PyTorch's flash attention) are quantized in place instead of being concatenated into one tensor. |
+| `return_residual=True` | also returns a handle of x; pass it as the residual of the attention output projection (`NVFP4Linear.forward(attn, residual=handle)`), whose epilogue does the add, and whose residual gradient is then added inside this function's norm backward. |
+| `residual=True` (MLPs) | returns `x + mlp(x)`: the add in the down projection's epilogue, the residual gradient in the norm backward. |
+| norm `None`, `gelu_mlp`, `swiglu_mlp` | no normalization: post-norm blocks, plain MLPs. |
+| biases | anywhere: fc1's and the SwiGLU gate / up biases are added inside the activation kernel (gradients from the same read), the others in the GEMM epilogue (gradients from the output-gradient quantizer). |
+
 The RMSNorm module may be `torch.nn.RMSNorm` (with or without weight, default eps) or any module with
 `weight` and `variance_epsilon` (Hugging Face's `LlamaRMSNorm`). The normalized input is quantized
-once for both the gate and the up projection. `experiments/train_gpt.py --fuse-producers` shows a full
-GPT model; `bench/bench_llama_block.py` a Llama-style block.
+once for both the gate and the up projection. Outputs are bit-identical to the unfused composition of
+the same NVFP4 ops; gradients differ only in rounding (the fused path quantizes fp32 values directly
+where the unfused one rounds them to bf16 first). `experiments/train_gpt.py --fuse-producers` shows a
+full GPT model; `bench/bench_llama_block.py` a Llama-style block.
 
 ### 3.3 Low-level ops
 
 ```python
-from nvfp4 import quantize, quantize_dual, gemm
+from nvfp4 import quantize, quantize_dual, gemm, norm_backward
 qa = quantize(a)                                   # NVFP4Tensor(data, scales, gdec), along the last dim
 qb, qbt = quantize_dual(b, block_2d=True)          # b and b^T from one read
 d = gemm(qa, qb)                                   # a @ b^T, bf16 (or fp32 / into `out`, accumulate=True)
+y = gemm(qa, qb, torch.bfloat16, bias=bias, residual=r)  # r + (a @ b^T + bias), fused in the store
+r_q, c_q, db = quantize_dual([dq, dk, dv], bias_grad=True)  # concatenation read in place + column sums
 ```
 
 Seeds (`row_sr_seed`, `col_sr_seed`, `rht_seed`) are Python ints or one-element int64 tensors on the
@@ -151,9 +176,10 @@ sync, and changes on every CUDA-graph replay. Both give bit-identical results fo
 | DDP / FSDP | DDP, FSDP1 and FSDP2 tested (see §4), including fused wgrad accumulation. Pass FSDP2 a mesh built from your process group (`DeviceMesh.from_group`) when it isn't NCCL. PyTorch 2.7's FSDP2 sums gradients over gloo where 2.14 averages them (same for `nn.Linear`). |
 | Memory | Saved activations are NVFP4 (~0.56 bytes per element) instead of BF16; peak memory of a block step is 7–14% below BF16. |
 | Shapes | `in_features` / `out_features` must be multiples of 128. Token counts are arbitrary (padded internally). Very small layers (< 128 wide) should stay BF16. |
-| Fused blocks | GPT / BERT style (LayerNorm, tanh or exact GELU, biases) and Llama style (RMSNorm, SwiGLU). Attention itself stays PyTorch's BF16 SDPA; its output is quantized by `o_proj` as usual. |
+| Fused blocks | GPT / BERT / ViT style (LayerNorm, tanh or exact GELU) and Llama style (RMSNorm, SwiGLU), pre- or post-norm, biases anywhere, residual adds fused. Attention itself stays PyTorch's BF16 SDPA; its output is quantized by `o_proj` as usual. |
+| Version changes | v0.8 changed the stochastic-rounding generator (one hash per element pair) and quantizes fp32 output gradients without first rounding them to bf16: gradients are not bit-identical to v0.7's for the same seed (forward results are). |
 | Precision recipe | Keep embeddings, the LM head and the last 1–2 blocks in BF16. Measured quality gap at 124M / 507M parameters: +1.0–1.4% validation loss, constant over training; at 124M over three seeds +0.019 ± 0.002 nats (+1.28%) (RESULTS.md §4–5). Validate on your own model before relying on it. |
-| Throughput | Gains grow with width: block fwd+bwd 1.8× BF16 at d=768, 2.4× at d=2048, 3.1× at d=4096 on an RTX 5090 Laptop GPU. |
+| Throughput | Gains grow with width: GPT block fwd+bwd 1.8× BF16 at d=768, 2.7× at d=2048, 3.2× at d=4096 (3.5× for micro-batches after the first with the weight cache); Llama block 2.1–3.3× (3.6×) on an RTX 5090 Laptop GPU. |
 
 ## 6. Operating on a laptop / workstation
 

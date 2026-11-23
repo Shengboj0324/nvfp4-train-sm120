@@ -1,5 +1,32 @@
 # Changelog
 
+## 0.8.0 — residual / epilogue fusion, persistent GEMM, cheaper stochastic rounding (2026-11-23)
+
+- **Residual adds, biases and the q / k / v hand-off are fused** (DESIGN.md §3.6). The GEMM epilogue
+  adds a bias and a residual in its store (`gemm(..., bias=, residual=)`, bit-identical to adding
+  afterwards); `NVFP4Linear` uses it for its bias and for `forward(x, residual=r)`, taking the bias
+  gradient from column sums of the output-gradient quantizer. The sub-blocks gain `chunks=3` (q, k, v
+  as views; their gradients quantized in place by the new multi-part `quantize_dual([...])` instead of
+  being stacked and copied), `return_residual=True` (a residual handle whose gradient is added inside
+  the norm backward) and `residual=True` on the MLPs. A new deterministic LayerNorm / RMSNorm backward
+  kernel (`csrc/norm.cu`, `ops.norm_backward`) replaces PyTorch's, producing dx (with the residual
+  gradient added), dw and db from one read. Llama block: 6–8% faster than the 0.7 fused path.
+- **SwiGLU gate / up biases** (added inside the SwiGLU kernels, gradients from the same read) and
+  **norm-free MLPs** for post-norm blocks: `layernorm_mlp(x, None, ...)`, `gelu_mlp`, `swiglu_mlp`.
+- **Persistent TMA GEMM** (DESIGN.md §4.2): one CTA per SM carries the load pipeline across output
+  tiles, the last warp to release a stage issues its refill at once, and the accumulating epilogue
+  batches its loads behind an L2 prefetch. 8–17% fewer cycles at locked clocks, up to 8% faster at the
+  power limit (8192³: 441 TFLOPS, above cuBLASLt's 427), the accumulating wgrad GEMM 3–28% faster; it
+  is now also used from K = 512 on large grids.
+- **Stochastic rounding: one hash per element pair** (16-bit uniforms): SR adds 34–43% to the dual
+  quantizer instead of 48–61%. The SR noise for a given seed differs from 0.7's.
+- Numerics: fp32 output gradients (an fp32 residual stream) are quantized without first rounding
+  them to bf16. Forward outputs of every layer and block are unchanged; gradients are not
+  bit-identical to 0.7's.
+- Block benchmarks time every variant in two passes in opposite orders (the power-limited GPU slows
+  as it heats up). Weight-cache hits under FSDP2 when the allocator returns the same address.
+- GPT block: 1.82–3.22× BF16 (3.50× with the weight cache); Llama block: 2.09–3.32× (3.64×). 637 tests.
+
 ## 0.7.0 — Llama-style blocks, weight cache, fused biases (2026-11-23)
 
 - **Llama-style fused blocks:** `rmsnorm_linear` and `rmsnorm_swiglu_mlp`. RMSNorm, SwiGLU and both

@@ -1,6 +1,6 @@
 # Results
 
-All results were measured on one machine on 2026-11-21/22:
+All results were measured on one machine on 2026-11-21/23:
 
 - **GPU:** NVIDIA GeForce RTX 5090 **Laptop** GPU (GB203, 82 SMs, 24 GB, ~896 GB/s, 64 MB L2, ~175 W board power)
 - **Driver:** 595.79 (Windows 11), running in WSL2 Ubuntu 22.04
@@ -13,7 +13,11 @@ There are three versions of the stack ([DESIGN.md](DESIGN.md) has the details):
   hardware E2M1 convert and optional fused wgrad accumulation.
 - **v0.3** adds the TMA GEMM main loop, split-K for small output grids, and LayerNorm /
   GELU / GELU-backward fused into quantization.
-- **v0.7** (current) adds the weight-quantization cache and fused Llama-style blocks (§3.1–3.2).
+- **v0.7** adds the weight-quantization cache and fused Llama-style blocks (§3.1–3.2).
+- **v0.8** (current) makes the TMA GEMM persistent (the pipeline carries across output tiles, refills
+  start the moment a stage is free), fuses the residual adds, biases and the q/k/v hand-off (GEMM
+  epilogue, in-place multi-part quantization, a LayerNorm / RMSNorm backward kernel that adds the
+  residual gradient) and halves the stochastic-rounding hash work. §1 and §3 are v0.8 numbers.
 - **v0.4 – v0.6** did not change the kernels' speed: v0.4 hardened them (NaN propagation,
   checks, sanitizers), v0.5 moved the rounding seeds to the GPU and integrated the layers with
   `torch.compile`, CUDA graphs, DDP and FSDP2. v0.5 adds a three-seed quality study (§4.1).
@@ -27,33 +31,37 @@ different runs).
 
 ## 1. GEMM throughput (TFLOPS, `bench/results/gemm.json`)
 
-| M × N × K | BF16 cuBLAS | **NVFP4, this repo** | v0.2 main loop (cp.async) | incl. quantizing both operands | NVFP4 cuBLASLt (`torch._scaled_mm`) | ours / BF16 | ours / cuBLASLt |
-|---|---|---|---|---|---|---|---|
-| 2048³ | 81 | **289** | 261 | 189 | 242 | 3.58× | 1.20 |
-| 4096³ | 93 | **385** | 336 | 274 | 343 | 4.12× | 1.12 |
-| 8192³ | 90 | **410** | 382 | 298 | 429 | 4.56× | 0.96 |
-| 8192×8192×2048 | 99 | **364** | 331 | 301 | 215 | 3.69× | 1.70 |
-| 8192×2048×8192 | 93 | **401** | 352 | 229 | 334 | 4.33× | 1.20 |
-| 2048×8192×8192 | 93 | **407** | 363 | 234 | 336 | 4.40× | 1.21 |
-| 8192×3072×768 | 88 | **277** | 256 | 177 | 141 | 3.16× | 1.97 |
-| 8192×768×3072 | 92 | **390** | 312 | 122 | 336 | 4.24× | 1.16 |
-| 768×3072×8192 | 84 | **393** | 341 | 150 | 400 | 4.66× | 0.98 |
-| 768×768×8192 (split-K) | 84 | **266** | 212 | 128 | 213 | 3.18× | 1.25 |
-| 2304×768×8192 | 95 | **308** | 270 | 36\* | 343 | 3.24× | 0.90 |
+| M × N × K | BF16 cuBLAS | **NVFP4, this repo (v0.8)** | v0.7 | v0.2 main loop (cp.async) | incl. quantizing both operands | NVFP4 cuBLASLt (`torch._scaled_mm`) | ours / BF16 | ours / cuBLASLt |
+|---|---|---|---|---|---|---|---|---|
+| 2048³ | 86 | **293** | 289 | 258 | 189 | 237 | 3.42× | 1.24 |
+| 4096³ | 93 | **406** | 385 | 336 | 282 | 338 | 4.38× | 1.20 |
+| 8192³ | 89 | **441** | 410 | 375 | 310 | 427 | 4.97× | 1.03 |
+| 8192×8192×2048 | 99 | **392** | 364 | 321 | 321 | 215 | 3.95× | 1.82 |
+| 8192×2048×8192 | 93 | **425** | 401 | 347 | 239 | 341 | 4.59× | 1.25 |
+| 2048×8192×8192 | 92 | **432** | 407 | 356 | 244 | 334 | 4.69× | 1.29 |
+| 8192×3072×768 | 87 | **275** | 277 | 256 | 180 | 139 | 3.14× | 1.98 |
+| 8192×768×3072 | 92 | **397** | 390 | 323 | 122 | 334 | 4.33× | 1.19 |
+| 768×3072×8192 | 85 | **414** | 393 | 341 | 134 | 393 | 4.86× | 1.05 |
+| 768×768×8192 (split-K) | 84 | **273** | 266 | 218 | 128 | 214 | 3.26× | 1.28 |
+| 2304×768×8192 | 95 | **313** | 308 | 276 | 19\* | 344 | 3.31× | 0.91 |
 
-\* An outlier of that run: quantizing the two operands takes 37 + 21 µs on their own, so this column
-should read about 190 TFLOPS.
+\* An outlier (it was in v0.7's run too): quantizing the two operands takes ~37 + 21 µs on their own,
+so this column should read about 190 TFLOPS.
 
-- **v0.3 closed the long-K gap to cuBLASLt.** v0.2 reached about 86% of cuBLASLt at 8192³ and on the
-  long-K shapes; v0.3's TMA main loop is 96–121% of it there (8192³: 410 vs 429; the K=8192 wgrad
-  and dgrad shapes 393–407 vs 334–400). An interleaved A/B run (alternating the two kernels on each
-  shape) gave 433 vs 426 at 8192³ and 404 vs 405 at 8192×2048×8192. How: [DESIGN.md §4.1](DESIGN.md).
-- **The TMA loop is 7–25% faster than the v0.2 loop** on every shape it handles (K ≥ 1024).
-- **Split-K** lifts the 36-tile 768×768×8192 wgrad from 212 to 266 TFLOPS (+25%).
-- **Against BF16:** 3.2–4.7× BF16 cuBLAS.
-- **Locked-clock caveat:** at equal (profiler-locked) clocks cuBLASLt's kernel keeps the tensor pipe
-  90% busy vs our 69%; at the power limit, where training runs, that no longer shows
-  ([DESIGN.md §4.1](DESIGN.md)).
+- **v0.8's persistent main loop** is up to 8% faster than v0.7 at the power limit (8192³: 441 vs 410, now
+  above cuBLASLt's 427) and spends 8–17% fewer cycles at locked clocks; the accumulating wgrad GEMM
+  (not in this table: `D += A·B^T` into an fp32 gradient) is 3–28% faster
+  ([DESIGN.md §4.2](DESIGN.md)).
+- **v0.3 closed the long-K gap to cuBLASLt** (v0.2 reached about 86% of it). How:
+  [DESIGN.md §4.1](DESIGN.md).
+- **The TMA loop is 7–25% faster than the v0.2 loop** on every shape it handles (K ≥ 1024, and from
+  K = 512 when there are at least 8 output tiles per SM).
+- **Split-K** lifts the 36-tile 768×768×8192 wgrad from 218 to 273 TFLOPS (+25%).
+- **Against BF16:** 3.1–5.0× BF16 cuBLAS; against cuBLASLt NVFP4: 0.91–1.98×, below it only on
+  2304×768×8192.
+- **Locked-clock caveat:** at equal (profiler-locked) clocks cuBLASLt's kernel still takes fewer cycles
+  (8192³: 3.65M vs 4.64M, tensor pipe ~90% vs 71%; v0.7: 5.10M, 64%). At the power limit, where
+  training runs, that does not show ([DESIGN.md §4.2](DESIGN.md)).
 - **Output agreement:** cuBLASLt and our output agree within bf16 rounding (max |Δ| / max |D| ≈ 0.4–0.7%).
   Ours matches the fp64 reference to about 1e-7.
 - **Hardware ceiling:** NVIDIA's dense FP4 peak for the *desktop* RTX 5090 is 1676 TFLOPS. The
@@ -68,12 +76,16 @@ Each case produces exactly the operand pair NVFP4Linear needs, so the outputs ar
 
 | Role in NVFP4Linear | Tensor | separate | **fused** | speedup |
 |---|---|---|---|---|
-| activation: X (RNE) + Xᵀ (RHT, padded to 128) | 8192 × 768 bf16 | 65.1 µs | **32.9 µs** | **1.98×** |
-| | 8192 × 3072 bf16 | 361.5 µs | **155.1 µs** | **2.33×** |
-| gradient: dY (SR) + dYᵀ (RHT + SR, padded) | 8192 × 2304 bf16 | 314.0 µs | **173.3 µs** | **1.81×** |
-| | 8192 × 8192 bf16 | 1172 µs | **648 µs** | **1.81×** |
-| weight: W + Wᵀ (16×16 2D blocks) | 3072 × 768 fp32 | 52.1 µs | **23.3 µs** | **2.23×** |
-| | 8192 × 2048 fp32 | 286.5 µs | **182.0 µs** | **1.57×** |
+| activation: X (RNE) + Xᵀ (RHT, padded to 128) | 8192 × 768 bf16 | 70.1 µs | **36.0 µs** | **1.95×** |
+| | 8192 × 3072 bf16 | 362.4 µs | **157.3 µs** | **2.30×** |
+| gradient: dY (SR) + dYᵀ (RHT + SR, padded) | 8192 × 2304 bf16 | 311.2 µs | **166.4 µs** | **1.87×** |
+| | 8192 × 8192 bf16 | 1155 µs | **609 µs** | **1.90×** |
+| weight: W + Wᵀ (16×16 2D blocks) | 3072 × 768 fp32 | 57.5 µs | **25.8 µs** | **2.23×** |
+| | 8192 × 2048 fp32 | 290.3 µs | **182.5 µs** | **1.59×** |
+
+v0.8's paired stochastic-rounding hash ([DESIGN.md §3.2](DESIGN.md)) made the gradient case 5–6%
+faster than v0.7 (173 → 166 µs, 648 → 609 µs); measured in isolation, SR now adds 34–43% to the dual
+quantizer instead of 48–61%, and 5–6% to the fused SwiGLU-backward quantizer instead of 9–11%.
 
 ### 2.2 Single-output quantizer
 
@@ -83,9 +95,9 @@ bandwidth; the 8192² row (128 MB) is the DRAM-bound case.
 
 | Tensor | rowwise | rowwise, 16×16 2D | transposed | transposed + RHT + SR (wgrad) | rowwise + SR |
 |---|---|---|---|---|---|
-| 8192 × 2048 bf16 | **1379 GB/s (31 µs)** — v0.1: 725 | 544 (v0.1: 470) | 594 (v0.1: 503) | 475 (v0.1: 254) | 622 |
-| 8192 × 8192 bf16 | 474 GB/s (363 µs) — v0.1: 488 | 197 (v0.1: 191) | 411 (v0.1: 406) | 333 (v0.1: 225) | 408 |
-| 768 × 8192 bf16 | 721 GB/s (22 µs) | 361 | 461 | 410 | 467 |
+| 8192 × 2048 bf16 | **1305 GB/s (33 µs)** — v0.1: 725 | 549 (v0.1: 470) | 613 (v0.1: 503) | 485 (v0.1: 254) | 709 (v0.7: 622) |
+| 8192 × 8192 bf16 | 476 GB/s (361 µs) — v0.1: 488 | 198 (v0.1: 191) | 421 (v0.1: 406) | 367 (v0.1: 225) | 453 (v0.7: 408) |
+| 768 × 8192 bf16 | 678 GB/s (24 µs) | 362 | 475 | 404 | 528 (v0.7: 467) |
 
 Most of the gain over v0.1 came from the hardware `cvt.rn.satfinite.e2m1x2` convert, a
 division-free stochastic-rounding path and per-CTA amax reduction (DESIGN.md §3.2–3.3).
@@ -107,17 +119,25 @@ of the LayerNorm output, and the separate amax pass over each of those outputs.
 
 This measures one pre-LN GPT block (qkv, SDPA attention, out-proj and a 4× MLP), forward and
 backward, on 8192 tokens with BF16 autocast. The four linears either run in NVFP4 or stay BF16;
-attention is BF16 SDPA in both. "NVFP4" is NVFP4Linear; "NVFP4 fused" adds the LayerNorm / GELU
-fusion and fused wgrad accumulation (the configuration of the v0.3 training runs). Peak memory is
+attention is BF16 SDPA in both. "NVFP4" is NVFP4Linear; "fused" adds the LayerNorm / GELU fusion and
+fused wgrad accumulation (the configuration of the v0.3 training runs); "fused + residual" (v0.8) also
+hands q / k / v over without a concatenation and fuses both residual adds (`chunks=3`,
+`return_residual`, `residual=True`; [DESIGN.md §3.6](DESIGN.md)). Every variant is timed in two passes
+in opposite orders and the best is kept (the power-limited GPU slows as it heats up). Peak memory is
 the extra CUDA memory allocated during the step.
 
-| d_model | BF16 step | NVFP4 | **NVFP4 fused** | **speedup** (v0.2 / v0.1) | linear TFLOPS, BF16 → NVFP4 | peak MiB, BF16 → NVFP4 fused |
-|---|---|---|---|---|---|---|
-| 768 | 6.35 ms | 3.65 ms | **3.52 ms** | **1.80×** (1.66× / 1.29×) | 55 → 95 | 461 → 427 |
-| 1024 | 10.19 ms | 5.45 ms | **5.12 ms** | **1.99×** (1.81× / 1.44×) | 61 → 113 | 624 → 572 |
-| 2048 | 34.06 ms | 14.81 ms | **14.09 ms** | **2.42×** (2.15× / 1.76×) | 73 → 167 | 1441 → 1283 |
-| 3072 | 78.70 ms | 30.17 ms | **26.58 ms** | **2.96×** (2.40× / 2.04×) | 71 → 185 | 2513 → 2200 |
-| 4096 | 136.00 ms | 48.47 ms | **43.94 ms** | **3.10×** (2.54× / 2.13×) | 73 → 204 | 3841 → 3323 |
+| d_model | BF16 step | NVFP4 | fused | **fused + residual** | **speedup** (fused / NVFP4) | linear TFLOPS, BF16 → NVFP4 | peak MiB, BF16 → fused + residual |
+|---|---|---|---|---|---|---|---|
+| 768 | 6.24 ms | 3.74 ms | 3.50 ms | **3.43 ms** | **1.82×** (1.78× / 1.67×) | 56 → 93 | 461 → 438 |
+| 1024 | 10.30 ms | 5.49 ms | 5.05 ms | **4.92 ms** | **2.09×** (2.04× / 1.87×) | 60 → 113 | 624 → 588 |
+| 2048 | 34.67 ms | 15.58 ms | 13.69 ms | **13.07 ms** | **2.65×** (2.53× / 2.23×) | 71 → 159 | 1441 → 1315 |
+| 3072 | 79.57 ms | 29.18 ms | 27.62 ms | **25.07 ms** | **3.17×** (2.88× / 2.73×) | 70 → 191 | 2513 → 2248 |
+| 4096 | 135.57 ms | 46.11 ms | 42.89 ms | **42.14 ms** | **3.22×** (3.16× / 2.94×) | 73 → 215 | 3841 → 3387 |
+
+v0.7 measured 1.80× / 1.96× / 2.40× / 2.97× / 2.88× for "fused" at the same widths (v0.3: up to
+3.10× at d=4096 in a cooler session); the v0.8 GEMM and quantizer changes lift every NVFP4 column.
+The residual fusion uses 1–3% more peak memory than "fused" (the fp32 residual-stream gradient is
+held while the norm backward runs).
 
 - **Split-K's share** at d=768 (where the 768×768 projection wgrad splits): 3.64 ms with
   `NVFP4_GEMM_SPLITS=1` vs 3.60 ms auto, about 1% of the step.
@@ -130,35 +150,40 @@ With `cache_weight_quantization=True` the NVFP4 copies of a weight are reused un
 step (or any other change) touches it, so under gradient accumulation every micro-batch after the
 first skips the weight quantizer. The table is the steady state of such a micro-batch (same session):
 
-| d_model | NVFP4 fused | + weight cache | saved | speedup vs BF16 | peak MiB |
+| d_model | fused + residual | + weight cache | saved | speedup vs BF16 | peak MiB |
 |---|---|---|---|---|---|
-| 768 | 3.58 ms | 3.49 ms | 2.4% | 1.74× → 1.78× | 427 → 431 |
-| 1024 | 5.20 ms | 5.08 ms | 2.4% | 1.96× → 2.01× | 572 → 577 |
-| 2048 | 14.20 ms | 13.62 ms | 4.1% | 2.40× → 2.51× | 1283 → 1310 |
-| 3072 | 26.73 ms | 25.37 ms | 5.1% | 2.97× → 3.13× | 2200 → 2261 |
-| 4096 | 47.05 ms | 44.33 ms | 5.8% | 2.88× → 3.05× | 3323 → 3432 |
+| 768 | 3.43 ms | 3.33 ms | 2.8% | 1.82× → 1.87× | 438 → 444 |
+| 1024 | 4.92 ms | 4.77 ms | 3.0% | 2.09× → 2.16× | 588 → 594 |
+| 2048 | 13.07 ms | 12.96 ms | 0.8% | 2.65× → 2.67× | 1315 → 1342 |
+| 3072 | 25.07 ms | 23.82 ms | 5.0% | 3.17× → 3.34× | 2248 → 2310 |
+| 4096 | 42.14 ms | 38.78 ms | 8.0% | 3.22× → **3.50×** | 3387 → 3496 |
 
 The cached copies cost ~1.1 bytes per weight element.
 
-### 3.2 Llama-style block (v0.7, `bench/results/llama_block.json`)
+### 3.2 Llama-style block (v0.7–v0.8, `bench/results/llama_block.json`)
 
 One Llama-style block: RMSNorm, qkv, causal SDPA, o_proj, RMSNorm and a SwiGLU MLP (hidden ≈ 8/3·d,
 rounded to 256), forward and backward on 8192 tokens with BF16 autocast. "NVFP4" converts the five
 linears; "fused" uses `rmsnorm_linear` / `rmsnorm_swiglu_mlp` (RMSNorm and SwiGLU and its backward
 inside the quantizers, one quantization of the normalized input shared by gate and up, fused wgrad
-accumulation); "+ cache" adds the weight cache (micro-batches after the first).
+accumulation; the v0.7 API); "fused + residual" adds the v0.8 fusions (q / k / v chunks, residual
+handle into the o_proj epilogue, `residual=True` MLP); "+ cache" adds the weight cache (micro-batches
+after the first). Two passes in opposite orders, best kept.
 
-| d_model (hidden) | BF16 step | NVFP4 | **fused** | **+ cache** | peak MiB, BF16 → NVFP4 → fused |
-|---|---|---|---|---|---|
-| 1024 (2816) | 11.03 ms | 6.51 ms (1.70×) | **5.86 ms (1.88×)** | **5.69 ms (1.94×)** | 688 → 648 → 601 |
-| 2048 (5632) | 39.03 ms | 17.05 ms (2.29×) | **15.00 ms (2.60×)** | **15.01 ms (2.60×)** | 1541 → 1426 → 1330 |
-| 3072 (8192) | 79.71 ms | 32.33 ms (2.47×) | **28.17 ms (2.83×)** | **27.98 ms (2.85×)** | 2601 → 2374 → 2243 |
-| 4096 (11008) | 140.26 ms | 51.72 ms (2.71×) | **47.32 ms (2.96×)** | **44.88 ms (3.13×)** | 3965 → 3569 → 3395 |
+| d_model (hidden) | BF16 step | NVFP4 | fused | **fused + residual** | **+ cache** | peak MiB, BF16 → NVFP4 → fused → + residual |
+|---|---|---|---|---|---|---|
+| 1024 (2816) | 11.05 ms | 6.48 ms (1.70×) | 5.68 ms (1.95×) | **5.29 ms (2.09×)** | **5.14 ms (2.15×)** | 688 → 648 → 601 → 618 |
+| 2048 (5632) | 39.28 ms | 17.82 ms (2.20×) | 14.85 ms (2.64×) | **13.71 ms (2.87×)** | **13.12 ms (2.99×)** | 1541 → 1426 → 1330 → 1361 |
+| 3072 (8192) | 80.83 ms | 32.03 ms (2.52×) | 28.75 ms (2.81×) | **26.39 ms (3.06×)** | **23.99 ms (3.37×)** | 2601 → 2374 → 2243 → 2291 |
+| 4096 (11008) | 141.50 ms | 50.15 ms (2.82×) | 45.43 ms (3.11×) | **42.58 ms (3.32×)** | **38.91 ms (3.64×)** | 3965 → 3569 → 3395 → 3459 |
 
-- The fusion is 9–14% faster than NVFP4Linear with PyTorch's RMSNorm / SiLU, and uses 5–8% less memory.
-- The first version was no faster than unfused: its RMSNorm backward was ~10 separate fp32 PyTorch
-  ops (2+ ms per step at d=2048). It now calls PyTorch's fused RMSNorm-backward kernel
-  (`aten._fused_rms_norm_backward`, PyTorch ≥ 2.9; the fp32 formula remains as the fallback).
+- v0.7 measured 1.88× / 2.60× / 2.83× / 2.96× for "fused" and up to 3.13× with the cache.
+- The residual fusion saves 6–8% over "fused": at d=4096 it removes ~3.4 ms of the 0.7 step's 39.4 ms
+  of GPU time (the q / k / v gradient stack and copy, both residual adds, the residual-gradient sums
+  and a bf16 cast; [DESIGN.md §3.6](DESIGN.md)).
+- The first v0.7 version was no faster than unfused: its RMSNorm backward was ~10 separate fp32
+  PyTorch ops. v0.7 used PyTorch's fused RMSNorm-backward kernel; v0.8 replaces it with its own kernel
+  that also produces dw and adds the residual gradient in the same pass.
 
 ## 4. End-to-end pretraining: GPT-124M (`experiments/results/`, `…/v0.2/`, `…/v0.3/`)
 
@@ -239,6 +264,11 @@ wgrad accumulation and fused producers; seed 0 of BF16 is the v0.2 BF16 run abov
 - **Throughput is stable:** +27.7% tokens/s for NVFP4 on every seed (spread under 0.2%), the same as
   v0.3's single run, so v0.5's integration work cost no end-to-end speed.
 - Peak GPU temperature 76–79 °C; each NVFP4 run took 630 s, each BF16 run 805 s.
+
+**v0.8 rerun of seed 0** (`experiments/results/v0.8/`, residual-fused blocks, paired stochastic
+rounding, persistent GEMM): validation loss **1.5073** after 3000 steps vs v0.5's 1.5068 for the same
+seed (BF16: 1.4892), i.e. within the seed spread; 82.4k tokens/s vs 80.6k (+2.2% at this width,
+where the block step is small and attention / embeddings / the LM head are a large share); 613 s.
 
 ## 5. End-to-end pretraining: GPT-507M, d=2048 (`experiments/results/v0.2_wide/`, `…/v0.3_wide/`)
 

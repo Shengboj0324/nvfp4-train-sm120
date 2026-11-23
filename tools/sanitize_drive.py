@@ -41,8 +41,37 @@ norm = torch.nn.RMSNorm(128).to(d)
 up, qkv = NVFP4Linear(128, 256, bias=False).to(d), NVFP4Linear(128, 384, bias=False).to(d)
 (rmsnorm_swiglu_mlp(xg, norm, fc1, up, fc2).float().square().mean()
  + rmsnorm_linear(xg, norm, qkv).float().mean()).backward()
-for (m, n, k) in [(200, 72, 256), (130, 260, 1280), (64, 64, 2048)]:
+# v0.8: multi-part quantization with column sums, SwiGLU biases, norm backward (register rows / warp path)
+for R in (100, 130):
+    for dt in (torch.bfloat16, torch.float32):
+        parts = [torch.randn(R, 64, device=d, dtype=dt) for _ in range(3)]
+        ops.quantize_dual(parts, bias_grad=True, row_sr_seed=1, col_sr_seed=2, rht_seed=3, col_pad=128)
+        ops.quantize_dual(parts[0], bias_grad=True, row=False, col_pad=128)
+    xb = torch.randn(R, 64, device=d, dtype=torch.bfloat16)
+    bg, bu = torch.randn(64, device=d), torch.randn(64, device=d)
+    ops.swiglu_quantize_dual(xb, xb, bias_g=bg, bias_u=bu, rht_seed=1, col_pad=128)
+    for gate in (True, False):
+        ops.swiglu_backward_quantize_dual(xb, xb, xb, gate=gate, bias_g=bg, bias_u=bu, bias_grad=True,
+                                          row_sr_seed=1, col_sr_seed=2, rht_seed=1, col_pad=128)
+for (R, C) in [(100, 48), (37, 2048), (20, 6144), (5, 16384)]:
+    for dt in (torch.bfloat16, torch.float32):
+        xn = torch.randn(R, C, device=d, dtype=dt)
+        w, rstd, mean = torch.rand(C, device=d), torch.rand(R, device=d), torch.randn(R, device=d)
+        ops.norm_backward(torch.randn(R, C, device=d), xn, mean, rstd, w, dres=torch.randn_like(xn), need_db=True)
+        ops.norm_backward(torch.randn(R, C, device=d), xn, None, rstd, w, need_dx=False)
+xg2 = torch.randn(2, 50, 128, device=d, requires_grad=True)
+lin3, o = NVFP4Linear(128, 384).to(d), NVFP4Linear(128, 128).to(d)
+g2, u2, d2 = NVFP4Linear(128, 256).to(d), NVFP4Linear(128, 256).to(d), NVFP4Linear(256, 128).to(d)
+with torch.autocast("cuda", dtype=torch.bfloat16):
+    q, k, v, res = rmsnorm_linear(xg2, norm, lin3, chunks=3, return_residual=True)
+    h = o(q * k + v, residual=res)
+    out = rmsnorm_swiglu_mlp(h, norm, g2, u2, d2, residual=True)
+out.float().square().mean().backward()
+# GEMMs: both main loops, split-K, accumulate, epilogue; the persistent TMA loop with more work units than
+# SMs (2048x2048: 256 tiles; with splits 3: 768 units) and ragged edges
+for (m, n, k) in [(200, 72, 256), (130, 260, 1280), (64, 64, 2048), (2048, 2000, 512)]:
     qa = ops.quantize(torch.randn(m, k, device=d)); qb = ops.quantize(torch.randn(n, k, device=d))
+    bias, res = torch.randn(n, device=d), torch.randn(m, n, device=d)
     for impl in ("tma", "cp.async"):
         for s in (1, 3):
             if impl == "tma" and k % 256:
@@ -50,5 +79,7 @@ for (m, n, k) in [(200, 72, 256), (130, 260, 1280), (64, 64, 2048)]:
             ops.gemm(qa, qb, impl=impl, splits=s)
             out = torch.zeros(m, n, device=d)
             ops.gemm(qa, qb, out=out, accumulate=True, impl=impl, splits=s)
+            ops.gemm(qa, qb, torch.bfloat16, bias=bias, residual=res, impl=impl, splits=s)
+            ops.gemm(qa, qb, torch.float32, bias=bias, residual=res.bfloat16(), impl=impl, splits=s)
 torch.cuda.synchronize()
 print("DRIVE_OK")

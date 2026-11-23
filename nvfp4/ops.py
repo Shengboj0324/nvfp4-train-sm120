@@ -66,16 +66,30 @@ def quantize(x: torch.Tensor, *, transpose: bool = False, block_2d: bool = False
     return NVFP4Tensor(d, s, g)
 
 
-def quantize_dual(x: torch.Tensor, *, row: bool = True, col: bool = True, block_2d: bool = False,
-                  row_sr_seed: Seed = None, col_sr_seed: Seed = None, rht_seed: Seed = None,
-                  col_pad: int = 16) -> tuple[NVFP4Tensor | None, NVFP4Tensor | None]:
+def quantize_dual(x: torch.Tensor | list[torch.Tensor] | tuple[torch.Tensor, ...], *, row: bool = True,
+                  col: bool = True, block_2d: bool = False, row_sr_seed: Seed = None, col_sr_seed: Seed = None,
+                  rht_seed: Seed = None, col_pad: int = 16, bias_grad: bool = False):
     """One read of ``x`` [R, C] -> (``x`` quantized along C, ``x.T`` quantized along R).
 
     The second output is padded with zero rows of ``x`` to a multiple of ``col_pad`` and optionally
     random-Hadamard transformed (``rht_seed``). ``*_sr_seed`` enables stochastic rounding for that
     output. With ``block_2d`` both use 16x16 tiles, so the col output is the exact transpose of the row
     output. Bit-identical to ``reference.quantize_dual`` (with the seeds' values).
+
+    ``x`` may also be a list of 1-3 same-shaped tensors: the input is then their concatenation along
+    dim 1, read in place (e.g. the q / k / v gradients of a fused qkv projection; not with ``block_2d``).
+    ``bias_grad=True`` also returns the column sums of ``x`` (fp32 [C], the gradient of a bias added to the
+    layer output ``x`` is the gradient of), from the same read: ``(row, col, bias_grad)``.
     """
+    if isinstance(x, (list, tuple)) or bias_grad:
+        parts = list(x) if isinstance(x, (list, tuple)) else [x]
+        if block_2d:
+            raise ValueError("block_2d is not supported for multi-part inputs / bias_grad")
+        outs = _lib.quantize_dual_parts(parts, row, col, *_seed_flags(row_sr_seed, col_sr_seed, rht_seed),
+                                        int(col_pad), *_seed_tensors(row_sr_seed, col_sr_seed, rht_seed),
+                                        bool(bias_grad))
+        pair = _pair(outs[:6], row, col)
+        return (*pair, outs[6].sum(0)) if bias_grad else pair
     outs = _lib.quantize_dual(x, row, col, block_2d, *_seed_flags(row_sr_seed, col_sr_seed, rht_seed), int(col_pad),
                               *_seed_tensors(row_sr_seed, col_sr_seed, rht_seed))
     return _pair(outs, row, col)
@@ -162,28 +176,48 @@ def rmsnorm_quantize_dual(x: torch.Tensor, weight: torch.Tensor, eps: float, *, 
     return (outs[0], *_pair(outs[1:], row, col))
 
 
-def swiglu_quantize_dual(g: torch.Tensor, u: torch.Tensor, *, row: bool = True, col: bool = True,
+def swiglu_quantize_dual(g: torch.Tensor, u: torch.Tensor, *, bias_g: torch.Tensor | None = None,
+                         bias_u: torch.Tensor | None = None, row: bool = True, col: bool = True,
                          row_sr_seed: Seed = None, col_sr_seed: Seed = None, rht_seed: Seed = None, col_pad: int = 16):
-    """Quantize ``silu(g) * u`` (bf16 gate / up projections, Llama's SwiGLU MLP) without writing it."""
+    """Quantize ``silu(g + bias_g) * (u + bias_u)`` (bf16 gate / up projections, Llama's SwiGLU MLP; the
+    optional per-column biases are added in fp32) without writing it."""
     outs = _lib.swiglu_quantize_dual(g, u, row, col, *_seed_flags(row_sr_seed, col_sr_seed, rht_seed), int(col_pad),
-                                     *_seed_tensors(row_sr_seed, col_sr_seed, rht_seed))
+                                     *_seed_tensors(row_sr_seed, col_sr_seed, rht_seed), bias_g, bias_u)
     return _pair(outs, row, col)
 
 
 def swiglu_backward_quantize_dual(dy: torch.Tensor, g: torch.Tensor, u: torch.Tensor, *, gate: bool,
-                                  row: bool = True, col: bool = True, row_sr_seed: Seed = None,
-                                  col_sr_seed: Seed = None, rht_seed: Seed = None, col_pad: int = 16):
+                                  bias_g: torch.Tensor | None = None, bias_u: torch.Tensor | None = None,
+                                  bias_grad: bool = False, row: bool = True, col: bool = True,
+                                  row_sr_seed: Seed = None, col_sr_seed: Seed = None, rht_seed: Seed = None,
+                                  col_pad: int = 16):
     """Quantize the gradient of ``silu(g) * u`` w.r.t. ``g`` (``gate=True``: ``dy * u * silu'(g)``) or w.r.t.
-    ``u`` (``gate=False``: ``dy * silu(g)``) from its output gradient ``dy`` (all bf16), without writing it."""
+    ``u`` (``gate=False``: ``dy * silu(g)``) from its output gradient ``dy`` (all bf16), without writing it.
+    ``g`` / ``u`` get the biases added first, as in swiglu_quantize_dual; ``bias_grad=True`` also returns the
+    gradient's column sums (the gradient of that projection's bias): ``(row, col, bias_grad)``."""
     outs = _lib.swiglu_backward_quantize_dual(dy, g, u, bool(gate), row, col,
                                               *_seed_flags(row_sr_seed, col_sr_seed, rht_seed), int(col_pad),
-                                              *_seed_tensors(row_sr_seed, col_sr_seed, rht_seed))
-    return _pair(outs, row, col)
+                                              *_seed_tensors(row_sr_seed, col_sr_seed, rht_seed), bias_g, bias_u,
+                                              bool(bias_grad))
+    pair = _pair(outs[:6], row, col)
+    return (*pair, outs[6].sum(0)) if bias_grad else pair
+
+
+def norm_backward(dy: torch.Tensor, x: torch.Tensor, mean: torch.Tensor | None, rstd: torch.Tensor,
+                  weight: torch.Tensor, *, dres: torch.Tensor | None = None, need_dx: bool = True,
+                  need_dw: bool = True, need_db: bool = False):
+    """LayerNorm (``mean`` given) or RMSNorm (``mean=None``) backward from the statistics the fused
+    quantizers return. ``dy``: gradient of the normalized output (fp32 [R, C]); ``dres`` (optional, x's
+    dtype) is added to dx, e.g. the gradient that reaches x through a residual connection. Returns
+    ``(dx, dweight, dbias)`` (None where not requested). Deterministic."""
+    dx, dw, db = _lib.norm_backward(dy, x, mean, rstd, weight, dres, bool(need_dx), bool(need_dw), bool(need_db))
+    return dx if need_dx else None, dw if need_dw else None, db if need_db else None
 
 
 def gemm(a: NVFP4Tensor, b: NVFP4Tensor, out_dtype: torch.dtype = torch.bfloat16, *,
          out: torch.Tensor | None = None, accumulate: bool = False, impl: str = "auto",
-         splits: int | None = None) -> torch.Tensor:
+         splits: int | None = None, bias: torch.Tensor | None = None,
+         residual: torch.Tensor | None = None) -> torch.Tensor:
     """D[M, N] = A[M, K] @ B[N, K]^T with both operands in NVFP4 (block-scaled tensor-core MMA).
 
     ``out`` writes into an existing contiguous [M, N] tensor; ``accumulate=True`` adds to it instead
@@ -191,10 +225,27 @@ def gemm(a: NVFP4Tensor, b: NVFP4Tensor, out_dtype: torch.dtype = torch.bfloat16
     ``impl``: "auto" (TMA main loop when K % 256 == 0, else cp.async), "tma" or "cp.async".
     ``splits``: number of K splits (0 = chosen from the grid size; None = $NVFP4_GEMM_SPLITS, default 0).
     The split-K reduction is deterministic but sums in a different order than an unsplit GEMM.
+
+    ``bias`` ([N]) / ``residual`` ([M, N], bf16 or fp32): the linear-layer epilogue, computed in the GEMM's
+    store, bit-identical to ``residual + (D_bf16.to(out_dtype) + bias.to(out_dtype))`` in PyTorch, where
+    ``D_bf16`` is the bf16 GEMM output (so ``out_dtype`` is the layer's output dtype; the result has dtype
+    ``promote(residual.dtype, out_dtype)``). Saves the separate bias / residual-add passes.
     """
     impl_id = {"auto": 0, "cp.async": 1, "tma": 2}[impl]
     if splits is None:
         splits = _DEFAULT_SPLITS
+    if bias is not None or residual is not None:
+        if out is not None or accumulate:
+            raise ValueError("bias / residual cannot be combined with out / accumulate")
+        dt = out_dtype if residual is None else torch.promote_types(residual.dtype, out_dtype)
+        if dt not in (torch.bfloat16, torch.float32):
+            raise ValueError(f"unsupported epilogue dtype {dt}")
+        b32 = None if bias is None else bias.to(out_dtype).float().contiguous()
+        res = None if residual is None else residual.contiguous()
+        if res is not None and res.dtype not in (torch.bfloat16, torch.float32):
+            res = res.to(dt)
+        return _lib.gemm(a.data, a.scales, a.gdec, b.data, b.scales, b.gdec, dt, impl_id, splits, b32, res,
+                         out_dtype == torch.bfloat16)
     if out is None:
         return _lib.gemm(a.data, a.scales, a.gdec, b.data, b.scales, b.gdec, out_dtype, impl_id, splits)
     _lib.gemm_out(a.data, a.scales, a.gdec, b.data, b.scales, b.gdec, out, accumulate, impl_id, splits)

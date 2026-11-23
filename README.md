@@ -2,11 +2,12 @@
 
 **4-bit (NVFP4) training on consumer Blackwell GPUs (RTX 50-series, `sm_120`).**
 
-The repository contains block-scaled FP4 tensor-core GEMMs (a TMA-fed main loop plus split-K),
-bit-exact fused quantizers that emit an operand and its transpose in one pass (with 16-point random
-Hadamard transform and stochastic rounding, and with LayerNorm / GELU computed inside the
-quantizer), and drop-in layers that run the forward, input-gradient and weight-gradient GEMMs in
-NVFP4 and save only 4-bit operands for backward.
+The repository contains block-scaled FP4 tensor-core GEMMs (a persistent TMA-fed main loop plus
+split-K, with bias / residual adds in the epilogue), bit-exact fused quantizers that emit an operand
+and its transpose in one pass (with 16-point random Hadamard transform and stochastic rounding, and
+with LayerNorm / RMSNorm / GELU / SwiGLU computed inside the quantizer), and drop-in layers and
+transformer sub-blocks that run the forward, input-gradient and weight-gradient GEMMs in NVFP4 and
+save only 4-bit operands for backward.
 
 Consumer Blackwell has hardware FP4 tensor cores, but its programming model differs from datacenter
 Blackwell: warp-level `mma.sync` instead of `tcgen05`, no tensor memory, and about 99 KB of shared
@@ -19,16 +20,17 @@ Full details and raw data are in [docs/RESULTS.md](docs/RESULTS.md).
 
 | | |
 |---|---|
-| NVFP4 GEMM throughput | **266–410 TFLOPS**: **3.2–4.7× BF16 cuBLAS**; on par with cuBLASLt NVFP4 on long K (96–121%), up to 2× faster on short K |
+| NVFP4 GEMM throughput | **273–441 TFLOPS**: **3.1–5.0× BF16 cuBLAS**; 0.91–1.98× cuBLASLt NVFP4 (above it on 10 of 11 shapes, up to 2× on short K) |
 | Fused dual quantizer | operand + transposed operand in one pass: **1.6–2.3×** faster than two separate quantizations |
-| Transformer block fwd+bwd | **1.80× (d=768) → 2.42× (d=2048) → 3.10× (d=4096)** vs BF16, with 7–14% less memory |
+| GPT block fwd+bwd (v0.8) | **1.82× (d=768) → 2.65× (d=2048) → 3.22× (d=4096)** vs BF16 (**3.50×** for micro-batches after the first, with the weight cache), 5–12% less memory |
 | GPT-507M (d=2048) pretraining | val loss **1.6954 vs 1.6786** BF16 (+1.0%), **1.62× tokens/s, −39% GPU energy** |
 | GPT-124M (d=768) pretraining, 49M tokens | val loss **1.5062 vs 1.4892** BF16 (constant ~0.017 gap, no divergence), **+27% tokens/s, −22% GPU energy** |
 | Same, three seeds (v0.5) | gap **+0.019 ± 0.002** nats (+1.28%), constant over training for every seed; +27.7% tokens/s |
 | Framework integration (v0.5) | `torch.compile(fullgraph=True)` without graph breaks (bit-identical to eager), CUDA-graph capture of whole training steps, no host syncs, DDP and FSDP2 bit-exact vs single process |
-| Llama-style block (v0.7) | RMSNorm + SwiGLU fused into the quantizers: **1.88× (d=1024) → 2.96× (d=4096)** vs BF16, 9–14% faster than unfused NVFP4; with the weight cache **up to 3.13×** |
+| Llama-style block (v0.7–v0.8) | RMSNorm, SwiGLU, residual adds and the q / k / v hand-off fused: **2.09× (d=1024) → 3.32× (d=4096)** vs BF16, 18–30% faster than unfused NVFP4; with the weight cache **up to 3.64×** |
+| v0.8 | persistent TMA GEMM (8–17% fewer cycles at locked clocks, 8192³ above cuBLASLt at the power limit); residual adds, biases and q / k / v fused into GEMM epilogues and a deterministic norm-backward kernel; post-norm blocks; stochastic rounding at half the hashing cost |
 | Platforms (v0.6) | Linux / WSL2 and **native Windows** (MSVC build, tests on the GPU, CI compile job); DDP, **FSDP1** and FSDP2 bit-exact; bitwise-reproducible training with PyTorch's flash attention in deterministic mode |
-| Correctness | quantizers and every fused producer (LayerNorm, RMSNorm, GELU tanh / exact, SwiGLU) **bit-exact** vs the reference spec; GEMM = fp64 reference to ~1e-7; 528 tests; compute-sanitizer clean (memcheck, racecheck, synccheck, initcheck); 8-minute soak with bit-exact replays |
+| Correctness | quantizers and every fused producer (LayerNorm, RMSNorm, GELU tanh / exact, SwiGLU, with biases) **bit-exact** vs the reference spec; fused blocks' outputs bit-identical to the unfused composition; GEMM = fp64 reference to ~1e-7; 637 tests; compute-sanitizer clean (memcheck, racecheck, synccheck, initcheck); soak runs with bit-exact replays |
 
 ![loss curves](experiments/results/v0.3_wide/loss.png)
 
@@ -60,11 +62,11 @@ y = layer(torch.randn(8192, 4096, device="cuda", dtype=torch.bfloat16))
 # or convert an existing model's block linears, keeping the last blocks in BF16:
 convert_linears(model.blocks, skip=("10.", "11."))
 
-# pre-norm sub-blocks with the normalization / activation fused into the NVFP4 quantizers
-from nvfp4 import layernorm_linear, layernorm_mlp, rmsnorm_linear, rmsnorm_swiglu_mlp
-qkv = layernorm_linear(x, block.ln1, block.qkv)           # GPT / BERT: LayerNorm (+ biases)
-out = layernorm_mlp(x, block.ln2, block.fc1, block.fc2)   # fc2(gelu(fc1(ln2(x)))), approximate="tanh"/"none"
-out = rmsnorm_swiglu_mlp(x, norm, gate, up, down)         # Llama: down(silu(gate(n)) * up(n)), n = norm(x)
+# transformer blocks with norm, activation and residual adds fused (Llama style; GPT: layernorm_*)
+from nvfp4 import rmsnorm_linear, rmsnorm_swiglu_mlp
+q, k, v, res = rmsnorm_linear(x, blk.norm1, blk.qkv, chunks=3, return_residual=True)
+x = blk.o_proj(attention(q, k, v), residual=res)          # x + o_proj(attn), add in the GEMM epilogue
+x = rmsnorm_swiglu_mlp(x, blk.norm2, blk.gate, blk.up, blk.down, residual=True)  # x + down(silu(g) * u)
 
 # reuse quantized weights across the micro-batches of an optimizer step
 convert_linears(model.blocks, cache_weight_quantization=True)
@@ -85,14 +87,16 @@ runs the same recipe through the pure-PyTorch reference.
 
 ```
 csrc/quantize_dual.cu  fused BF16/FP32 -> NVFP4 rowwise + transposed (RHT, SR, 16x16 2D) in one pass,
-                       optionally applying LayerNorm / GELU / GELU-backward while loading
+                       optionally applying LayerNorm / RMSNorm / GELU / SwiGLU (and backwards) while loading
 csrc/quantize.cu       single-output quantizer (rowwise / transposed / 16x16 2D, RHT, stochastic rounding)
-csrc/gemm_tma.cu       mma.sync kind::mxf4nvf4 block-scaled TN GEMM, TMA + mbarrier pipeline (K >= 1024)
+csrc/gemm_tma.cu       mma.sync kind::mxf4nvf4 block-scaled TN GEMM, persistent TMA + mbarrier pipeline
 csrc/gemm.cu           cp.async GEMM main loop (short K / fallback) and host dispatch
-csrc/gemm_common.cuh   shared epilogue: deterministic split-K, fused fp32 accumulate (D += A @ B^T)
+csrc/gemm_common.cuh   shared epilogue: deterministic split-K, fused fp32 accumulate, bias / residual add
+csrc/norm.cu           LayerNorm / RMSNorm backward (+ residual gradient), deterministic
 nvfp4/reference.py     executable spec of the format and recipe (pure PyTorch)
 nvfp4/linear.py        NVFP4Linear autograd layer + convert_linears
-nvfp4/fused.py         layernorm_linear / layernorm_mlp / rmsnorm_linear / rmsnorm_swiglu_mlp (fused producers)
+nvfp4/fused.py         layernorm_linear / layernorm_mlp / rmsnorm_linear / rmsnorm_swiglu_mlp / gelu_mlp /
+                       swiglu_mlp: fused transformer sub-blocks
 tests/                 bit-exact / reference tests (GPU tests auto-skip without sm_120)
 bench/                 GEMM, quantizer and transformer-block benchmarks (+ results/)
 experiments/           TinyStories GPT pretraining: BF16 vs NVFP4 (+ results/)
@@ -107,10 +111,10 @@ Verified on one GPU model (RTX 5090 Laptop) with the test, sanitizer and soak su
 end-to-end pretraining comparisons; validate the precision recipe on your own model before relying on
 it. The known gaps are listed in
 [docs/DESIGN.md §6](docs/DESIGN.md#6-known-limitations-and-next-steps):
-- at equal clocks the GEMM keeps the tensor pipe 69% busy vs cuBLASLt's 90% (the gap disappears at
-  this laptop's power limit, but would show on a GPU with more power headroom);
-- the fused sub-blocks cover GPT / BERT-style and Llama-style pre-norm blocks; attention-side
-  producers aren't fused;
+- at equal clocks the GEMM keeps the tensor pipe 71% busy vs cuBLASLt's ~90% (v0.7: 64%; the gap
+  disappears at this laptop's power limit, but would show on a GPU with more power headroom);
+- attention itself is PyTorch's BF16 SDPA (the projections, norms, activations and residual adds
+  around it are NVFP4 / fused);
 - hardware stochastic rounding (`cvt.rs`) isn't available on sm_120a, so SR runs in software;
 - tested on one GPU model; multi-process tests run two ranks on one GPU over gloo, so NCCL across
   several GPUs has only run with one rank.

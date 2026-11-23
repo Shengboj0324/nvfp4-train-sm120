@@ -89,9 +89,11 @@ def hash_u32(x: torch.Tensor) -> torch.Tensor:
 
 
 def sr_uniform(seed: int, index: torch.Tensor) -> torch.Tensor:
-    """Uniform [0, 1) fp32 for each linear element index; 24-bit resolution."""
-    h = hash_u32(hash_u32(index.to(torch.int64) ^ (seed & _M32)) + ((seed >> 32) & _M32))
-    return (h >> 8).to(torch.float32) * (1.0 / 16777216.0)
+    """Uniform [0, 1) fp32 for each linear element index, 16-bit resolution. Elements 2k and 2k + 1 share
+    one hash of the pair index k (keyed by the 64-bit seed): the low half for 2k, the high half for 2k + 1."""
+    index = index.to(torch.int64)
+    h = hash_u32(hash_u32((index >> 1) ^ (seed & _M32)) + ((seed >> 32) & _M32))
+    return ((h >> (16 * (index & 1))) & 0xFFFF).to(torch.float32) * (1.0 / 65536.0)
 
 
 def e2m1_round_stochastic(v: torch.Tensor, u: torch.Tensor) -> torch.Tensor:
@@ -349,14 +351,40 @@ def swiglu_backward_up(dy: torch.Tensor, g: torch.Tensor) -> torch.Tensor:
     return dy.float() * silu(g)
 
 
-def swiglu_quantize_dual(g, u, **kw):
-    """Spec of ops.swiglu_quantize_dual."""
-    return quantize_dual(swiglu(g, u), **kw)
+def swiglu_quantize_dual(g, u, *, bias_g=None, bias_u=None, **kw):
+    """Spec of ops.swiglu_quantize_dual (biases added in fp32)."""
+    return quantize_dual(swiglu(_gelu_input(g, bias_g), _gelu_input(u, bias_u)), **kw)
 
 
-def swiglu_backward_quantize_dual(dy, g, u, *, gate: bool, **kw):
+def swiglu_backward(dy, g, u, *, gate: bool, bias_g=None, bias_u=None):
+    """The gradient of silu(g + bias_g) * (u + bias_u) w.r.t. g (gate) or u, in fp32."""
+    g, u = _gelu_input(g, bias_g), _gelu_input(u, bias_u)
+    return swiglu_backward_gate(dy, g, u) if gate else swiglu_backward_up(dy, g)
+
+
+def swiglu_backward_quantize_dual(dy, g, u, *, gate: bool, bias_g=None, bias_u=None, **kw):
     """Spec of ops.swiglu_backward_quantize_dual."""
-    return quantize_dual(swiglu_backward_gate(dy, g, u) if gate else swiglu_backward_up(dy, g), **kw)
+    return quantize_dual(swiglu_backward(dy, g, u, gate=gate, bias_g=bias_g, bias_u=bias_u), **kw)
+
+
+def norm_backward(dy, x, mean, rstd, weight, dres=None):
+    """Spec of ops.norm_backward (fp32): LayerNorm if ``mean`` is given, else RMSNorm. Returns (dx, dw, db)."""
+    dy, xf, w = dy.float(), x.float(), weight.float()
+    n = (xf if mean is None else xf - mean.float()[:, None]) * rstd.float()[:, None]
+    g = dy * w
+    proj = n * (g * n).mean(-1, keepdim=True)
+    dx = rstd.float()[:, None] * (g - proj if mean is None else g - g.mean(-1, keepdim=True) - proj)
+    if dres is not None:
+        dx = dx + dres.float()
+    return dx.to(x.dtype), (dy * n).sum(0), dy.sum(0)
+
+
+def linear_epilogue(y_bf16, out_dtype, bias=None, residual=None):
+    """Spec of ops.gemm's bias / residual epilogue: residual + (y.to(out_dtype) + bias.to(out_dtype))."""
+    y = y_bf16.to(torch.bfloat16).to(out_dtype)
+    if bias is not None:
+        y = y + bias.to(out_dtype)
+    return y if residual is None else residual + y
 
 
 def unpack_codes(data: torch.Tensor) -> torch.Tensor:
