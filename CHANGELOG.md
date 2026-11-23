@@ -1,5 +1,30 @@
 # Changelog
 
+## 0.5.0 — training-stack integration (2026-11-22)
+
+- **Seeds on the GPU.** The layers draw their stochastic-rounding / RHT seeds with the CUDA generator
+  into a small int64 tensor that the quantizers read directly (the low-level ops accept an int or a
+  one-element int64 tensor per seed). A training step no longer synchronizes with the host, and
+  activation checkpointing restores the seeds with the CUDA RNG state.
+- **CUDA graphs:** whole training steps (forward, backward, optimizer) can be captured; every replay
+  draws fresh seeds. `tools/soak.py` now also trains a block through a captured graph.
+- **torch.compile:** the kernels are registered as `torch.library` custom ops (`nvfp4._library`), so
+  `fullgraph=True` compiles models with NVFP4 layers and the fused LayerNorm / MLP blocks without graph
+  breaks; with inductor's `fallback_random` the compiled step is bit-identical to eager.
+- **Fused wgrad accumulation works with DDP and FSDP2.** The accumulated gradient is handed to
+  autograd (adopted without a copy), so gradient hooks fire; under `torch.autograd.grad` it falls back
+  to the ordinary path instead of touching `.grad`.
+- **Layer outputs are not views** (like `nn.Linear`): FSDP2 warned about views returned by modules.
+- **New tests** (`tests/test_integration_cuda.py`): device seeds bit-identical to int seeds, no host
+  sync in a training step, compile without graph breaks, CUDA-graph training, fused accumulation
+  hooks, and two-process DDP / FSDP2 (gloo) bit-exact against a single-process reference. 321 tests.
+- Performance: per-kernel GPU time unchanged; a transformer-block step is within ~1% of 0.4.0
+  (+0.5–1.5% at d = 768–2048, A/B in one session).
+- **Quality over three seeds** (GPT-124M, 49M tokens): NVFP4 − BF16 validation loss +0.019 ± 0.002
+  nats (+1.28%), constant over training for every seed, +27.7% tokens/s (RESULTS.md §4.1).
+- Tooling: `tools/guard.py` also waits for the host load average to settle before starting a job;
+  the sanitizer driver covers device seeds and a layer forward + backward (0 findings).
+
 ## 0.4.0 — production hardening (2026-11-22)
 
 - **Fixed: NaN inputs were silently quantized to finite values.** `fmaxf` drops NaN, so the global

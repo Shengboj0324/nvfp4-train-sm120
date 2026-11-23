@@ -11,8 +11,11 @@ There are three versions of the stack ([DESIGN.md](DESIGN.md) has the details):
 - **v0.1** quantized each operand with a separate kernel and saved BF16 activations for backward.
 - **v0.2** added the fused dual quantizer (one read per operand), NVFP4-saved activations, the
   hardware E2M1 convert and optional fused wgrad accumulation.
-- **v0.3** (current) adds the TMA GEMM main loop, split-K for small output grids, and LayerNorm /
+- **v0.3** adds the TMA GEMM main loop, split-K for small output grids, and LayerNorm /
   GELU / GELU-backward fused into quantization.
+- **v0.4 / v0.5** (current) did not change the kernels' speed: v0.4 hardened them (NaN propagation,
+  checks, sanitizers), v0.5 moved the rounding seeds to the GPU and integrated the layers with
+  `torch.compile`, CUDA graphs, DDP and FSDP2. v0.5 adds a three-seed quality study (§4.1).
 
 Raw data sits next to each table: `bench/results/*.json` and `experiments/results/**`.
 Every benchmark checks correctness against the fp64 reference before timing. Timings are the
@@ -173,6 +176,32 @@ method).
 - **The wgrad RHT is not measurable here.** At this scale its effect (0.001) is below what one run
   per configuration can resolve. NVIDIA reports that it matters for much larger models and longer
   runs, where outlier-heavy gradients appear. We don't claim a benefit we didn't measure.
+
+### 4.1 Three seeds (v0.5, `experiments/results/v0.5_seeds/`)
+
+The comparison above uses one seed. To check that the gap is not luck, the same setup was repeated
+with seeds 0, 1 and 2 for both precisions (`experiments/run_v05_seeds.sh`; the seed changes the
+initialization, the data order and the rounding seeds). NVFP4 runs use the v0.5 stack with fused
+wgrad accumulation and fused producers; seed 0 of BF16 is the v0.2 BF16 run above.
+
+![three seeds](../experiments/results/v0.5_seeds/seeds.png)
+
+| seed | BF16 val loss | NVFP4 val loss | gap (same seed) | BF16 tokens/s | NVFP4 tokens/s |
+|---|---|---|---|---|---|
+| 0 | 1.4892 | 1.5068 | +0.0176 (+1.18%) | 63,295 | 80,624 |
+| 1 | 1.4922 | 1.5112 | +0.0189 (+1.27%) | 63,018 | 80,575 |
+| 2 | 1.4892 | 1.5100 | +0.0209 (+1.40%) | 63,045 | 80,524 |
+| **mean ± std** | 1.4902 ± 0.0018 | 1.5093 ± 0.0023 | **+0.0191 ± 0.0016 (+1.28%)** | 63,119 | **80,574 (+27.7%)** |
+
+- **The gap is reproducible:** +0.018 to +0.021 for every seed, a standard deviation of 0.0016 across
+  seeds. It is about ten times the seed-to-seed spread of either precision alone, so it is a real,
+  small cost of the format, not noise; and it is consistent with every earlier single-seed run
+  (+0.017 to +0.020).
+- **It stays constant during training** for all three seeds (right panel): after the first 1000
+  steps it moves within +0.014 to +0.021 and does not grow.
+- **Throughput is stable:** +27.7% tokens/s for NVFP4 on every seed (spread under 0.2%), the same as
+  v0.3's single run, so v0.5's integration work cost no end-to-end speed.
+- Peak GPU temperature 76–79 °C; each NVFP4 run took 630 s, each BF16 run 805 s.
 
 ## 5. End-to-end pretraining: GPT-507M, d=2048 (`experiments/results/v0.2_wide/`, `…/v0.3_wide/`)
 
