@@ -312,6 +312,63 @@ This run tests the claim from §3 that wider models gain more.
 - Results on a desktop RTX 5090, which has twice the SMs and three times the power budget, will
   differ.
 
+## 6. Desktop RTX 5090 ×2, rented (`experiments/results/rtx5090_desktop_2gpu/`)
+
+One session on 2026-11-23 on a rented Community-Cloud machine: **2× GeForce RTX 5090** (170 SMs, 32 GB,
+517 W power limit, up to 3090 MHz), driver 615.71, **CUDA 12.8 and PyTorch 2.11.0+cu128** (older than
+the laptop's 13.0 / 2.14.1, so this also checks the build on another toolchain). v0.8.0 as released;
+`tools/pod_session.sh` ran everything unattended.
+
+**Correctness.** 625 tests passed (12 skipped, the same parametrize exclusions as on the laptop),
+including **the five two-GPU NCCL tests across two physical GPUs** (DDP, DDP with bucket views, FSDP1,
+FSDP2, weight cache: gradients bit-identical to a single process). compute-sanitizer memcheck,
+racecheck, synccheck and initcheck: 0 findings. 5-minute soak: 28,047 iterations, 5,610 bit-exact
+replays, 140,235 GEMMs re-checked.
+
+**GEMM (TFLOPS)** — the persistent TMA loop at full desktop power:
+
+| M × N × K | BF16 cuBLAS | **NVFP4, this repo** | NVFP4 cuBLASLt | ours / cuBLASLt |
+|---|---|---|---|---|
+| 2048³ | 159 | **686** | 520 | 1.32 |
+| 4096³ | 167 | **973** | 809 | 1.20 |
+| 8192³ | 209 | **1027** | 856 | 1.20 |
+| 8192×8192×2048 | 203 | **899** | 549 | 1.64 |
+| 8192×2048×8192 | 168 | **987** | 921 | 1.07 |
+| 2048×8192×8192 | 169 | **989** | 917 | 1.08 |
+| 8192×3072×768 | 183 | **594** | 347 | 1.71 |
+| 8192×768×3072 | 123 | **802** | 693 | 1.16 |
+| 768×3072×8192 | 183 | **1002** | 923 | 1.09 |
+| 768×768×8192 (split-K) | 168 | **381** | 292 | 1.30 |
+| 2304×768×8192 | 194 | **796** | 775 | 1.03 |
+
+The locked-clock gap of [DESIGN.md §4.2](DESIGN.md) does **not** show up with the desktop part's power
+headroom: the kernel is at or above cuBLASLt on every shape (1.03–1.71×) and reaches 1.03 PFLOPS,
+61% of NVIDIA's 1676 TFLOPS dense-FP4 figure for this GPU.
+
+**Block step** (8192 tokens, BF16 autocast, same benchmarks as §3):
+
+| d_model | GPT: BF16 | GPT: fused + residual | + cache | Llama: BF16 | Llama: fused + residual | + cache |
+|---|---|---|---|---|---|---|
+| 768 / 1024 | 2.91 ms | 2.31 ms (1.26×) | 2.20 ms (1.32×) | 5.67 ms (d=1024) | 2.70 ms (2.10×) | 2.51 ms (2.26×) |
+| 2048 | 16.15 ms | 5.43 ms (2.98×) | 5.22 ms (3.09×) | 17.54 ms | 5.75 ms (3.05×) | 5.53 ms (3.17×) |
+| 3072 | 32.31 ms | 10.23 ms (3.16×) | 9.70 ms (3.33×) | 34.13 ms | 10.63 ms (3.21×) | 10.09 ms (3.38×) |
+| 4096 | 55.66 ms | 17.03 ms (3.27×) | 16.10 ms (3.46×) | 57.75 ms | 17.51 ms (3.30×) | 16.52 ms (3.49×) |
+
+At d = 768–1024 a whole block step takes ~2.3 ms on this GPU and the step is bound by kernel launches
+(Python and the dispatcher), so the gain there is small; CUDA-graph capture of the training step
+(supported, [USAGE.md §5](USAGE.md)) is the remedy at that size.
+
+**GPT-124M, 3000 steps, one GPU:** NVFP4 val loss **1.5070** vs BF16 **1.4880** (the laptop: 1.5073 vs
+1.4892), **192k vs 145k tokens/s (+32%)**.
+
+**Two GPUs, DDP over NCCL:** trains correctly (NVFP4 val 1.5103 after 3000 steps with the global
+batch split over two ranks) but at only 56k tokens/s. The machine is the limit: NCCL reported
+peer-to-peer disabled between the two cards, all-reduce ran over host shared memory at **2.0 GB/s bus
+bandwidth** (`tools/allreduce_probe.py`: 273 ms for 512 MB; a GPT-124M step all-reduces ~500 MB of fp32
+gradients), and plain BF16 DDP on the same machine is just as slow (55k vs 145k tokens/s on one GPU;
+`pass2/`). Data-parallel scaling on consumer cards needs a host with P2P or fast PCIe between them, or
+gradients communicated in lower precision.
+
 ## Reproduce
 
 ```bash

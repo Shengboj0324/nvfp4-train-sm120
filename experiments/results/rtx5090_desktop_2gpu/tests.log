@@ -1,0 +1,28 @@
+ss..........ss..........ss.............................................. [ 11%]
+........................................................................ [ 22%]
+........................................................................ [ 33%]
+........................................................................ [ 45%]
+........................................................................ [ 56%]
+........................................................................ [ 67%]
+...................................................s...........s.....s.. [ 79%]
+.....................s...........s.....s................................ [ 90%]
+.............................................................            [100%]
+=============================== warnings summary ===============================
+tests/test_fused_llama.py: 14 warnings
+  /workspace/venv/lib/python3.10/site-packages/torch/jit/_script.py:365: DeprecationWarning: `torch.jit.script_method` is deprecated. Please switch to `torch.compile` or `torch.export`.
+    warnings.warn(
+
+tests/test_fused_residual.py::test_llama_block_v08_forward_exact_and_gradients[dtype1-False]
+  /workspace/venv/lib/python3.10/site-packages/torch/nn/functional.py:2954: UserWarning: Mismatch dtype between input and weight: input dtype = c10::BFloat16, weight dtype = float, Cannot dispatch to fused implementation. (Triggered internally at /pytorch/aten/src/ATen/native/layer_norm.cpp:344.)
+    return torch.rms_norm(input, normalized_shape, weight, eps)
+
+tests/test_integration_cuda.py::test_training_step_has_no_host_sync
+  /workspace/venv/lib/python3.10/site-packages/torch/cuda/__init__.py:1270: UserWarning: Synchronization debug mode is a prototype feature and does not yet detect all synchronizing operations (Triggered internally at /pytorch/torch/csrc/cuda/Module.cpp:1003.)
+    torch._C._cuda_set_sync_debug_mode(debug_mode)
+
+-- Docs: https://docs.pytest.org/en/stable/how-to/capture-warnings.html
+=========================== short test summary info ============================
+SKIPPED [6] tests/test_epilogue_cuda.py:25: no epilogue
+SKIPPED [6] tests/test_quantize_dual_cuda.py:48: 2D blocks need rows % 16 == 0
+625 passed, 12 skipped, 16 warnings in 81.56s (0:01:21)
+[guard] elapsed 87s | peak GPU temp 37C, power 108W, GPU mem 5662MB | min host mem avail 625310MB | cooldown 0s

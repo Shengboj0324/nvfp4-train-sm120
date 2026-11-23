@@ -29,6 +29,7 @@ Full details and raw data are in [docs/RESULTS.md](docs/RESULTS.md).
 | Framework integration (v0.5) | `torch.compile(fullgraph=True)` without graph breaks (bit-identical to eager), CUDA-graph capture of whole training steps, no host syncs, DDP and FSDP2 bit-exact vs single process |
 | Llama-style block (v0.7–v0.8) | RMSNorm, SwiGLU, residual adds and the q / k / v hand-off fused: **2.09× (d=1024) → 3.32× (d=4096)** vs BF16, 18–30% faster than unfused NVFP4; with the weight cache **up to 3.64×** |
 | v0.8 | persistent TMA GEMM (8–17% fewer cycles at locked clocks, 8192³ above cuBLASLt at the power limit); residual adds, biases and q / k / v fused into GEMM epilogues and a deterministic norm-backward kernel; post-norm blocks; stochastic rounding at half the hashing cost |
+| Desktop RTX 5090 ×2 (v0.8, rented) | GEMM **up to 1027 TFLOPS, 1.03–1.71× cuBLASLt** on every shape; GPT block 3.27× BF16 (3.46× cached), Llama 3.30× (3.49×); GPT-124M +32% tokens/s at the same loss; **NCCL across two GPUs** bit-exact (DDP, FSDP1, FSDP2); 625 tests + sanitizers clean on CUDA 12.8 / PyTorch 2.11 |
 | Platforms (v0.6) | Linux / WSL2 and **native Windows** (MSVC build, tests on the GPU, CI compile job); DDP, **FSDP1** and FSDP2 bit-exact; bitwise-reproducible training with PyTorch's flash attention in deterministic mode |
 | Correctness | quantizers and every fused producer (LayerNorm, RMSNorm, GELU tanh / exact, SwiGLU, with biases) **bit-exact** vs the reference spec; fused blocks' outputs bit-identical to the unfused composition; GEMM = fp64 reference to ~1e-7; 637 tests; compute-sanitizer clean (memcheck, racecheck, synccheck, initcheck); soak runs with bit-exact replays |
 
@@ -107,8 +108,8 @@ docs/                  USAGE.md (integration guide), DESIGN.md, RESULTS.md, rese
 
 ## Status and limitations
 
-Verified on one GPU model (RTX 5090 Laptop) with the test, sanitizer and soak suites above and two
-end-to-end pretraining comparisons; validate the precision recipe on your own model before relying on
+Verified on the RTX 5090 Laptop and on two rented desktop RTX 5090s with the test, sanitizer and
+soak suites above and end-to-end pretraining comparisons; validate the precision recipe on your own model before relying on
 it. The known gaps are listed in
 [docs/DESIGN.md §6](docs/DESIGN.md#6-known-limitations-and-next-steps):
 - at equal clocks the GEMM keeps the tensor pipe 71% busy vs cuBLASLt's ~90% (v0.7: 64%; the gap
@@ -116,8 +117,8 @@ it. The known gaps are listed in
 - attention itself is PyTorch's BF16 SDPA (the projections, norms, activations and residual adds
   around it are NVFP4 / fused);
 - hardware stochastic rounding (`cvt.rs`) isn't available on sm_120a, so SR runs in software;
-- tested on one GPU model; multi-process tests run two ranks on one GPU over gloo, so NCCL across
-  several GPUs has only run with one rank.
+- tested on the RTX 5090 Laptop and the desktop RTX 5090 (also two of them over NCCL); not yet on
+  the smaller RTX 50 parts.
 
 ## License
 

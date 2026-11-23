@@ -1,5 +1,15 @@
 # Changelog
 
+## Unreleased — validated on rented desktop RTX 5090s (2026-11-23)
+
+- **2× desktop RTX 5090** (CUDA 12.8, PyTorch 2.11): 625 tests incl. the two-GPU NCCL tests (DDP,
+  FSDP1, FSDP2 bit-exact across two physical GPUs), sanitizers clean, soak OK; GEMM up to 1027 TFLOPS,
+  1.03–1.71× cuBLASLt; GPT-124M +32% tokens/s at the same loss. DDP on that host was bound by a
+  2 GB/s all-reduce (no P2P), equally for BF16 (RESULTS.md §6). Results in
+  `experiments/results/rtx5090_desktop_2gpu/`.
+- `tools/allreduce_probe.py` (NCCL all-reduce bandwidth); shell scripts executable in git and
+  `tools/sanitize.sh` finds python / compute-sanitizer on any machine (found on the rented machine).
+
 ## 0.8.0 — residual / epilogue fusion, persistent GEMM, cheaper stochastic rounding (2026-11-23)
 
 - **Residual adds, biases and the q / k / v hand-off are fused** (DESIGN.md §3.6). The GEMM epilogue

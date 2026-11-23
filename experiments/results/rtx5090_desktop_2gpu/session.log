@@ -1,0 +1,145 @@
+== session start 2026-11-23T20:01:07Z
+
+==================== env ====================
+Mon Nov 23 20:01:07 2026       
++-----------------------------------------------------------------------------------------+
+| NVIDIA-SMI 615.71.09              KMD Version: 615.71.09     CUDA UMD Version: 13.4     |
++-----------------------------------------+------------------------+----------------------+
+| GPU  Name                 Persistence-M | Bus-Id          Disp.A | Volatile Uncorr. ECC |
+| Fan  Temp   Perf          Pwr:Usage/Cap |           Memory-Usage | GPU-Util  Compute M. |
+|                                         |                        |               MIG M. |
+|=========================================+========================+======================|
+|   0  NVIDIA GeForce RTX 5090        On  |   00000000:C7:00.0 Off |                  N/A |
+| 30%   33C    P8             29W /  517W |       2MiB /  32607MiB |      0%      Default |
+|                                         |                        |                  N/A |
++-----------------------------------------+------------------------+----------------------+
+|   1  NVIDIA GeForce RTX 5090        On  |   00000000:E3:00.0 Off |                  N/A |
+|  0%   28C    P8             14W /  517W |       2MiB /  32607MiB |      0%      Default |
+|                                         |                        |                  N/A |
++-----------------------------------------+------------------------+----------------------+
+
++-----------------------------------------------------------------------------------------+
+| Processes:                                                                              |
+|  GPU   GI   CI              PID   Type   Process name                        GPU Memory |
+|        ID   ID                                                               Usage      |
+|=========================================================================================|
+|  No running processes found                                                             |
++-----------------------------------------------------------------------------------------+
+index, name, compute_cap, memory.total [MiB], power.limit [W], clocks.max.sm [MHz], pcie.link.gen.max, pcie.link.width.max
+0, NVIDIA GeForce RTX 5090, 12.0, 32607 MiB, 517.50 W, 3090 MHz, 3, 16
+1, NVIDIA GeForce RTX 5090, 12.0, 32607 MiB, 517.50 W, 3090 MHz, 5, 16
+	[4mGPU0	GPU1	CPU Affinity	NUMA Affinity	GPU NUMA ID[0m
+GPU0	 X 	NODE	96-191,288-383	1		N/A
+GPU1	NODE	 X 	96-191,288-383	1		N/A
+
+Legend:
+
+  X    = Self
+  SYS  = Connection traversing PCIe as well as the SMP interconnect between NUMA nodes (e.g., QPI/UPI)
+  NODE = Connection traversing PCIe as well as the interconnect between PCIe Host Bridges within a NUMA node
+  PHB  = Connection traversing PCIe as well as a PCIe Host Bridge (typically the CPU)
+  PXB  = Connection traversing multiple PCIe bridges (without traversing the PCIe Host Bridge)
+  PIX  = Connection traversing at most a single PCIe bridge
+  NV#  = Connection traversing a bonded set of # NVLinks
+driver supports CUDA 
+nvcc 12.8 at /usr/local/cuda
+ERROR: Could not find a version that satisfies the requirement torch==2.14.1 (from versions: 2.7.0+cu128, 2.7.1+cu128, 2.8.0+cu128, 2.9.0+cu128, 2.9.1+cu128, 2.10.0+cu128, 2.11.0+cu128)
+ERROR: No matching distribution found for torch==2.14.1
+torch 2.11.0+cu128 cuda 12.8 ['NVIDIA GeForce RTX 5090', 'NVIDIA GeForce RTX 5090']
+3e22a95 Merge v0.8-fusion: residual / epilogue fusion, persistent GEMM, paired SR (0.8.0)
+== env: ok (80 s)
+
+==================== build ====================
+ptxas info    : Used 40 registers, used 1 barriers, 16680 bytes smem
+ptxas info    : Used 54 registers, used 1 barriers, 18968 bytes smem
+ptxas info    : Used 48 registers, used 1 barriers, 16680 bytes smem
+ptxas info    : Used 53 registers, used 1 barriers, 18968 bytes smem
+ptxas info    : Used 40 registers, used 1 barriers, 16680 bytes smem
+ptxas info    : Used 55 registers, used 1 barriers, 18968 bytes smem
+ptxas info    : Used 40 registers, used 1 barriers, 16680 bytes smem
+ptxas info    : Used 53 registers, used 1 barriers, 18968 bytes smem
+ptxas info    : Used 40 registers, used 1 barriers, 16680 bytes smem
+ptxas info    : Used 55 registers, used 1 barriers, 18968 bytes smem
+ptxas info    : Used 47 registers, used 1 barriers, 16680 bytes smem
+ptxas info    : Used 53 registers, used 1 barriers, 18968 bytes smem
+ptxas info    : Used 39 registers, used 1 barriers, 16680 bytes smem
+ptxas info    : Used 55 registers, used 1 barriers, 18968 bytes smem
+ptxas info    : Used 38 registers, used 1 barriers, 32 bytes smem
+ptxas info    : Used 48 registers, used 1 barriers, 16680 bytes smem
+ptxas info    : Used 53 registers, used 1 barriers, 18968 bytes smem
+ptxas info    : Used 30 registers, used 1 barriers, 32 bytes smem
+ptxas info    : Used 40 registers, used 1 barriers, 16680 bytes smem
+x86_64-linux-gnu-g++ -shared -Wl,-O1 -Wl,-Bsymbolic-functions -Wl,-Bsymbolic-functions -g -fwrapv -O2 -Wl,-Bsymbolic-functions -g -fwrapv -O2 -g -fstack-protector-strong -Wformat -Werror=format-security -Wdate-time -D_FORTIFY_SOURCE=2 /workspace/nvfp4-train-sm120/build/temp.linux-x86_64-3.10/csrc/bindings.o /workspace/nvfp4-train-sm120/build/temp.linux-x86_64-3.10/csrc/gemm.o /workspace/nvfp4-train-sm120/build/temp.linux-x86_64-3.10/csrc/gemm_tma.o /workspace/nvfp4-train-sm120/build/temp.linux-x86_64-3.10/csrc/norm.o /workspace/nvfp4-train-sm120/build/temp.linux-x86_64-3.10/csrc/quantize.o /workspace/nvfp4-train-sm120/build/temp.linux-x86_64-3.10/csrc/quantize_dual.o -L/workspace/venv/lib/python3.10/site-packages/torch/lib -L/usr/local/cuda/lib64 -lc10 -ltorch -ltorch_cpu -ltorch_python -lcudart -lc10_cuda -ltorch_cuda -o build/lib.linux-x86_64-3.10/nvfp4/_C.cpython-310-x86_64-linux-gnu.so
+== build: ok (52 s)
+
+==================== tests ====================
+
+tests/test_fused_residual.py::test_llama_block_v08_forward_exact_and_gradients[dtype1-False]
+  /workspace/venv/lib/python3.10/site-packages/torch/nn/functional.py:2954: UserWarning: Mismatch dtype between input and weight: input dtype = c10::BFloat16, weight dtype = float, Cannot dispatch to fused implementation. (Triggered internally at /pytorch/aten/src/ATen/native/layer_norm.cpp:344.)
+    return torch.rms_norm(input, normalized_shape, weight, eps)
+
+tests/test_integration_cuda.py::test_training_step_has_no_host_sync
+  /workspace/venv/lib/python3.10/site-packages/torch/cuda/__init__.py:1270: UserWarning: Synchronization debug mode is a prototype feature and does not yet detect all synchronizing operations (Triggered internally at /pytorch/torch/csrc/cuda/Module.cpp:1003.)
+    torch._C._cuda_set_sync_debug_mode(debug_mode)
+
+-- Docs: https://docs.pytest.org/en/stable/how-to/capture-warnings.html
+=========================== short test summary info ============================
+SKIPPED [6] tests/test_epilogue_cuda.py:25: no epilogue
+SKIPPED [6] tests/test_quantize_dual_cuda.py:48: 2D blocks need rows % 16 == 0
+625 passed, 12 skipped, 16 warnings in 81.56s (0:01:21)
+[guard] elapsed 87s | peak GPU temp 37C, power 108W, GPU mem 5662MB | min host mem avail 625310MB | cooldown 0s
+====================== 5 passed, 19 deselected in 23.48s =======================
+SOAK_OK 28047 iterations, 5610 replay checks, 140235 extra GEMMs, 28047 CUDA-graph training steps, 5.0 min
+== tests: FAILED (414 s)
+
+==================== bench ====================
+{'nvidia_smi': 'NVIDIA GeForce RTX 5090, 615.71.09, 517.50 W, 3090 MHz, 2625 MHz, 53\nNVIDIA GeForce RTX 5090, 615.71.09, 517.50 W, 3090 MHz, 180 MHz, 27', 'torch': '2.11.0+cu128', 'cuda': '12.8', 'device': 'NVIDIA GeForce RTX 5090', 'sms': 170, 'host': '9573d1c4651e'}
+{"M": 2048, "N": 2048, "K": 2048, "bf16_cublas_tflops": 159.04, "nvfp4_ours_tflops": 686.45, "nvfp4_cp_async_loop_tflops": 558.1, "nvfp4_ours_incl_quant_tflops": 426.73, "check_rel_err": 7.256459610971433e-08, "cublaslt_vs_ours_rel_diff": 0.005698596127331257, "nvfp4_cublaslt_tflops": 519.8, "after_shape_gpu_state": "2400 MHz, 51, 92.58 W\n180 MHz, 27, 14.84 W"}
+{"M": 4096, "N": 4096, "K": 4096, "bf16_cublas_tflops": 166.79, "nvfp4_ours_tflops": 973.4, "nvfp4_cp_async_loop_tflops": 764.05, "nvfp4_ours_incl_quant_tflops": 647.09, "check_rel_err": 8.907178283834583e-08, "cublaslt_vs_ours_rel_diff": 0.006180374883115292, "nvfp4_cublaslt_tflops": 808.53, "after_shape_gpu_state": "2400 MHz, 57, 104.46 W\n180 MHz, 27, 15.23 W"}
+{"M": 8192, "N": 8192, "K": 8192, "bf16_cublas_tflops": 208.68, "nvfp4_ours_tflops": 1026.52, "nvfp4_cp_async_loop_tflops": 760.93, "nvfp4_ours_incl_quant_tflops": 742.52, "check_rel_err": 6.4060394322496e-08, "cublaslt_vs_ours_rel_diff": 0.005719286855310202, "nvfp4_cublaslt_tflops": 855.57, "after_shape_gpu_state": "2167 MHz, 64, 529.02 W\n180 MHz, 27, 15.89 W"}
+{"M": 8192, "N": 8192, "K": 2048, "bf16_cublas_tflops": 203.08, "nvfp4_ours_tflops": 898.58, "nvfp4_cp_async_loop_tflops": 730.05, "nvfp4_ours_incl_quant_tflops": 698.0, "check_rel_err": 6.419877252028527e-08, "cublaslt_vs_ours_rel_diff": 0.004217823036015034, "nvfp4_cublaslt_tflops": 548.67, "after_shape_gpu_state": "2617 MHz, 63, 265.99 W\n172 MHz, 27, 15.42 W"}
+{"M": 8192, "N": 2048, "K": 8192, "bf16_cublas_tflops": 168.21, "nvfp4_ours_tflops": 986.68, "nvfp4_cp_async_loop_tflops": 771.26, "nvfp4_ours_incl_quant_tflops": 551.08, "check_rel_err": 7.539598101402589e-08, "cublaslt_vs_ours_rel_diff": 0.004704848397523165, "nvfp4_cublaslt_tflops": 921.21, "after_shape_gpu_state": "2542 MHz, 63, 265.97 W\n180 MHz, 27, 15.64 W"}
+{"M": 2048, "N": 8192, "K": 8192, "bf16_cublas_tflops": 168.62, "nvfp4_ours_tflops": 989.35, "nvfp4_cp_async_loop_tflops": 769.3, "nvfp4_ours_incl_quant_tflops": 553.54, "check_rel_err": 6.744539149394768e-08, "cublaslt_vs_ours_rel_diff": 0.005490702111274004, "nvfp4_cublaslt_tflops": 916.5, "after_shape_gpu_state": "2610 MHz, 61, 239.84 W\n180 MHz, 27, 15.95 W"}
+{"M": 8192, "N": 3072, "K": 768, "bf16_cublas_tflops": 183.37, "nvfp4_ours_tflops": 593.73, "nvfp4_cp_async_loop_tflops": 600.28, "nvfp4_ours_incl_quant_tflops": 494.27, "check_rel_err": 1.1318351056388565e-07, "cublaslt_vs_ours_rel_diff": 0.005444562993943691, "nvfp4_cublaslt_tflops": 346.53, "after_shape_gpu_state": "2625 MHz, 57, 262.01 W\n180 MHz, 27, 16.33 W"}
+{"M": 8192, "N": 768, "K": 3072, "bf16_cublas_tflops": 122.67, "nvfp4_ours_tflops": 801.83, "nvfp4_cp_async_loop_tflops": 602.67, "nvfp4_ours_incl_quant_tflops": 525.06, "check_rel_err": 5.689893356475295e-08, "cublaslt_vs_ours_rel_diff": 0.00467335619032383, "nvfp4_cublaslt_tflops": 693.41, "after_shape_gpu_state": "2625 MHz, 51, 262.01 W\n180 MHz, 27, 16.33 W"}
+{"M": 768, "N": 3072, "K": 8192, "bf16_cublas_tflops": 182.53, "nvfp4_ours_tflops": 1001.85, "nvfp4_cp_async_loop_tflops": 766.5, "nvfp4_ours_incl_quant_tflops": 588.24, "check_rel_err": 6.999188428835623e-08, "cublaslt_vs_ours_rel_diff": 0.005424065515398979, "nvfp4_cublaslt_tflops": 923.09, "after_shape_gpu_state": "2625 MHz, 57, 160.10 W\n180 MHz, 27, 16.09 W"}
+{"M": 768, "N": 768, "K": 8192, "bf16_cublas_tflops": 168.24, "nvfp4_ours_tflops": 380.8, "nvfp4_cp_async_loop_tflops": 196.4, "nvfp4_ours_incl_quant_tflops": 220.02, "check_rel_err": 6.648413375387463e-08, "cublaslt_vs_ours_rel_diff": 0.005066689103841782, "nvfp4_cublaslt_tflops": 292.42, "after_shape_gpu_state": "2625 MHz, 50, 88.45 W\n180 MHz, 27, 16.33 W"}
+{"M": 2304, "N": 768, "K": 8192, "bf16_cublas_tflops": 194.48, "nvfp4_ours_tflops": 795.71, "nvfp4_cp_async_loop_tflops": 586.32, "nvfp4_ours_incl_quant_tflops": 485.64, "check_rel_err": 6.302003896507813e-08, "cublaslt_vs_ours_rel_diff": 0.005211252719163895, "nvfp4_cublaslt_tflops": 774.91, "after_shape_gpu_state": "2625 MHz, 49, 97.48 W\n180 MHz, 27, 16.00 W"}
+[guard] elapsed 29s | peak GPU temp 64C, power 525W, GPU mem 6242MB | min host mem avail 629464MB | cooldown 0s
+{"shape": [768, 8192], "mode": "transpose", "us": 16.1, "eff_GBps": 1004.3}
+{"shape": [768, 8192], "mode": "transpose_rht_sr", "us": 18.0, "eff_GBps": 897.1}
+{"shape": [768, 8192], "mode": "rowwise_sr", "us": 14.8, "eff_GBps": 1088.6}
+{"case": "activation", "shape": [8192, 768], "dtype": "bfloat16", "separate_us": 37.17, "fused_us": 22.32, "speedup": 1.67, "fused_eff_GBps": 880.82}
+{"case": "activation", "shape": [8192, 3072], "dtype": "bfloat16", "separate_us": 135.31, "fused_us": 46.03, "speedup": 2.94, "fused_eff_GBps": 1708.53}
+{"case": "gradient", "shape": [8192, 2304], "dtype": "bfloat16", "separate_us": 93.04, "fused_us": 56.04, "speedup": 1.66, "fused_eff_GBps": 1052.42}
+{"case": "gradient", "shape": [8192, 8192], "dtype": "bfloat16", "separate_us": 546.04, "fused_us": 250.66, "speedup": 2.18, "fused_eff_GBps": 836.65}
+{"case": "weight", "shape": [3072, 768], "dtype": "float32", "separate_us": 29.22, "fused_us": 22.25, "speedup": 1.31, "fused_eff_GBps": 543.36}
+{"case": "weight", "shape": [8192, 2048], "dtype": "float32", "separate_us": 114.71, "fused_us": 34.46, "speedup": 3.33, "fused_eff_GBps": 2495.18}
+[guard] elapsed 3s | peak GPU temp 58C, power 240W, GPU mem 980MB | min host mem avail 630126MB | cooldown 0s
+{"d": 768, "bf16_ms": 2.911, "nvfp4_ms": 2.397, "nvfp4_fused_wgrad_ms": 2.407, "nvfp4_fused_ms": 2.386, "nvfp4_fused_cached_ms": 2.412, "nvfp4_fused_res_ms": 2.315, "nvfp4_fused_res_cached_ms": 2.202, "speedup": 1.214, "speedup_fused_wgrad": 1.209, "speedup_fused": 1.22, "speedup_fused_cached": 1.207, "speedup_fused_res": 1.258, "speedup_fused_res_cached": 1.322, "linear_tflops_bf16": 119.52, "linear_tflops_nvfp4": 145.141, "peak_mib_bf16": 413.088, "peak_mib_nvfp4": 373.499, "peak_mib_nvfp4_fused": 380.767, "peak_mib_nvfp4_fused_cached": 384.065, "peak_mib_nvfp4_fused_res": 392.892, "peak_mib_nvfp4_fused_res_cached": 396.065}
+{"d": 1024, "bf16_ms": 4.845, "nvfp4_ms": 2.318, "nvfp4_fused_wgrad_ms": 2.265, "nvfp4_fused_ms": 2.389, "nvfp4_fused_cached_ms": 2.268, "nvfp4_fused_res_ms": 2.351, "nvfp4_fused_res_cached_ms": 2.231, "speedup": 2.09, "speedup_fused_wgrad": 2.139, "speedup_fused": 2.028, "speedup_fused_cached": 2.136, "speedup_fused_res": 2.06, "speedup_fused_res_cached": 2.172, "linear_tflops_bf16": 127.66, "linear_tflops_nvfp4": 266.801, "peak_mib_bf16": 576.658, "peak_mib_nvfp4": 515.538, "peak_mib_nvfp4_fused": 523.79, "peak_mib_nvfp4_fused_cached": 530.542, "peak_mib_nvfp4_fused_res": 539.79, "peak_mib_nvfp4_fused_res_cached": 546.542}
+{"d": 2048, "bf16_ms": 16.155, "nvfp4_ms": 6.34, "nvfp4_fused_wgrad_ms": 6.112, "nvfp4_fused_ms": 5.583, "nvfp4_fused_cached_ms": 5.38, "nvfp4_fused_res_ms": 5.426, "nvfp4_fused_res_cached_ms": 5.223, "speedup": 2.548, "speedup_fused_wgrad": 2.643, "speedup_fused": 2.894, "speedup_fused_cached": 3.003, "speedup_fused_res": 2.978, "speedup_fused_res_cached": 3.093, "linear_tflops_bf16": 153.135, "linear_tflops_nvfp4": 390.18, "peak_mib_bf16": 1392.939, "peak_mib_nvfp4": 1244.946, "peak_mib_nvfp4_fused": 1234.946, "peak_mib_nvfp4_fused_cached": 1261.948, "peak_mib_nvfp4_fused_res": 1266.946, "peak_mib_nvfp4_fused_res_cached": 1293.948}
+{"d": 3072, "bf16_ms": 32.311, "nvfp4_ms": 12.201, "nvfp4_fused_wgrad_ms": 11.561, "nvfp4_fused_ms": 10.615, "nvfp4_fused_cached_ms": 10.057, "nvfp4_fused_res_ms": 10.231, "nvfp4_fused_res_cached_ms": 9.697, "speedup": 2.648, "speedup_fused_wgrad": 2.795, "speedup_fused": 3.044, "speedup_fused_cached": 3.213, "speedup_fused_res": 3.158, "speedup_fused_res_cached": 3.332, "linear_tflops_bf16": 172.273, "linear_tflops_nvfp4": 456.213, "peak_mib_bf16": 2465.221, "peak_mib_nvfp4": 2217.853, "peak_mib_nvfp4_fused": 2154.29, "peak_mib_nvfp4_fused_cached": 2213.667, "peak_mib_nvfp4_fused_res": 2202.29, "peak_mib_nvfp4_fused_res_cached": 2261.667}
+{"d": 4096, "bf16_ms": 55.66, "nvfp4_ms": 19.249, "nvfp4_fused_wgrad_ms": 18.388, "nvfp4_fused_ms": 17.515, "nvfp4_fused_cached_ms": 16.6, "nvfp4_fused_res_ms": 17.032, "nvfp4_fused_res_cached_ms": 16.096, "speedup": 2.892, "speedup_fused_wgrad": 3.027, "speedup_fused": 3.178, "speedup_fused_cached": 3.353, "speedup_fused_res": 3.268, "speedup_fused_res_cached": 3.458, "linear_tflops_bf16": 177.786, "linear_tflops_nvfp4": 514.075, "peak_mib_bf16": 3793.502, "peak_mib_nvfp4": 3424.509, "peak_mib_nvfp4_fused": 3276.509, "peak_mib_nvfp4_fused_cached": 3383.511, "peak_mib_nvfp4_fused_res": 3340.509, "peak_mib_nvfp4_fused_res_cached": 3447.511}
+[guard] elapsed 72s | peak GPU temp 65C, power 481W, GPU mem 7902MB | min host mem avail 628388MB | cooldown 0s
+{"d": 1024, "hidden": 2816, "bf16_ms": 5.671, "peak_mib_bf16": 640.955, "nvfp4_ms": 3.109, "peak_mib_nvfp4": 600.305, "nvfp4_fused_ms": 2.757, "peak_mib_nvfp4_fused": 552.603, "nvfp4_fused_cached_ms": 2.579, "peak_mib_nvfp4_fused_cached": 560.746, "nvfp4_fused_res_ms": 2.7, "peak_mib_nvfp4_fused_res": 569.478, "nvfp4_fused_res_cached_ms": 2.509, "peak_mib_nvfp4_fused_res_cached": 577.996, "speedup_nvfp4": 1.824, "speedup_nvfp4_fused": 2.057, "speedup_nvfp4_fused_cached": 2.199, "speedup_nvfp4_fused_res": 2.1, "speedup_nvfp4_fused_res_cached": 2.261}
+{"d": 2048, "hidden": 5632, "bf16_ms": 17.537, "peak_mib_bf16": 1492.846, "nvfp4_ms": 7.261, "peak_mib_nvfp4": 1378.727, "nvfp4_fused_ms": 6.129, "peak_mib_nvfp4_fused": 1282.416, "nvfp4_fused_cached_ms": 5.914, "peak_mib_nvfp4_fused_cached": 1309.855, "nvfp4_fused_res_ms": 5.747, "peak_mib_nvfp4_fused_res": 1314.416, "nvfp4_fused_res_cached_ms": 5.534, "peak_mib_nvfp4_fused_res_cached": 1341.855, "speedup_nvfp4": 2.415, "speedup_nvfp4_fused": 2.861, "speedup_nvfp4_fused_cached": 2.966, "speedup_nvfp4_fused_res": 3.052, "speedup_nvfp4_fused_res_cached": 3.169}
+{"d": 3072, "hidden": 8192, "bf16_ms": 34.131, "peak_mib_bf16": 2553.111, "nvfp4_ms": 13.647, "peak_mib_nvfp4": 2326.367, "nvfp4_fused_ms": 11.343, "peak_mib_nvfp4_fused": 2194.369, "nvfp4_fused_cached_ms": 10.835, "peak_mib_nvfp4_fused_cached": 2256.621, "nvfp4_fused_res_ms": 10.629, "peak_mib_nvfp4_fused_res": 2242.369, "nvfp4_fused_res_cached_ms": 10.095, "peak_mib_nvfp4_fused_res_cached": 2304.621, "speedup_nvfp4": 2.501, "speedup_nvfp4_fused": 3.009, "speedup_nvfp4_fused_cached": 3.15, "speedup_nvfp4_fused_res": 3.211, "speedup_nvfp4_fused_res_cached": 3.381}
+{"d": 4096, "hidden": 11008, "bf16_ms": 57.752, "peak_mib_bf16": 3917.377, "nvfp4_ms": 21.265, "peak_mib_nvfp4": 3522.573, "nvfp4_fused_ms": 18.472, "peak_mib_nvfp4_fused": 3348.697, "nvfp4_fused_cached_ms": 17.535, "peak_mib_nvfp4_fused_cached": 3459.137, "nvfp4_fused_res_ms": 17.506, "peak_mib_nvfp4_fused_res": 3414.697, "nvfp4_fused_res_cached_ms": 16.524, "peak_mib_nvfp4_fused_res_cached": 3523.637, "speedup_nvfp4": 2.716, "speedup_nvfp4_fused": 3.127, "speedup_nvfp4_fused_cached": 3.293, "speedup_nvfp4_fused_res": 3.299, "speedup_nvfp4_fused_res_cached": 3.495}
+[guard] elapsed 63s | peak GPU temp 66C, power 497W, GPU mem 8462MB | min host mem avail 626601MB | cooldown 0s
+== bench: ok (168 s)
+
+==================== gpt ====================
+train: 320221 stories, 63.7M tokens -> /workspace/nvfp4_data/train.bin
+val: 27630 stories, 5.5M tokens -> /workspace/nvfp4_data/val.bin
+gpt_bf16_1gpu.jsonl          final val 1.4880 at step 3000, median tok/s 145,232
+gpt_nvfp4_1gpu.jsonl         final val 1.5070 at step 3000, median tok/s 192,287
+gpt_nvfp4_ddp2.jsonl         final val 1.5103 at step 3000, median tok/s 56,164
+== gpt: ok (1567 s)
+
+== summary
+  env: ok
+  build: ok
+  tests: FAILED
+  bench: ok
+  gpt: ok

@@ -512,12 +512,11 @@ Done in v0.3: the TMA GEMM main loop (§4.1), split-K (§4.3) and LayerNorm/GELU
 quantization (§3.4). Done in v0.2: one fused read per operand, NVFP4-saved activations, in-place wgrad
 accumulation.
 
-1. **Locked-clock GEMM efficiency.** At equal clocks the TMA loop now keeps the tensor pipe 71% busy
-   vs cuBLASLt's ~90% (v0.7: 64%); what remains is per-warp OMMA issue spacing with two MMA warps per
-   scheduler (§4.2). Closing it needs cuBLASLt's warpgroup layout and `setmaxnreg`, i.e. tensor maps
-   in global memory instead of kernel parameters. It does not show at this laptop's power limit but
-   would on a GPU with more headroom (a desktop RTX 5090). A tile-contiguous scale layout (cuBLASLt's
-   "blocked" format) would remove the remaining scale traffic but changes the NVFP4 tensor format.
+1. **Locked-clock GEMM efficiency.** At equal clocks the TMA loop keeps the tensor pipe 71% busy vs
+   cuBLASLt's ~90% (v0.7: 64%); what remains is per-warp OMMA issue spacing with two MMA warps per
+   scheduler (§4.2). In practice it does not show: on a desktop RTX 5090 at full power the kernel is
+   1.03–1.71× cuBLASLt on every benchmarked shape, 1.03 PFLOPS at 8192³ (RESULTS.md §6). Closing it
+   would need cuBLASLt's warpgroup layout and `setmaxnreg` (tensor maps in global memory).
 2. **Attention itself** is PyTorch's BF16 SDPA (flash attention). The q / k / v hand-off and the
    residual adds around it are fused (§3.6); attention-score quantization (FP8 / FP4 attention) is out
    of scope.
@@ -530,11 +529,14 @@ accumulation.
 5. **Fused sub-blocks** cover GPT / BERT / ViT-style and Llama-style blocks, pre-norm or (via the
    norm-free MLPs) post-norm, with biases anywhere. Mixture-of-experts layers (grouped GEMMs) are not
    covered.
-6. **Framework coverage.** DDP, FSDP1 and FSDP2 are tested, but with two ranks on one GPU over gloo:
-   NCCL across several GPUs has only run with one rank (no multi-GPU machine available).
-   `DTensor.full_tensor()` over gloo with CUDA tensors crashes in PyTorch 2.14 (also for plain
-   `nn.Linear`); the tests gather shards on the CPU.
-7. **Platform.** Linux, WSL2 and native Windows build and pass the tests, but on one GPU model (RTX
-   5090 Laptop): other RTX 50 parts share the architecture (sm_120) but differ in SM count, clocks and
-   power limits, so the tile / split-K heuristics are tuned for this one. On Windows, inductor needs
-   Triton, which PyTorch's Windows wheels don't include.
+6. **Framework coverage.** DDP, FSDP1 and FSDP2 are tested with two ranks on one GPU over gloo and
+   (v0.8) with NCCL across two physical RTX 5090s, bit-identical to a single process. Data-parallel
+   *speed* depends on the host: on the rented two-GPU machine all-reduce ran at 2 GB/s (no P2P), so DDP
+   was communication-bound for BF16 and NVFP4 alike (RESULTS.md §6). `DTensor.full_tensor()` over gloo
+   with CUDA tensors crashes in PyTorch 2.14 (also for plain `nn.Linear`); the tests gather shards on
+   the CPU.
+7. **Platform.** Linux, WSL2 and native Windows build and pass the tests on the RTX 5090 Laptop, and
+   Linux on the desktop RTX 5090 (CUDA 12.8, PyTorch 2.11). The smaller RTX 50 parts (5080 / 5070 /
+   5060) share the architecture but have fewer SMs; the tile / split-K heuristics were tuned on the
+   82- and 170-SM parts. On Windows, inductor needs Triton, which PyTorch's Windows wheels don't
+   include.

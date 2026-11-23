@@ -1,0 +1,1 @@
+3e22a95 Merge v0.8-fusion: residual / epilogue fusion, persistent GEMM, paired SR (0.8.0)
