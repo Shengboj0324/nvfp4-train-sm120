@@ -22,6 +22,7 @@
 #include <cudaTypedefs.h>
 #include <cuda_runtime.h>
 
+#include <cstring>
 #include <stdexcept>
 #include <string>
 
@@ -102,6 +103,19 @@ __device__ __forceinline__ void tma_load_2d(uint32_t dst, const CUtensorMap* map
 struct Maps {
   const CUtensorMap *a, *b, *sa, *sb;
 };
+
+// The descriptors are passed to the kernel by value (__grid_constant__). CUDA 13 declares CUtensorMap
+// alignas(128) (12.x: 64), and MSVC cannot pass a by-value parameter aligned beyond 64 bytes (C2719).
+// TMA itself requires 64-byte-aligned descriptors, so under MSVC the kernel takes a 64-byte-aligned
+// copy with the same layout (tested on the GPU through the CUDA 12.9 Windows build, which is 64 too).
+#if defined(_MSC_VER)
+struct alignas(64) TmaParam {
+  cuuint64_t opaque[CU_TENSOR_MAP_NUM_QWORDS];
+};
+#else
+using TmaParam = CUtensorMap;
+#endif
+static_assert(sizeof(TmaParam) == sizeof(CUtensorMap) && alignof(TmaParam) >= 64, "tensor map parameter layout");
 
 // Barrier addresses (8 bytes each).
 __device__ __forceinline__ uint32_t full_bar(uint32_t bars, int s) { return bars + s * 8; }
@@ -265,14 +279,15 @@ __device__ __forceinline__ void steps(float (&acc)[MI][NI][4], Frag (&fr)[2], Sc
 
 template <typename OutT, bool kAccum>
 __global__ void __launch_bounds__(THREADS, 1)
-    nvfp4_gemm_tma_kernel(Args p, const __grid_constant__ CUtensorMap tm_a, const __grid_constant__ CUtensorMap tm_b,
-                          const __grid_constant__ CUtensorMap tm_sa, const __grid_constant__ CUtensorMap tm_sb) {
+    nvfp4_gemm_tma_kernel(Args p, const __grid_constant__ TmaParam tm_a, const __grid_constant__ TmaParam tm_b,
+                          const __grid_constant__ TmaParam tm_sa, const __grid_constant__ TmaParam tm_sb) {
   extern __shared__ uint8_t smem_raw[];
   uint8_t* smem = reinterpret_cast<uint8_t*>((reinterpret_cast<uintptr_t>(smem_raw) + 1023) & ~uintptr_t(1023));
   const uint32_t base = smem_u32(smem);
   const uint32_t bars = base + BAR_BASE;
   int* flag = reinterpret_cast<int*>(smem + BAR_BASE + (2 * STAGES + 2) * 8);
-  const Maps mp{&tm_a, &tm_b, &tm_sa, &tm_sb};
+  const Maps mp{reinterpret_cast<const CUtensorMap*>(&tm_a), reinterpret_cast<const CUtensorMap*>(&tm_b),
+                reinterpret_cast<const CUtensorMap*>(&tm_sa), reinterpret_cast<const CUtensorMap*>(&tm_sb)};
 
   const int warp = threadIdx.x >> 5, lane = threadIdx.x & 31;
   const int m0 = blockIdx.y * BM, n0 = blockIdx.x * BN;
@@ -361,7 +376,10 @@ void launch(const Args& p, const CUtensorMap (&maps)[4], dim3 grid, cudaStream_t
   static std::atomic<uint64_t> configured{0};
   const cudaError_t err = ensure_smem_attr(nvfp4_gemm_tma_kernel<OutT, kAccum>, SMEM_BYTES, configured);
   if (err != cudaSuccess) throw std::runtime_error(std::string("nvfp4 TMA GEMM: ") + cudaGetErrorString(err));
-  nvfp4_gemm_tma_kernel<OutT, kAccum><<<grid, THREADS, SMEM_BYTES, stream>>>(p, maps[0], maps[1], maps[2], maps[3]);
+  TmaParam prm[4];
+  static_assert(sizeof(prm) == sizeof(maps), "tensor map parameter layout");
+  std::memcpy(prm, maps, sizeof(prm));
+  nvfp4_gemm_tma_kernel<OutT, kAccum><<<grid, THREADS, SMEM_BYTES, stream>>>(p, prm[0], prm[1], prm[2], prm[3]);
 }
 
 }  // namespace tma
