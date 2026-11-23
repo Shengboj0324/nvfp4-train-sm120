@@ -13,7 +13,8 @@ There are three versions of the stack ([DESIGN.md](DESIGN.md) has the details):
   hardware E2M1 convert and optional fused wgrad accumulation.
 - **v0.3** adds the TMA GEMM main loop, split-K for small output grids, and LayerNorm /
   GELU / GELU-backward fused into quantization.
-- **v0.4 / v0.5** (current) did not change the kernels' speed: v0.4 hardened them (NaN propagation,
+- **v0.7** (current) adds the weight-quantization cache and fused Llama-style blocks (§3.1–3.2).
+- **v0.4 – v0.6** did not change the kernels' speed: v0.4 hardened them (NaN propagation,
   checks, sanitizers), v0.5 moved the rounding seeds to the GPU and integrated the layers with
   `torch.compile`, CUDA graphs, DDP and FSDP2. v0.5 adds a three-seed quality study (§4.1).
 
@@ -122,6 +123,42 @@ the extra CUDA memory allocated during the step.
   `NVFP4_GEMM_SPLITS=1` vs 3.60 ms auto, about 1% of the step.
 - **Why the benefit grows with width:** GEMM time grows as d², while the quantization passes and the
   BF16 parts (attention, norms) grow more slowly.
+
+### 3.1 Weight-quantization cache (v0.7, `bench_train_step.py`, `nvfp4_fused_cached`)
+
+With `cache_weight_quantization=True` the NVFP4 copies of a weight are reused until an optimizer
+step (or any other change) touches it, so under gradient accumulation every micro-batch after the
+first skips the weight quantizer. The table is the steady state of such a micro-batch (same session):
+
+| d_model | NVFP4 fused | + weight cache | saved | speedup vs BF16 | peak MiB |
+|---|---|---|---|---|---|
+| 768 | 3.58 ms | 3.49 ms | 2.4% | 1.74× → 1.78× | 427 → 431 |
+| 1024 | 5.20 ms | 5.08 ms | 2.4% | 1.96× → 2.01× | 572 → 577 |
+| 2048 | 14.20 ms | 13.62 ms | 4.1% | 2.40× → 2.51× | 1283 → 1310 |
+| 3072 | 26.73 ms | 25.37 ms | 5.1% | 2.97× → 3.13× | 2200 → 2261 |
+| 4096 | 47.05 ms | 44.33 ms | 5.8% | 2.88× → 3.05× | 3323 → 3432 |
+
+The cached copies cost ~1.1 bytes per weight element.
+
+### 3.2 Llama-style block (v0.7, `bench/results/llama_block.json`)
+
+One Llama-style block: RMSNorm, qkv, causal SDPA, o_proj, RMSNorm and a SwiGLU MLP (hidden ≈ 8/3·d,
+rounded to 256), forward and backward on 8192 tokens with BF16 autocast. "NVFP4" converts the five
+linears; "fused" uses `rmsnorm_linear` / `rmsnorm_swiglu_mlp` (RMSNorm and SwiGLU and its backward
+inside the quantizers, one quantization of the normalized input shared by gate and up, fused wgrad
+accumulation); "+ cache" adds the weight cache (micro-batches after the first).
+
+| d_model (hidden) | BF16 step | NVFP4 | **fused** | **+ cache** | peak MiB, BF16 → NVFP4 → fused |
+|---|---|---|---|---|---|
+| 1024 (2816) | 11.03 ms | 6.51 ms (1.70×) | **5.86 ms (1.88×)** | **5.69 ms (1.94×)** | 688 → 648 → 601 |
+| 2048 (5632) | 39.03 ms | 17.05 ms (2.29×) | **15.00 ms (2.60×)** | **15.01 ms (2.60×)** | 1541 → 1426 → 1330 |
+| 3072 (8192) | 79.71 ms | 32.33 ms (2.47×) | **28.17 ms (2.83×)** | **27.98 ms (2.85×)** | 2601 → 2374 → 2243 |
+| 4096 (11008) | 140.26 ms | 51.72 ms (2.71×) | **47.32 ms (2.96×)** | **44.88 ms (3.13×)** | 3965 → 3569 → 3395 |
+
+- The fusion is 9–14% faster than NVFP4Linear with PyTorch's RMSNorm / SiLU, and uses 5–8% less memory.
+- The first version was no faster than unfused: its RMSNorm backward was ~10 separate fp32 PyTorch
+  ops (2+ ms per step at d=2048). It now calls PyTorch's fused RMSNorm-backward kernel
+  (`aten._fused_rms_norm_backward`, PyTorch ≥ 2.9; the fp32 formula remains as the fallback).
 
 ## 4. End-to-end pretraining: GPT-124M (`experiments/results/`, `…/v0.2/`, `…/v0.3/`)
 

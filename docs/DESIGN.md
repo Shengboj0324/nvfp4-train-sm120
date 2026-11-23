@@ -161,8 +161,18 @@ The dual quantizer's tile loader can instead apply the producer op itself (`Pro`
 | Op | Reads | Computes per element (fp32, each op IEEE-rounded) |
 |---|---|---|
 | LayerNorm | x, mean[r], rstd[r], γ, β | `((x − mean) · rstd) · γ + β` |
-| GELU (tanh) | h | `(x · 0.5) · (tanh((x + x³ · κ) · β) + 1)` |
-| GELU backward | dY, h | `dY · gelu'(h)` |
+| GELU (tanh) | h, optional bias[c] | `(x · 0.5) · (tanh((x + x³ · κ) · β) + 1)`, x = h + bias |
+| GELU backward | dY, h, optional bias[c] | `dY · gelu'(h + bias)` |
+| GELU (exact, v0.7) | h, optional bias[c] | `(x · 0.5) · (1 + erf(x / √2))` and its backward `dY · (Φ + x · φ)` |
+| RMSNorm (v0.7) | x, rstd[r], γ | `(x · rstd) · γ` |
+| SwiGLU (v0.7) | g, u | `silu(g) · u`, silu(g) = `g / (1 + exp(−g))` |
+| SwiGLU backward (v0.7) | dY, g, u | gate: `(dY · u) · (s · (1 + g · (1 − s)))`, s = sigmoid(g); up: `dY · silu(g)` |
+
+**Bias gradients without writing the gradient (v0.7).** fc1's bias sits before the GELU, so its
+gradient is the column sum of the GELU input gradient, which the fused path never writes. The
+quantize kernel already holds each 64×64 tile of it in shared memory; when asked, 64 threads sum the
+tile's columns in a fixed order and write one row of per-tile partial sums ([tiles along R, C]),
+which the host sums. Deterministic (no atomics), and the gradient costs one small extra write.
 
 - **LayerNorm statistics** come from a small kernel (`ln_stats_kernel`: one warp per row, two passes,
   deterministic shuffle-tree sums). The LayerNorm backward then runs PyTorch's
@@ -182,6 +192,12 @@ saves (x, the statistics, h, the NVFP4 transposed operands). One subtlety: every
 `backward()` references stays alive until it returns, unlike between separate autograd nodes, so the
 functions drop each temporary as soon as it is consumed and the LayerNorm-gradient GEMM writes fp32
 directly. Without that, peak memory of the d=768 block rose 20%; with it, it is unchanged.
+
+**Llama-style blocks (v0.7).** `rmsnorm_swiglu_mlp` quantizes RMSNorm(x) once; that operand (and
+its RHT-transposed copy for the weight gradients) feeds both the gate and the up GEMM. The SwiGLU
+producer reads both projections and the backward runs the gate and up halves as two quantizer
+calls whose RHT seed matches x^T's, and accumulates both dgrad GEMMs into one fp32 buffer. The
+RMSNorm backward is PyTorch's fused kernel (`aten._fused_rms_norm_backward`) fed with our statistic.
 
 ### 3.5 Seeds on the GPU, and what that buys (v0.5)
 
@@ -221,6 +237,15 @@ every hook fires. The backward only does this when the parameter is a leaf whose
 this backward pass will run (`torch._C._will_engine_execute_node`); `torch.autograd.grad`, non-fp32
 gradients and compiled graphs take the ordinary path. Tests check the in-place property (the
 gradient's data pointer is unchanged across micro-batches) and DDP / FSDP2 equality.
+
+**Weight-quantization cache (v0.7).** Weights use deterministic 16×16 blocks, so their NVFP4 copies
+can be reused while the weight is unchanged. The cache key is (optimizer-step counter, storage
+address, autograd version counter, dtype, shape, device). The version counter alone is not enough:
+measured on PyTorch 2.14, `AdamW(fused=True)` updates parameters in place *without* bumping it
+(foreach and single-tensor optimizers do). So a global `register_optimizer_step_post_hook` counts
+every `torch.optim` step, fused or not, including subclasses. What remains invisible, in-place writes
+through `param.data`, is documented with an explicit `invalidate_weight_caches`. During CUDA-graph
+capture the cache switches itself off for good, since replays change weights without running Python.
 
 **Outputs are not views.** The layers return `aten._unsafe_view` of their 2D result, as `F.linear`
 does internally, instead of a reshape view. FSDP2 warns about modules that return views, because an
@@ -360,7 +385,8 @@ zero-filled copies, and stores are guarded. `K` must be a multiple of 128 (256 f
 | Dual quantizer | `tests/test_quantize_dual_cuda.py` | **bit-exact** vs `reference.quantize_dual` for all 6 configurations × 7 shapes × 2 dtypes; == two separate calls; 2D col == exact transpose |
 | GEMM | `tests/test_gemm_cuda.py` | vs fp64 reference: max error ≤ 1e-5 · max\|ref\|, ragged shapes, extreme scales; TMA loop == cp.async loop bit for bit; split-K deterministic across runs, accumulate == add |
 | Fused producers | `tests/test_fused_producers_cuda.py` | **bit-exact** vs reference LayerNorm / GELU / GELU-backward + `quantize_dual` (4 configurations × 5 shapes × 2 dtypes); LayerNorm statistics vs fp64 |
-| Fused sub-blocks | `tests/test_fused_modules.py` | forward == explicit op composition bit for bit; every gradient's cosine with fp32 ≥ the unfused NVFP4 path's − 0.01; seeded determinism; partial gradients; fused wgrad accumulation |
+| Fused sub-blocks | `tests/test_fused_modules.py`, `tests/test_fused_llama.py` | GPT / BERT style (incl. biases, exact GELU) and Llama style (RMSNorm, SwiGLU; norm-module variants): forward == explicit op composition bit for bit; every gradient's cosine with fp32 ≥ the unfused NVFP4 path's − 0.01; seeded determinism; partial gradients (incl. bias-only); fused wgrad accumulation; compile |
+| Weight cache | `tests/test_weight_cache_cuda.py` (+ two-process DDP / FSDP2) | bit-identical to uncached over optimizer steps (fused / foreach AdamW, SGD); reused within a step; every update path noticed (and the documented `.data` exception); CUDA-graph capture bypasses it; checkpointing, compile, deepcopy / pickle |
 | Layer | `tests/test_linear.py` | CUDA == emulated recipe (same seeds); cosine with full precision > 0.97–0.98; SR noise averages out; only NVFP4 tensors saved for backward (exact byte count); no-grad / frozen-weight / no-input-grad paths; fused wgrad accumulation == autograd bit for bit |
 | Robustness | `tests/test_robustness_cuda.py` | NaN / ±inf anywhere → non-finite outputs (quantize, dual, fused producers, GEMM, layers, gradients); clear errors on misuse; any leading shape incl. empty; fp32/bf16/fp16 and non-contiguous inputs; bf16 weights; state dict ↔ `nn.Linear`; activation checkpointing bit-exact; `torch.compile` == eager; CUDA-graph replay == eager; concurrent streams with split-K; DDP |
 | Integration | `tests/test_integration_cuda.py` | GPU seed tensors == integer seeds bit for bit (all four quantizers); no host sync in a training step; `torch.compile(fullgraph=True)` with no graph breaks, bit-identical to eager; CUDA-graph capture of fwd+bwd (fresh seeds per replay, noise averages out) and of a full Adam step (loss falls); fused accumulation in place with hooks firing, and under `torch.autograd.grad`; outputs not views; **two-process DDP (plain and bucket views), FSDP1 (flat and `use_orig_params`) and FSDP2** over gloo, fused and unfused, bit-exact vs a single-process reference; deterministic mode + flash attention reproduces a block's gradients bit for bit |
@@ -374,6 +400,9 @@ Every benchmark checks correctness against the reference before it times anythin
 
 ## 6. Known limitations and next steps
 
+Done in v0.7: weight-quantization cache (item 4 of v0.6), Llama-style fused blocks (RMSNorm,
+SwiGLU), biases and exact GELU in the fused GPT blocks (item 5), two-GPU NCCL tests and a
+multi-GPU session script (run once a multi-GPU machine is available).
 Done in v0.6: native Windows build and tests, FSDP1, bitwise-reproducible training with flash
 attention (deterministic mode), CI compile job on Windows.
 Done in v0.5: GPU-resident seeds, no graph breaks under `torch.compile`, CUDA-graph capture of
@@ -394,10 +423,10 @@ accumulation.
    are not fused; attention itself is PyTorch's BF16 SDPA.
 3. **Stochastic rounding is ALU-bound.** It needs two 32-bit hashes per element, because sm_120a has
    no `cvt.rs`. A cheaper generator, such as one hash per two elements, would need a spec change.
-4. **Weight quantization is redone per micro-batch** (about 0.5 ms per block step at d=2048). It
-   could be cached per optimizer step, but a safe invalidation rule is needed: `param.data` writes
-   don't bump `_version`.
-5. **Fused sub-blocks** cover pre-LN blocks with bias-free linears and tanh-GELU.
+4. **Weight cache limits.** In-place writes through `param.data` outside an optimizer step are not
+   detected (documented, with an explicit invalidation call); under FSDP2 the cache never hits.
+5. **Fused sub-blocks** cover GPT / BERT-style and Llama-style pre-norm blocks; biases on the SwiGLU
+   gate / up projections and post-norm blocks are not fused.
 6. **Framework coverage.** DDP, FSDP1 and FSDP2 are tested, but with two ranks on one GPU over gloo:
    NCCL across several GPUs has only run with one rank (no multi-GPU machine available).
    `DTensor.full_tensor()` over gloo with CUDA tensors crashes in PyTorch 2.14 (also for plain

@@ -26,8 +26,9 @@ Full details and raw data are in [docs/RESULTS.md](docs/RESULTS.md).
 | GPT-124M (d=768) pretraining, 49M tokens | val loss **1.5062 vs 1.4892** BF16 (constant ~0.017 gap, no divergence), **+27% tokens/s, −22% GPU energy** |
 | Same, three seeds (v0.5) | gap **+0.019 ± 0.002** nats (+1.28%), constant over training for every seed; +27.7% tokens/s |
 | Framework integration (v0.5) | `torch.compile(fullgraph=True)` without graph breaks (bit-identical to eager), CUDA-graph capture of whole training steps, no host syncs, DDP and FSDP2 bit-exact vs single process |
+| Llama-style block (v0.7) | RMSNorm + SwiGLU fused into the quantizers: **1.88× (d=1024) → 2.96× (d=4096)** vs BF16, 9–14% faster than unfused NVFP4; with the weight cache **up to 3.13×** |
 | Platforms (v0.6) | Linux / WSL2 and **native Windows** (MSVC build, tests on the GPU, CI compile job); DDP, **FSDP1** and FSDP2 bit-exact; bitwise-reproducible training with PyTorch's flash attention in deterministic mode |
-| Correctness | quantizers and fused LayerNorm/GELU **bit-exact** vs the reference spec; GEMM = fp64 reference to ~1e-7; 324 tests; compute-sanitizer clean (memcheck, racecheck, synccheck, initcheck); 8-minute soak with bit-exact replays |
+| Correctness | quantizers and every fused producer (LayerNorm, RMSNorm, GELU tanh / exact, SwiGLU) **bit-exact** vs the reference spec; GEMM = fp64 reference to ~1e-7; 528 tests; compute-sanitizer clean (memcheck, racecheck, synccheck, initcheck); 8-minute soak with bit-exact replays |
 
 ![loss curves](experiments/results/v0.3_wide/loss.png)
 
@@ -59,10 +60,14 @@ y = layer(torch.randn(8192, 4096, device="cuda", dtype=torch.bfloat16))
 # or convert an existing model's block linears, keeping the last blocks in BF16:
 convert_linears(model.blocks, skip=("10.", "11."))
 
-# pre-LN sub-blocks with LayerNorm / GELU fused into the NVFP4 quantizers
-from nvfp4 import layernorm_linear, layernorm_mlp
-qkv = layernorm_linear(x, block.ln1, block.qkv)           # block.qkv: NVFP4Linear (bias-free)
-out = layernorm_mlp(x, block.ln2, block.fc1, block.fc2)   # fc2(gelu_tanh(fc1(ln2(x))))
+# pre-norm sub-blocks with the normalization / activation fused into the NVFP4 quantizers
+from nvfp4 import layernorm_linear, layernorm_mlp, rmsnorm_linear, rmsnorm_swiglu_mlp
+qkv = layernorm_linear(x, block.ln1, block.qkv)           # GPT / BERT: LayerNorm (+ biases)
+out = layernorm_mlp(x, block.ln2, block.fc1, block.fc2)   # fc2(gelu(fc1(ln2(x)))), approximate="tanh"/"none"
+out = rmsnorm_swiglu_mlp(x, norm, gate, up, down)         # Llama: down(silu(gate(n)) * up(n)), n = norm(x)
+
+# reuse quantized weights across the micro-batches of an optimizer step
+convert_linears(model.blocks, cache_weight_quantization=True)
 
 # low-level ops
 from nvfp4 import quantize, gemm
@@ -87,7 +92,7 @@ csrc/gemm.cu           cp.async GEMM main loop (short K / fallback) and host dis
 csrc/gemm_common.cuh   shared epilogue: deterministic split-K, fused fp32 accumulate (D += A @ B^T)
 nvfp4/reference.py     executable spec of the format and recipe (pure PyTorch)
 nvfp4/linear.py        NVFP4Linear autograd layer + convert_linears
-nvfp4/fused.py         layernorm_linear / layernorm_mlp with fused producers
+nvfp4/fused.py         layernorm_linear / layernorm_mlp / rmsnorm_linear / rmsnorm_swiglu_mlp (fused producers)
 tests/                 bit-exact / reference tests (GPU tests auto-skip without sm_120)
 bench/                 GEMM, quantizer and transformer-block benchmarks (+ results/)
 experiments/           TinyStories GPT pretraining: BF16 vs NVFP4 (+ results/)
@@ -104,7 +109,7 @@ it. The known gaps are listed in
 [docs/DESIGN.md §6](docs/DESIGN.md#6-known-limitations-and-next-steps):
 - at equal clocks the GEMM keeps the tensor pipe 69% busy vs cuBLASLt's 90% (the gap disappears at
   this laptop's power limit, but would show on a GPU with more power headroom);
-- the fused sub-blocks cover pre-LN blocks with bias-free linears and tanh-GELU; attention-side
+- the fused sub-blocks cover GPT / BERT-style and Llama-style pre-norm blocks; attention-side
   producers aren't fused;
 - hardware stochastic rounding (`cvt.rs`) isn't available on sm_120a, so SR runs in software;
 - tested on one GPU model; multi-process tests run two ranks on one GPU over gloo, so NCCL across

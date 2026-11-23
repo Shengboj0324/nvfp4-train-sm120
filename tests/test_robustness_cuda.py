@@ -60,6 +60,25 @@ def test_fused_producers_propagate_non_finite(bad):
     assert not torch.isfinite(r.gdec).all()
 
 
+@pytest.mark.parametrize("bad", ["nan", "inf", "-inf"])
+@pytest.mark.parametrize("where", ["g", "u", "dy"])
+def test_llama_producers_propagate_non_finite(bad, where):
+    t = {k: torch.randn(256, 512, device=DEV) for k in ("g", "u", "dy")}
+    t[where] = _poison(t[where], bad)
+    g, u, dy = (t[k].bfloat16() for k in ("g", "u", "dy"))
+    if where != "dy":
+        r, c = ops.swiglu_quantize_dual(g, u, rht_seed=1, col_pad=128)
+        assert not torch.isfinite(r.gdec).all() and not torch.isfinite(c.gdec).all()
+    r, _ = ops.swiglu_backward_quantize_dual(dy, g, u, gate=True, col=False)
+    assert not torch.isfinite(r.gdec).all()
+    if where != "u":  # the up-gradient dy * silu(g) does not read u
+        r, _ = ops.swiglu_backward_quantize_dual(dy, g, u, gate=False, col=False)
+        assert not torch.isfinite(r.gdec).all()
+    rstd, r, c = ops.rmsnorm_quantize_dual(_poison(torch.randn(256, 512, device=DEV), bad),
+                                           torch.ones(512, device=DEV), 1e-6, rht_seed=1, col_pad=128)
+    assert not torch.isfinite(r.gdec).all() and not torch.isfinite(c.gdec).all()
+
+
 @pytest.mark.parametrize("bad", ["nan", "inf"])
 def test_layers_propagate_non_finite(bad):
     lin = NVFP4Linear(512, 256, bias=False).to(DEV)
@@ -72,6 +91,10 @@ def test_layers_propagate_non_finite(bad):
     ln = torch.nn.LayerNorm(512).to(DEV)
     fc1, fc2 = NVFP4Linear(512, 1024, bias=False).to(DEV), NVFP4Linear(1024, 512, bias=False).to(DEV)
     assert not torch.isfinite(layernorm_mlp(x.detach(), ln, fc1, fc2)).all()
+    from nvfp4.fused import rmsnorm_swiglu_mlp
+    norm = torch.nn.RMSNorm(512).to(DEV)
+    up = NVFP4Linear(512, 1024, bias=False).to(DEV)
+    assert not torch.isfinite(rmsnorm_swiglu_mlp(x.detach(), norm, fc1, up, fc2)).all()
 
 
 def test_non_finite_gradient_propagates():

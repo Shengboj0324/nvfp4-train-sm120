@@ -116,20 +116,68 @@ def layernorm_quantize_dual(x: torch.Tensor, weight: torch.Tensor, bias: torch.T
     return (outs[0], outs[1], *_pair(outs[2:], row, col))
 
 
-def gelu_quantize_dual(h: torch.Tensor, *, row: bool = True, col: bool = True, row_sr_seed: Seed = None,
-                       col_sr_seed: Seed = None, rht_seed: Seed = None, col_pad: int = 16):
-    """Quantize ``gelu(h)`` (tanh approximation, bf16 ``h``) without writing it."""
+def _exact(approximate: str) -> bool:
+    if approximate not in ("tanh", "none"):
+        raise ValueError(f"approximate must be 'tanh' or 'none', got {approximate!r}")
+    return approximate == "none"
+
+
+def gelu_quantize_dual(h: torch.Tensor, *, bias: torch.Tensor | None = None, approximate: str = "tanh",
+                       row: bool = True, col: bool = True, row_sr_seed: Seed = None, col_sr_seed: Seed = None,
+                       rht_seed: Seed = None, col_pad: int = 16):
+    """Quantize ``gelu(h + bias)`` (bf16 ``h``, optional per-column ``bias``; ``approximate`` as in
+    ``torch.nn.functional.gelu``: "tanh" or "none" for the exact erf form) without writing it."""
     outs = _lib.gelu_quantize_dual(h, row, col, *_seed_flags(row_sr_seed, col_sr_seed, rht_seed), int(col_pad),
-                                   *_seed_tensors(row_sr_seed, col_sr_seed, rht_seed))
+                                   *_seed_tensors(row_sr_seed, col_sr_seed, rht_seed), bias, _exact(approximate))
     return _pair(outs, row, col)
 
 
-def gelu_backward_quantize_dual(dy: torch.Tensor, h: torch.Tensor, *, row: bool = True, col: bool = True,
-                                row_sr_seed: Seed = None, col_sr_seed: Seed = None, rht_seed: Seed = None,
-                                col_pad: int = 16):
-    """Quantize the GELU input gradient ``dy * gelu'(h)`` (bf16 ``dy``, ``h``) without writing it."""
+def gelu_backward_quantize_dual(dy: torch.Tensor, h: torch.Tensor, *, bias: torch.Tensor | None = None,
+                                approximate: str = "tanh", bias_grad: bool = False, row: bool = True,
+                                col: bool = True, row_sr_seed: Seed = None, col_sr_seed: Seed = None,
+                                rht_seed: Seed = None, col_pad: int = 16):
+    """Quantize the GELU input gradient ``dy * gelu'(h + bias)`` (bf16 ``dy``, ``h``) without writing it.
+
+    With ``bias_grad=True`` also returns its sum over rows (fp32 [C], the gradient of ``bias``), computed
+    from the same read: ``(row, col, bias_grad)``.
+    """
     outs = _lib.gelu_backward_quantize_dual(dy, h, row, col, *_seed_flags(row_sr_seed, col_sr_seed, rht_seed),
-                                            int(col_pad), *_seed_tensors(row_sr_seed, col_sr_seed, rht_seed))
+                                            int(col_pad), *_seed_tensors(row_sr_seed, col_sr_seed, rht_seed), bias,
+                                            _exact(approximate), bool(bias_grad))
+    pair = _pair(outs[:6], row, col)
+    return (*pair, outs[6].sum(0)) if bias_grad else pair
+
+
+def rmsnorm_quantize_dual(x: torch.Tensor, weight: torch.Tensor, eps: float, *, row: bool = True, col: bool = True,
+                          row_sr_seed: Seed = None, col_sr_seed: Seed = None, rht_seed: Seed = None,
+                          col_pad: int = 16):
+    """Quantize ``RMSNorm(x)`` [R, C] (fp32 weight [C]) without writing it.
+
+    Returns ``(rstd, row, col)``: the per-row ``1 / sqrt(mean(x^2) + eps)`` ([R] fp32, what the RMSNorm
+    backward needs) and the two quantize_dual outputs of ``(x * rstd) * weight`` in fp32.
+    """
+    outs = _lib.rmsnorm_quantize_dual(x, weight, float(eps), row, col,
+                                      *_seed_flags(row_sr_seed, col_sr_seed, rht_seed), int(col_pad),
+                                      *_seed_tensors(row_sr_seed, col_sr_seed, rht_seed))
+    return (outs[0], *_pair(outs[1:], row, col))
+
+
+def swiglu_quantize_dual(g: torch.Tensor, u: torch.Tensor, *, row: bool = True, col: bool = True,
+                         row_sr_seed: Seed = None, col_sr_seed: Seed = None, rht_seed: Seed = None, col_pad: int = 16):
+    """Quantize ``silu(g) * u`` (bf16 gate / up projections, Llama's SwiGLU MLP) without writing it."""
+    outs = _lib.swiglu_quantize_dual(g, u, row, col, *_seed_flags(row_sr_seed, col_sr_seed, rht_seed), int(col_pad),
+                                     *_seed_tensors(row_sr_seed, col_sr_seed, rht_seed))
+    return _pair(outs, row, col)
+
+
+def swiglu_backward_quantize_dual(dy: torch.Tensor, g: torch.Tensor, u: torch.Tensor, *, gate: bool,
+                                  row: bool = True, col: bool = True, row_sr_seed: Seed = None,
+                                  col_sr_seed: Seed = None, rht_seed: Seed = None, col_pad: int = 16):
+    """Quantize the gradient of ``silu(g) * u`` w.r.t. ``g`` (``gate=True``: ``dy * u * silu'(g)``) or w.r.t.
+    ``u`` (``gate=False``: ``dy * silu(g)``) from its output gradient ``dy`` (all bf16), without writing it."""
+    outs = _lib.swiglu_backward_quantize_dual(dy, g, u, bool(gate), row, col,
+                                              *_seed_flags(row_sr_seed, col_sr_seed, rht_seed), int(col_pad),
+                                              *_seed_tensors(row_sr_seed, col_sr_seed, rht_seed))
     return _pair(outs, row, col)
 
 

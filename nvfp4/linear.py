@@ -21,6 +21,7 @@ the CUDA path and for numerics studies on machines without an sm_120 GPU.
 from __future__ import annotations
 
 import torch
+from torch.optim.optimizer import register_optimizer_step_post_hook
 
 from nvfp4 import ops
 from nvfp4 import reference as ref
@@ -70,6 +71,92 @@ class _QuantizerEmulate:
 
 
 _BACKENDS = {"cuda": _QuantizerCUDA, "emulate": _QuantizerEmulate}
+
+
+class WeightQuantCache:
+    """The NVFP4 copies (W, and W^T for dgrad) of one weight, reused while the weight is unchanged.
+
+    Weights are quantized with deterministic 16x16 blocks (no RHT, no stochastic rounding), so a cached
+    copy is bit-identical to quantizing again. Under gradient accumulation the weights don't change
+    between the micro-batches of an optimizer step, and every micro-batch after the first skips the
+    weight quantizer.
+
+    A cached copy is used only if, since it was made,
+      * no ``torch.optim`` optimizer has stepped (any optimizer, any subclass: a global step hook
+        counts steps; needed because fused optimizers such as ``AdamW(fused=True)`` update parameters
+        without bumping their version counter), and
+      * the weight's storage and autograd version counter are unchanged (catches ``copy_`` / in-place
+        ops under ``no_grad``, ``load_state_dict``, ``.to()``, assigning ``param.data``).
+    Not noticed: in-place writes through ``param.data`` (``p.data.add_(...)``) outside an optimizer
+    step, and weights changed by replaying a CUDA graph that a forward of this layer was not part of.
+    After those, call ``invalidate_weight_caches(model)``. Never used for parameters that are not
+    leaves (FSDP1's flat-parameter views) or under torch.compile; a layer seen during CUDA-graph
+    capture turns its cache off for good (replays change weights without running any Python).
+    """
+
+    __slots__ = ("key", "wq", "wtq", "hits", "misses", "bypass")
+
+    def __init__(self):
+        self.key = self.wq = self.wtq = None
+        self.hits = self.misses = 0
+        self.bypass = False
+
+    def clear(self) -> None:
+        self.key = self.wq = self.wtq = None
+
+    # copies / pickles of a module start with an empty cache (no tensors serialized)
+    def __deepcopy__(self, memo):
+        return WeightQuantCache()
+
+    def __reduce__(self):
+        return (WeightQuantCache, ())
+
+
+_optimizer_steps = [0]  # bumped after every torch.optim optimizer step (see WeightQuantCache)
+
+
+def _count_optimizer_step(optimizer, args, kwargs):
+    _optimizer_steps[0] += 1
+
+
+register_optimizer_step_post_hook(_count_optimizer_step)
+
+
+def quantized_weight(weight: torch.Tensor, need_t: bool, backend_name: str, cache: WeightQuantCache | None):
+    """(W, W^T or None) in NVFP4 with 16x16 blocks, from ``cache`` when it is still valid."""
+    be = _BACKENDS[backend_name]
+    if cache is not None and not cache.bypass and torch.cuda.is_current_stream_capturing():
+        cache.clear()
+        cache.bypass = True
+    if cache is None or cache.bypass or backend_name != "cuda" or not weight.is_leaf:
+        return be.dual(weight.detach(), col=need_t, block_2d=True)
+    key = (_optimizer_steps[0], weight.data_ptr(), weight._version, weight.dtype, tuple(weight.shape),
+           weight.device)
+    if cache.key == key and (cache.wtq is not None or not need_t):
+        cache.hits += 1
+        return cache.wq, (cache.wtq if need_t else None)
+    wq, wtq = be.dual(weight.detach(), col=need_t, block_2d=True)
+    cache.key, cache.wq, cache.wtq = key, wq, wtq
+    cache.misses += 1
+    return wq, wtq
+
+
+def weight_cache(lin) -> WeightQuantCache | None:
+    """The layer's cache if caching is enabled (never while torch.compile traces)."""
+    if not lin.cache_weight_quantization or torch.compiler.is_compiling():
+        return None
+    return lin.weight_quant_cache
+
+
+def invalidate_weight_caches(module: torch.nn.Module) -> int:
+    """Drop the cached NVFP4 weights of every NVFP4Linear in ``module`` (needed only after in-place writes
+    through ``param.data``; see WeightQuantCache). Returns the number of layers."""
+    n = 0
+    for m in module.modules():
+        if isinstance(m, NVFP4Linear):
+            m.weight_quant_cache.clear()
+            n += 1
+    return n
 
 
 _will_execute = getattr(torch._C, "_will_engine_execute_node", None)
@@ -122,7 +209,7 @@ def _weight_grad(ctx, param, dytq, xtq, w_dtype, backend_name: str):
 class _NVFP4LinearFn(torch.autograd.Function):
     @staticmethod
     def forward(ctx, x2d, weight, backend_name: str, wgrad_rht: bool, need_dgrad: bool, need_wgrad: bool,
-                fuse_wgrad: bool):
+                fuse_wgrad: bool, wcache):
         be = _BACKENDS[backend_name]
         # [dY row SR, dY^T SR, RHT]: drawn once per call; the backward reuses the RHT seed of X^T
         seeds = draw_seeds(3, x2d.device) if need_dgrad or need_wgrad else None
@@ -130,7 +217,7 @@ class _NVFP4LinearFn(torch.autograd.Function):
         # X  -> rowwise for fprop, and (if wgrad) X^T along tokens, RHT, zero-padded to ALIGN tokens
         xq, xtq = be.dual(x2d, col=need_wgrad, rht_seed=rht, col_pad=ALIGN)
         # W  -> 16x16 tiles; W^T (exact transpose) for dgrad
-        wq, wtq = be.dual(weight.detach(), col=need_dgrad, block_2d=True)
+        wq, wtq = quantized_weight(weight, need_dgrad, backend_name, wcache)
         y = be.mm(xq, wq, torch.bfloat16)                                   # [M, out]
         saved = [seeds] if seeds is not None else []
         if need_wgrad:
@@ -150,7 +237,7 @@ class _NVFP4LinearFn(torch.autograd.Function):
         do_dx = ctx.need_dgrad and ctx.needs_input_grad[0]
         do_dw = ctx.need_wgrad and ctx.needs_input_grad[1]
         if not (do_dx or do_dw):
-            return (None,) * 7
+            return (None,) * 8
         seeds = saved[0]
         xtq = ops.NVFP4Tensor(*saved[1:4]) if ctx.need_wgrad else None
         wtq = ops.NVFP4Tensor(*saved[-3:]) if ctx.need_dgrad else None
@@ -163,7 +250,7 @@ class _NVFP4LinearFn(torch.autograd.Function):
                             col_pad=ALIGN)
         dx = be.mm(dyq, wtq, torch.bfloat16) if do_dx else None              # [M, in]
         dw = _weight_grad(ctx, ctx.param, dytq, xtq, ctx.w_dtype, ctx.backend_name) if do_dw else None
-        return dx, dw, None, None, None, None, None
+        return dx, dw, None, None, None, None, None, None
 
 
 class NVFP4Linear(torch.nn.Linear):
@@ -176,10 +263,16 @@ class NVFP4Linear(torch.nn.Linear):
     gradient accumulation. Gradient hooks, DDP and FSDP keep working (see _weight_grad); it is skipped
     automatically where it cannot apply (``torch.autograd.grad``, non-fp32 gradients, inside
     torch.compile).
+
+    ``cache_weight_quantization``: keep the NVFP4 copies of the weight and reuse them while the weight
+    is unchanged (bit-identical results; saves the weight quantizer on every micro-batch after the first
+    under gradient accumulation, at ~1.1 bytes per weight element of memory). See WeightQuantCache for
+    exactly when it notices weight updates.
     """
 
     def __init__(self, in_features: int, out_features: int, bias: bool = True, device=None, dtype=None,
-                 backend: str = "cuda", wgrad_rht: bool = True, fuse_wgrad_accumulation: bool = False):
+                 backend: str = "cuda", wgrad_rht: bool = True, fuse_wgrad_accumulation: bool = False,
+                 cache_weight_quantization: bool = False):
         super().__init__(in_features, out_features, bias=bias, device=device, dtype=dtype)
         if in_features % ALIGN or out_features % ALIGN:
             raise ValueError(f"NVFP4Linear needs in/out features divisible by {ALIGN}, got "
@@ -189,6 +282,8 @@ class NVFP4Linear(torch.nn.Linear):
         self.backend = backend
         self.wgrad_rht = wgrad_rht
         self.fuse_wgrad_accumulation = fuse_wgrad_accumulation
+        self.cache_weight_quantization = cache_weight_quantization
+        self.weight_quant_cache = WeightQuantCache()
 
     @classmethod
     def from_linear(cls, lin: torch.nn.Linear, **kw) -> "NVFP4Linear":
@@ -206,7 +301,8 @@ class NVFP4Linear(torch.nn.Linear):
         grad = torch.is_grad_enabled()
         fuse = self.fuse_wgrad_accumulation and not torch.compiler.is_compiling()
         y = _NVFP4LinearFn.apply(x2d, self.weight, self.backend, self.wgrad_rht,
-                                 grad and x2d.requires_grad, grad and self.weight.requires_grad, fuse)
+                                 grad and x2d.requires_grad, grad and self.weight.requires_grad, fuse,
+                                 weight_cache(self))
         # Drop-in semantics: return the caller's dtype (bf16 under autocast / bf16 models).
         out_dtype = torch.get_autocast_dtype("cuda") if torch.is_autocast_enabled("cuda") else x.dtype
         y = y.to(out_dtype)
@@ -216,7 +312,8 @@ class NVFP4Linear(torch.nn.Linear):
 
     def extra_repr(self) -> str:
         r = super().extra_repr() + f", backend={self.backend}, wgrad_rht={self.wgrad_rht}"
-        return r + (", fuse_wgrad_accumulation=True" if self.fuse_wgrad_accumulation else "")
+        r += ", fuse_wgrad_accumulation=True" if self.fuse_wgrad_accumulation else ""
+        return r + (", cache_weight_quantization=True" if self.cache_weight_quantization else "")
 
 
 def convert_linears(module: torch.nn.Module, *, skip=(), **kw) -> list[str]:
@@ -240,4 +337,4 @@ def flops_per_token(in_f: int, out_f: int) -> int:
     return 6 * in_f * out_f
 
 
-__all__ = ["NVFP4Linear", "convert_linears", "flops_per_token"]
+__all__ = ["NVFP4Linear", "WeightQuantCache", "convert_linears", "flops_per_token", "invalidate_weight_caches"]

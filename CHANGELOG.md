@@ -1,5 +1,25 @@
 # Changelog
 
+## 0.7.0 — Llama-style blocks, weight cache, fused biases (2026-11-23)
+
+- **Llama-style fused blocks:** `rmsnorm_linear` and `rmsnorm_swiglu_mlp`. RMSNorm, SwiGLU and both
+  halves of its backward run inside the quantizers (new ops `rmsnorm_quantize_dual`,
+  `swiglu_quantize_dual`, `swiglu_backward_quantize_dual`, bit-exact against the reference). The
+  normalized input is quantized once for gate and up. A Llama block step is 1.88–2.96× BF16, 9–14%
+  faster than unfused NVFP4, with 5–8% less memory (`bench/bench_llama_block.py`).
+- **Weight-quantization cache** (`NVFP4Linear(cache_weight_quantization=True)`): micro-batches after
+  the first skip the weight quantizer (2–6% per block step, bit-identical results). Invalidation
+  counts optimizer steps with a global hook because fused AdamW does not bump version counters (found
+  by the tests). `invalidate_weight_caches(model)` covers in-place `.data` writes. Tested under DDP,
+  FSDP2, CUDA graphs, compile and checkpointing.
+- **Fused GPT blocks accept biases and exact GELU:** `layernorm_mlp(..., approximate="none")`. fc1's
+  bias is added inside the GELU producer, and its gradient comes from deterministic per-tile column
+  sums computed in the same kernel (`gelu_backward_quantize_dual(..., bias_grad=True)`).
+- Two-GPU NCCL tests (DDP, FSDP1, FSDP2, weight cache) that skip on one GPU; DDP in
+  `experiments/train_gpt.py` via torchrun; `tools/guard.py` watches every GPU; `tools/pod_session.sh`
+  runs the whole validation on a rented multi-GPU machine.
+- 528 tests.
+
 ## 0.6.1 — Windows build with CUDA 13 (2026-11-23)
 
 - **Fixed: the TMA GEMM did not compile with MSVC and CUDA 13.** CUDA 13 declares `CUtensorMap`
