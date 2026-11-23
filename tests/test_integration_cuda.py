@@ -352,8 +352,14 @@ def _check_ddp(rank, world, bucket_view):
 
 def _gather_dim0(shard):
     """Concatenate the ranks' dim-0 shards. (DTensor.full_tensor() over gloo with CUDA tensors crashes
-    in PyTorch 2.14 even for plain nn.Linear, so gather through CPU tensors.)"""
+    in PyTorch 2.14 even for plain nn.Linear, so gloo gathers through CPU tensors; NCCL gathers on
+    the GPU.)"""
     import torch.distributed as dist
+    shard = shard.contiguous()
+    if dist.get_backend() == "nccl":
+        parts = [torch.empty_like(shard) for _ in range(dist.get_world_size())]
+        dist.all_gather(parts, shard)
+        return torch.cat(parts)
     parts = [torch.empty_like(shard, device="cpu") for _ in range(dist.get_world_size())]
     dist.all_gather(parts, shard.cpu())
     return torch.cat(parts).to(shard.device)
@@ -439,12 +445,16 @@ def _check_fsdp1(rank, world):
             assert hits[0] == 0, hits[0]
 
 
-def _dist_worker(rank, world, port, mode):
+def _dist_worker(rank, world, port, mode, backend="gloo"):
+    import datetime
+
     import torch.distributed as dist
     os.environ["MASTER_ADDR"], os.environ["MASTER_PORT"] = "127.0.0.1", str(port)
     torch.set_num_threads(2)  # gloo reduces on the CPU; a full OpenMP pool per rank only adds load
-    torch.cuda.set_device(0)
-    dist.init_process_group("gloo", rank=rank, world_size=world)
+    # gloo: every rank on GPU 0 (works on one GPU); NCCL: one GPU per rank, as in real training
+    torch.cuda.set_device(rank if backend == "nccl" else 0)
+    kw = {"device_id": torch.device("cuda", rank)} if backend == "nccl" else {}
+    dist.init_process_group(backend, rank=rank, world_size=world, timeout=datetime.timedelta(minutes=3), **kw)
     try:
         if mode == "fsdp2":
             _check_fsdp2(rank, world)
@@ -470,3 +480,18 @@ def test_two_process_data_parallel(mode):
         pytest.skip("gloo not available")
     os.environ.setdefault("OMP_NUM_THREADS", "2")  # inherited by the spawned ranks
     mp.spawn(_dist_worker, args=(2, _free_port(), mode), nprocs=2, join=True)
+
+
+@pytest.mark.parametrize("mode", ["ddp", "ddp_bucket_view", "fsdp1", "fsdp2"])
+def test_multi_gpu_nccl_data_parallel(mode):
+    """The same checks with one process per GPU over NCCL (needs two sm_120 GPUs). Two ranks, so every
+    reduction is a single addition and the result must still be bit-identical to the reference."""
+    import torch.distributed as dist
+    import torch.multiprocessing as mp
+    from nvfp4 import ops as _ops
+    if torch.cuda.device_count() < 2 or not all(_ops.available(i) for i in range(2)):
+        pytest.skip("needs two sm_120 GPUs")
+    if not dist.is_available() or not dist.is_nccl_available():
+        pytest.skip("NCCL not available")
+    os.environ.setdefault("OMP_NUM_THREADS", "2")
+    mp.spawn(_dist_worker, args=(2, _free_port(), mode, "nccl"), nprocs=2, join=True)
