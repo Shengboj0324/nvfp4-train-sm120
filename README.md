@@ -24,7 +24,9 @@ Full details and raw data are in [docs/RESULTS.md](docs/RESULTS.md).
 | Transformer block fwd+bwd | **1.80× (d=768) → 2.42× (d=2048) → 3.10× (d=4096)** vs BF16, with 7–14% less memory |
 | GPT-507M (d=2048) pretraining | val loss **1.6954 vs 1.6786** BF16 (+1.0%), **1.62× tokens/s, −39% GPU energy** |
 | GPT-124M (d=768) pretraining, 49M tokens | val loss **1.5062 vs 1.4892** BF16 (constant ~0.017 gap, no divergence), **+27% tokens/s, −22% GPU energy** |
-| Correctness | quantizers and fused LayerNorm/GELU **bit-exact** vs the reference spec; GEMM = fp64 reference to ~1e-7; 305 tests; compute-sanitizer clean (memcheck, racecheck, synccheck, initcheck); 8-minute soak with bit-exact replays |
+| Same, three seeds (v0.5) | gap **+0.019 ± 0.002** nats (+1.28%), constant over training for every seed; +27.7% tokens/s |
+| Framework integration (v0.5) | `torch.compile(fullgraph=True)` without graph breaks (bit-identical to eager), CUDA-graph capture of whole training steps, no host syncs, DDP and FSDP2 bit-exact vs single process |
+| Correctness | quantizers and fused LayerNorm/GELU **bit-exact** vs the reference spec; GEMM = fp64 reference to ~1e-7; 321 tests; compute-sanitizer clean (memcheck, racecheck, synccheck, initcheck); 8-minute soak with bit-exact replays |
 
 ![loss curves](experiments/results/v0.3_wide/loss.png)
 
@@ -97,6 +99,7 @@ it. The known gaps are listed in
 - the fused sub-blocks cover pre-LN blocks with bias-free linears and tanh-GELU; attention-side
   producers aren't fused;
 - hardware stochastic rounding (`cvt.rs`) isn't available on sm_120a, so SR runs in software;
+- multi-process tests run two ranks on one GPU (gloo); FSDP1 is untested;
 - only Linux/WSL2 is supported.
 
 ## License

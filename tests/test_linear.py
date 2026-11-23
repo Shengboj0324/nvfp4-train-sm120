@@ -105,6 +105,9 @@ def test_saves_only_nvfp4_operands():
     saved = []
     with torch.autograd.graph.saved_tensors_hooks(lambda t: saved.append(t) or t, lambda t: t):
         y = q(x)
+    seeds = [t for t in saved if t.dtype == torch.int64]
+    assert len(seeds) == 1 and seeds[0].numel() == 3  # the layer's SR / RHT seeds, drawn on the GPU
+    saved = [t for t in saved if t.dtype != torch.int64]
     assert saved and all(t.dtype in (torch.uint8, torch.float32) and t.numel() <= 512 * 1024 // 2 for t in saved)
     nbytes = sum(t.numel() * t.element_size() for t in saved)
     nvfp4 = lambda r, c: r * c // 2 + r * c // 16 + 4  # noqa: E731  codes + E4M3 scales + fp32 gdec

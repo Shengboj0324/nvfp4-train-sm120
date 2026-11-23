@@ -5,7 +5,8 @@ Samples GPU (nvidia-smi) and host (/proc) state every --interval seconds, append
 kills the whole process group of the command if any limit is crossed, so a long benchmark or
 training run on a laptop can never drive the machine into a thermal or out-of-memory reset.
 
-Before starting, it waits for the GPU to cool below --start-max-temp; after the command exits, it
+Before starting, it waits for the GPU to cool below --start-max-temp and for the host load average
+to settle; after the command exits, it
 keeps sampling until the GPU has cooled below --cooldown-temp (bounded by --cooldown-max-s), so
 back-to-back jobs never stack heat and every job ends with an idle, settled GPU.
 
@@ -47,6 +48,18 @@ def host_sample() -> dict:
             "load1": load1, "ncpu": os.cpu_count()}
 
 
+def wait_settled(max_load_per_cpu: float, max_s: float) -> float:
+    """Wait until the 1-min load average is below the kill threshold (a previous job's spike decays
+    slowly; starting into it would get the new job killed for load it did not cause)."""
+    t0 = time.time()
+    while time.time() - t0 < max_s:
+        h = host_sample()
+        if h["load1"] / h["ncpu"] < max_load_per_cpu:
+            break
+        time.sleep(2.0)
+    return time.time() - t0
+
+
 def wait_cool(below_c: float, max_s: float) -> float:
     """Sample every 2 s until the GPU is below `below_c` (or max_s passes); returns seconds waited."""
     t0 = time.time()
@@ -85,6 +98,9 @@ def main() -> int:
     waited = wait_cool(a.start_max_temp, 300.0)
     if waited > 1:
         print(f"[guard] waited {waited:.0f}s for the GPU to cool below {a.start_max_temp:.0f}C", file=sys.stderr)
+    waited = wait_settled(0.5 * a.max_load_per_cpu, 180.0)
+    if waited > 1:
+        print(f"[guard] waited {waited:.0f}s for the host load to settle", file=sys.stderr)
     proc = subprocess.Popen(cmd, start_new_session=True)
     t0, strikes, peak = time.time(), 0, {"temp": 0.0, "power": 0.0, "gpu_mem": 0.0, "min_host_mem": 1e12}
     killed_reason = None

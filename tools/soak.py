@@ -3,6 +3,7 @@ of a d=2048 model for a fixed wall-clock budget, checking continuously that
 
   * every loss, gradient and GEMM output is finite,
   * replaying a step with the same seed reproduces its gradients bit for bit (no races / stale state),
+  * a block trained through a captured CUDA graph (fresh GPU-drawn seeds every replay) stays finite,
   * GEMM results stay bit-identical to their first computation (no drift, no hangs: the guard and the
     kernels' bounded waits turn a hang into an error).
 
@@ -67,9 +68,39 @@ def main() -> int:
         qb = ops.quantize(torch.randn(n, k, device="cuda", dtype=torch.bfloat16))
         gemms.append((qa, qb, ops.gemm(qa, qb, torch.float32)))
 
+    # A third block trains through a captured CUDA graph (forward, backward, optimizer step): seeds are
+    # drawn on the GPU, so every replay uses fresh ones; checked for finite loss / weights.
+    gblk = make_block(a.d, False, 1)
+    gopt = torch.optim.AdamW(gblk.parameters(), lr=1e-4, capturable=True)
+    gx = torch.randn(8, 512, a.d, device="cuda")
+
+    def gstep():
+        gopt.zero_grad(set_to_none=True)
+        with torch.autocast("cuda", dtype=torch.bfloat16):
+            loss = gblk(gx).float().pow(2).mean()
+        loss.backward()
+        gopt.step()
+        return loss.detach()
+
+    side = torch.cuda.Stream()
+    side.wait_stream(torch.cuda.current_stream())
+    with torch.cuda.stream(side):
+        for _ in range(3):
+            gstep()
+    torch.cuda.current_stream().wait_stream(side)
+    gopt.zero_grad(set_to_none=True)
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        gloss = gstep()
+
     it, checks = 0, 0
     while time.time() < deadline:
         x = torch.randn(8, 512, a.d, device="cuda")
+        gx.copy_(x)
+        graph.replay()
+        if it % 10 == 0 and not (torch.isfinite(gloss) and all(torch.isfinite(p).all() for p in gblk.parameters())):
+            print(f"FAIL non-finite in the CUDA-graph step at iter {it}", flush=True)
+            return 1
         for name, blk in blocks.items():
             seed = 1000 + it
             loss, grads = step(blk, x, seed)
@@ -95,8 +126,8 @@ def main() -> int:
         it += 1
     torch.cuda.synchronize()
     print(f"SOAK_OK {it} iterations, {checks} replay checks, {it * len(gemms)} extra GEMMs, "
-          f"{a.minutes:.1f} min", flush=True)
-    del blocks, opts, gemms
+          f"{it} CUDA-graph training steps, {a.minutes:.1f} min", flush=True)
+    del blocks, opts, gemms, graph, gblk, gopt
     torch.cuda.empty_cache()
     return 0
 

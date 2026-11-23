@@ -126,8 +126,9 @@ bit-identical to the reference:
   - the chosen grid value is then converted exactly by the hardware convert.
 
   Together these made the SR quantize pass about 1.5× faster than v0.1's version.
-- **The RHT sign mask** (16 bits, derived from the seed) is computed once on the host. Sign flips are
-  XORs of the float sign bit, identical to multiplying by −1.
+- **The RHT sign mask** (16 bits, derived from the seed) is computed once on the host for an integer
+  seed. For a seed held in GPU memory (what the layers use, §3.5) each warp builds it with one hash per
+  lane and a ballot. Sign flips are XORs of the float sign bit, identical to multiplying by −1.
 - **Explicit rounding:** every remaining operation uses an explicit IEEE intrinsic (`__fdiv_rn`,
   `__fmul_rn`, ...), and the Hadamard transform is a butterfly in the same order as the reference.
 - **Reference fix (v0.2):** in PyTorch on CUDA, `tensor / python_scalar` is computed as
@@ -181,6 +182,49 @@ saves (x, the statistics, h, the NVFP4 transposed operands). One subtlety: every
 `backward()` references stays alive until it returns, unlike between separate autograd nodes, so the
 functions drop each temporary as soon as it is consumed and the LayerNorm-gradient GEMM writes fp32
 directly. Without that, peak memory of the d=768 block rose 20%; with it, it is unchanged.
+
+### 3.5 Seeds on the GPU, and what that buys (v0.5)
+
+Each layer call draws its stochastic-rounding and RHT seeds as one small int64 tensor with
+`torch.randint(..., device="cuda")`: three per linear (dY row SR, dY^T SR, RHT), six per fused MLP. The
+quantizers take each seed either as an integer kernel argument or as a pointer to such a tensor
+(`Params::*_seed_ptr`). With pointers:
+
+- **No host synchronization** anywhere in a training step (v0.4 drew seeds with `.item()` on the CPU
+  generator; `tests/test_integration_cuda.py` runs a step under `torch.cuda.set_sync_debug_mode("error")`).
+- **CUDA graphs** can capture whole training steps: PyTorch's CUDA generator is graph-safe, so every
+  replay draws new seeds (v0.4 would have frozen them into the graph).
+- **torch.compile** can trace the layers (the random draw is an ordinary op), and with inductor's
+  `fallback_random` the compiled step is bit-identical to eager.
+- **Determinism** is unchanged in kind: `torch.manual_seed` fixes the CUDA generator, and activation
+  checkpointing restores its state before recomputation.
+
+In the kernels, threads 0–2 of each CTA load the three seeds at entry and park them in shared memory
+after issuing their tile loads; the barrier that follows the tile load publishes them, and each warp
+builds the RHT sign mask with one hash per lane. Per-kernel GPU time equals the integer-seed path. (A
+first version that hashed all sixteen mask bits in every thread was compiled into predicated code that
+ran even without device seeds and made the quantizers ~10% slower.) A whole block step is within ~1%
+of v0.4 (A/B in one session: +0.5–1.5% at d = 768–2048, from the extra `randint` launches and Python
+work per layer).
+
+**torch.compile without graph breaks.** `nvfp4/_library.py` registers every kernel entry point as a
+`torch.library` custom op with a fake (shape-only) implementation. Eager calls go straight to the
+pybind11 function (no dispatcher overhead); only under `torch.compiler.is_compiling()` do the layers
+call `torch.ops.nvfp4.*`. Glue that inspects data pointers (16-byte alignment) lives inside the ops.
+
+**Fused gradient accumulation that keeps autograd's contract.** v0.2's fused wgrad accumulation added
+the new gradient into `weight.grad` inside the GEMM and returned `None` to autograd, so the weight's
+AccumulateGrad node never ran: per-parameter hooks did not fire, which DDP's bucketing relies on. Now
+the backward adds into `.grad`, detaches `.grad` from the parameter, and returns that same tensor.
+AccumulateGrad finds no `.grad` and adopts the returned tensor without a copy (its "steal" path), and
+every hook fires. The backward only does this when the parameter is a leaf whose AccumulateGrad node
+this backward pass will run (`torch._C._will_engine_execute_node`); `torch.autograd.grad`, non-fp32
+gradients and compiled graphs take the ordinary path. Tests check the in-place property (the
+gradient's data pointer is unchanged across micro-batches) and DDP / FSDP2 equality.
+
+**Outputs are not views.** The layers return `aten._unsafe_view` of their 2D result, as `F.linear`
+does internally, instead of a reshape view. FSDP2 warns about modules that return views, because an
+in-place op on one would bypass its pre-backward hook.
 
 ## 4. GEMM (`csrc/gemm.cu`, `csrc/gemm_tma.cu`, `csrc/gemm_common.cuh`)
 
@@ -319,7 +363,8 @@ zero-filled copies, and stores are guarded. `K` must be a multiple of 128 (256 f
 | Fused sub-blocks | `tests/test_fused_modules.py` | forward == explicit op composition bit for bit; every gradient's cosine with fp32 ≥ the unfused NVFP4 path's − 0.01; seeded determinism; partial gradients; fused wgrad accumulation |
 | Layer | `tests/test_linear.py` | CUDA == emulated recipe (same seeds); cosine with full precision > 0.97–0.98; SR noise averages out; only NVFP4 tensors saved for backward (exact byte count); no-grad / frozen-weight / no-input-grad paths; fused wgrad accumulation == autograd bit for bit |
 | Robustness | `tests/test_robustness_cuda.py` | NaN / ±inf anywhere → non-finite outputs (quantize, dual, fused producers, GEMM, layers, gradients); clear errors on misuse; any leading shape incl. empty; fp32/bf16/fp16 and non-contiguous inputs; bf16 weights; state dict ↔ `nn.Linear`; activation checkpointing bit-exact; `torch.compile` == eager; CUDA-graph replay == eager; concurrent streams with split-K; DDP |
-| Memory / race safety | `tools/sanitize.sh` | compute-sanitizer memcheck, racecheck, synccheck, initcheck over every kernel variant (ragged shapes, TMA and cp.async loops, split-K, accumulate, all producer ops): 0 findings |
+| Integration | `tests/test_integration_cuda.py` | GPU seed tensors == integer seeds bit for bit (all four quantizers); no host sync in a training step; `torch.compile(fullgraph=True)` with no graph breaks, bit-identical to eager; CUDA-graph capture of fwd+bwd (fresh seeds per replay, noise averages out) and of a full Adam step (loss falls); fused accumulation in place with hooks firing, and under `torch.autograd.grad`; outputs not views; **two-process DDP (plain and bucket views) and FSDP2** over gloo, fused and unfused, bit-exact vs a single-process reference |
+| Memory / race safety | `tools/sanitize.sh` | compute-sanitizer memcheck, racecheck, synccheck, initcheck over every kernel variant (ragged shapes, TMA and cp.async loops, split-K, accumulate, all producer ops, GPU-resident seeds, a layer forward + backward): 0 findings |
 | Long-run stability | `tools/soak.py` | 8 minutes: 18,401 fused + unfused training iterations, 3,682 bit-exact gradient replays, 92,005 GEMMs re-checked bit for bit, no non-finite values, no hang |
 | Packaging | wheel built and installed into an isolated directory | imports and trains from outside the repository |
 | Hardware ISA | CI `cuda-compile` job | `OMMA.SF.16864...UE4M3.4X` present in SASS |
@@ -329,6 +374,9 @@ Every benchmark checks correctness against the reference before it times anythin
 
 ## 6. Known limitations and next steps
 
+Done in v0.5: GPU-resident seeds, no graph breaks under `torch.compile`, CUDA-graph capture of
+training steps, fused accumulation compatible with DDP / FSDP2, FSDP2 and multi-process tests, a
+three-seed quality study ([RESULTS.md §4.1](RESULTS.md)).
 Done in v0.4: NaN propagation (a NaN used to be quantized to finite values), per-device kernel
 attributes, exact-architecture checks, sanitizer / soak / packaging verification (§5).
 Done in v0.3: the TMA GEMM main loop (§4.1), split-K (§4.2) and LayerNorm/GELU fused into
@@ -348,8 +396,9 @@ accumulation.
    could be cached per optimizer step, but a safe invalidation rule is needed: `param.data` writes
    don't bump `_version`.
 5. **Fused sub-blocks** cover pre-LN blocks with bias-free linears and tanh-GELU.
-6. **Framework coverage.** `torch.compile` graph-breaks at each NVFP4 layer (custom autograd
-   Functions); registering the ops as `torch.library` custom ops would remove that. FSDP and
-   training-step CUDA-graph capture are untested (in a captured graph the host-drawn SR/RHT seeds
-   would be frozen).
-7. **Platform.** Linux/WSL2 only, one GPU model tested. The native Windows build hasn't been tried.
+6. **Framework coverage.** FSDP1 (`FullyShardedDataParallel`, flat parameters) is untested; FSDP2
+   (`fully_shard`) is tested. Multi-process tests run two ranks on one GPU over gloo: the NCCL path
+   across several GPUs is exercised only with one rank. `DTensor.full_tensor()` over gloo with CUDA
+   tensors crashes in PyTorch 2.14 (also for plain `nn.Linear`); the tests gather shards on the CPU.
+7. **Platform.** Linux/WSL2 only, one GPU model tested (RTX 5090 Laptop). The native Windows build
+   hasn't been tried.

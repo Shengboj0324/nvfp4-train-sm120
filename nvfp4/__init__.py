@@ -10,7 +10,7 @@ from nvfp4.linear import NVFP4Linear, convert_linears
 from nvfp4.ops import (NVFP4Tensor, available, gelu_backward_quantize_dual, gelu_quantize_dual, gemm,
                        layernorm_quantize_dual, quantize, quantize_dual)
 
-__version__ = "0.4.0"
+__version__ = "0.5.0"
 __all__ = ["reference", "NVFP4Tensor", "NVFP4Linear", "available", "convert_linears", "gelu_backward_quantize_dual",
            "gelu_quantize_dual", "gemm", "layernorm_linear", "layernorm_mlp", "layernorm_quantize_dual", "quantize",
            "quantize_dual", "__version__"]
