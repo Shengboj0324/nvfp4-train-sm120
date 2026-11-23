@@ -9,7 +9,7 @@
 #   env     GPUs, driver, topology, CUDA toolkit (installs CUDA 13.0 / 12.8 if no nvcc >= 12.8), PyTorch
 #   build   the extension for sm_120a
 #   tests   the full suite (incl. the two-GPU NCCL tests), then sanitizers + 5-minute soak
-#   bench   GEMM, quantizer and transformer-block benchmarks on this GPU model
+#   bench   GEMM, quantizer, GPT-block and Llama-block benchmarks on this GPU model
 #   gpt     GPT-124M, 3000 steps: BF16 and NVFP4 on one GPU, NVFP4 with DDP over all GPUs (NCCL)
 # Everything ends up in $OUT (default /workspace/nvfp4_results) and $OUT.tar.gz.
 # Every GPU job runs under tools/guard.py (temperature / memory limits, over all GPUs).
@@ -127,6 +127,9 @@ do_bench() {
   python tools/guard.py --log "$OUT/bench_train_step.csv" -- python bench/bench_train_step.py --out "$OUT/train_step.json" \
     > "$OUT/bench_train_step.log" 2>&1 || st=1
   tail -8 "$OUT/bench_train_step.log"
+  python tools/guard.py --log "$OUT/bench_llama.csv" -- python bench/bench_llama_block.py --out "$OUT/llama_block.json" \
+    > "$OUT/bench_llama.log" 2>&1 || st=1
+  tail -6 "$OUT/bench_llama.log"
   return $st
 }
 
