@@ -40,6 +40,11 @@ tools/check.sh            # build + 324 tests (~20 s of GPU time); Windows: tool
 tools/check.sh release    # + compute-sanitizer (memcheck, racecheck, synccheck, initcheck) + 5-minute soak
 ```
 
+On a multi-GPU Linux machine (for example a rented cloud instance), `tools/pod_session.sh` does all
+of it in one go: installs a CUDA toolkit and PyTorch if needed, builds, runs the tests (including the
+two-GPU NCCL tests, which skip on one GPU), sanitizers and soak, the benchmarks, and GPT-124M runs on
+one GPU and with DDP over all GPUs, and packs every log and result into one archive.
+
 ## 3. Integrating
 
 ### 3.1 Linear layers

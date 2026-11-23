@@ -11,6 +11,7 @@ recipe. The optimizer keeps fp32 master weights in both modes (autocast BF16).
 from __future__ import annotations
 
 import argparse
+import contextlib
 import json
 import math
 import os
@@ -137,6 +138,16 @@ def main():
     ap.add_argument("--data", default=os.environ.get("NVFP4_DATA", os.path.expanduser("~/nvfp4_data")))
     ap.add_argument("--out", required=True)
     a = ap.parse_args()
+    # Data parallel when launched with torchrun (NCCL, one process per GPU): the global batch stays
+    # a.batch sequences per optimizer step, split over ranks; one process keeps the single-GPU path.
+    world = int(os.environ.get("WORLD_SIZE", "1"))
+    ddp = world > 1
+    rank = 0
+    if ddp:
+        import torch.distributed as dist
+        dist.init_process_group(os.environ.get("NVFP4_DIST_BACKEND", "nccl"))  # gloo: smoke tests on one GPU
+        rank = dist.get_rank()
+        torch.cuda.set_device(int(os.environ.get("LOCAL_RANK", "0")) % torch.cuda.device_count())
 
     torch.manual_seed(a.seed)
     torch.backends.cuda.matmul.allow_tf32 = True
@@ -153,17 +164,24 @@ def main():
             fuse_producers(model.blocks)
     n_params = sum(p.numel() for p in model.parameters())
     opt = torch.optim.AdamW(model.parameters(), lr=a.lr, betas=(0.9, 0.95), weight_decay=0.1, fused=True)
+    fwd = model
+    if ddp:
+        from torch.nn.parallel import DistributedDataParallel as DDP
+        fwd = DDP(model, device_ids=[torch.cuda.current_device()])
+        torch.cuda.manual_seed(a.seed * 7919 + rank + 1)  # independent rounding seeds per rank
     sched = lambda s: min(1.0, (s + 1) / a.warmup) * (0.1 + 0.9 * 0.5 * (1 + math.cos(math.pi * min(s, a.steps) / a.steps)))  # noqa: E731
-    assert a.batch % a.micro_batch == 0
-    accum = a.batch // a.micro_batch
-    gen = torch.Generator().manual_seed(a.seed)
+    assert a.batch % (a.micro_batch * world) == 0
+    accum = a.batch // (a.micro_batch * world)
+    gen = torch.Generator().manual_seed(a.seed if not ddp else a.seed * 1000 + rank)
     it = batches(train, a.micro_batch, a.ctx, gen)
-    os.makedirs(os.path.dirname(os.path.abspath(a.out)), exist_ok=True)
-    log = open(a.out, "w", buffering=1)
+    if rank == 0:
+        os.makedirs(os.path.dirname(os.path.abspath(a.out)), exist_ok=True)
+    log = open(a.out if rank == 0 else os.devnull, "w", buffering=1)
     meta = {"config": vars(a), "params": n_params, "nvfp4_linears": len(converted), "torch": torch.__version__,
-            "device": torch.cuda.get_device_name()}
+            "device": torch.cuda.get_device_name(), "world_size": world}
     log.write(json.dumps({"meta": meta}) + "\n")
-    print(meta, flush=True)
+    if rank == 0:
+        print(meta, flush=True)
 
     tok_per_step = a.batch * a.ctx
     t_last, tokens_window = time.perf_counter(), 0
@@ -173,18 +191,21 @@ def main():
             vl = evaluate(model, val, a.micro_batch, a.ctx, n_batches=40)
             rec = {"step": step, "val_loss": vl, "elapsed_s": time.perf_counter() - t_start}
             log.write(json.dumps(rec) + "\n")
-            print(rec, flush=True)
+            if rank == 0:
+                print(rec, flush=True)
             t_last, tokens_window = time.perf_counter(), 0  # exclude eval from throughput
         if step == a.steps:
             break
         for g in opt.param_groups:
             g["lr"] = a.lr * sched(step)
         loss_acc = 0.0
-        for _ in range(accum):
+        for i in range(accum):
             x, y = next(it)
-            with torch.autocast("cuda", dtype=torch.bfloat16):
-                _, loss = model(x, y)
-            (loss / accum).backward()
+            sync = not ddp or i == accum - 1  # all-reduce gradients once per optimizer step
+            with (contextlib.nullcontext() if sync else fwd.no_sync()):
+                with torch.autocast("cuda", dtype=torch.bfloat16):
+                    _, loss = fwd(x, y)
+                (loss / accum).backward()
             loss_acc += loss.detach() / accum
         loss = loss_acc
         gn = torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
@@ -198,7 +219,7 @@ def main():
                    "tok_per_s": tokens_window / (now - t_last) if step else None,
                    "max_mem_gb": torch.cuda.max_memory_allocated() / 2**30}
             log.write(json.dumps(rec) + "\n")
-            if step % 100 == 0:
+            if step % 100 == 0 and rank == 0:
                 print(rec, flush=True)
             t_last, tokens_window = now, 0
             if not math.isfinite(rec["loss"]):
@@ -209,8 +230,10 @@ def main():
     # Wind down explicitly (finish queued work, release cached memory) rather than tearing down a busy
     # CUDA context at interpreter exit; on this laptop a run once ended in a display-driver crash.
     torch.cuda.synchronize()
-    del model, opt
+    del model, opt, fwd
     torch.cuda.empty_cache()
+    if ddp:
+        torch.distributed.destroy_process_group()
 
 
 if __name__ == "__main__":

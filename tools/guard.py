@@ -28,13 +28,19 @@ WINDOWS = os.name == "nt"
 
 def gpu_sample() -> dict:
     q = "temperature.gpu,power.draw,utilization.gpu,memory.used,memory.total,clocks.sm"
+    """One sample over all visible GPUs, reporting the worst one for each limit: the hottest temperature,
+    the highest power and utilization, the fullest memory (multi-GPU training)."""
     try:
-        out = subprocess.run(["nvidia-smi", f"--query-gpu={q}", "--format=csv,noheader,nounits"],
-                             capture_output=True, text=True, timeout=10).stdout.strip().splitlines()[0]
-        t, p, u, mu, mt, clk = [x.strip() for x in out.split(",")]
+        lines = subprocess.run(["nvidia-smi", f"--query-gpu={q}", "--format=csv,noheader,nounits"],
+                               capture_output=True, text=True, timeout=10).stdout.strip().splitlines()
         f = lambda s: float(s) if s not in ("[N/A]", "N/A", "") else float("nan")  # noqa: E731
-        return {"gpu_temp_c": f(t), "gpu_power_w": f(p), "gpu_util": f(u),
-                "gpu_mem_used_mb": f(mu), "gpu_mem_total_mb": f(mt), "sm_clock_mhz": f(clk)}
+        gpus = [[f(x.strip()) for x in ln.split(",")] for ln in lines if ln.strip()]
+        if not gpus:
+            return {}
+        fullest = max(gpus, key=lambda g: g[3] / g[4] if g[4] > 0 else 0.0)
+        return {"gpu_temp_c": max(g[0] for g in gpus), "gpu_power_w": max(g[1] for g in gpus),
+                "gpu_util": max(g[2] for g in gpus), "gpu_mem_used_mb": fullest[3],
+                "gpu_mem_total_mb": fullest[4], "sm_clock_mhz": min(g[5] for g in gpus), "n_gpus": len(gpus)}
     except Exception:  # noqa: BLE001 - a failed sample must never crash the guard
         return {}
 
