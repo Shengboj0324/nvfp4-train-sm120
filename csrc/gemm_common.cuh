@@ -240,13 +240,12 @@ __device__ __forceinline__ void store_tile(const Args& p, float (&acc)[MI][NI][4
   }
 }
 
-// Common tail of both kernels: split-K reduction (if any), then the output store.
+// Common tail of both kernels: split-K reduction (if any) of split `z` of output tile `tile`, then the
+// output store.
 template <typename OutT, bool kAccum>
 __device__ __forceinline__ void finish_tile(const Args& p, float (&acc)[MI][NI][4], int m0, int n0, int wm, int wn,
-                                            int lane, int* flag) {
-  if (p.splits > 1 &&
-      !splitk_reduce(p, acc, m0, n0, wm, wn, lane, blockIdx.z, blockIdx.y * gridDim.x + blockIdx.x, flag))
-    return;
+                                            int lane, int* flag, int z, int tile) {
+  if (p.splits > 1 && !splitk_reduce(p, acc, m0, n0, wm, wn, lane, z, tile, flag)) return;
   store_tile<OutT, kAccum>(p, acc, m0, n0, wm, wn, lane);
 }
 
