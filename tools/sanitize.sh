@@ -4,8 +4,13 @@
 #   tools/sanitize.sh [tool ...]
 set -uo pipefail
 cd "$(dirname "$0")/.."
-PY=${PY:-$HOME/nvfp4/bin/python}
-CS=${CS:-$(command -v compute-sanitizer || echo /usr/local/cuda-13.0/bin/compute-sanitizer)}
+if [ -z "${PY:-}" ]; then
+  if [ -x "$HOME/nvfp4/bin/python" ]; then PY=$HOME/nvfp4/bin/python; else PY=$(command -v python || command -v python3); fi
+fi
+if [ -z "${CS:-}" ]; then
+  CS=$(command -v compute-sanitizer || ls /usr/local/cuda*/bin/compute-sanitizer /usr/local/cuda*/compute-sanitizer/compute-sanitizer 2>/dev/null | head -1)
+fi
+[ -x "$CS" ] || { echo "compute-sanitizer not found (set CS=...)"; exit 2; }
 export PYTHONPATH=$PWD${PYTHONPATH:+:$PYTHONPATH}
 status=0
 for tool in ${@:-memcheck racecheck synccheck initcheck}; do
