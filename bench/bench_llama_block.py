@@ -1,7 +1,8 @@
 """Training-step speed of one Llama-style block (RMSNorm, qkv, causal SDPA, o_proj, RMSNorm, SwiGLU MLP)
 vs model width: BF16, NVFP4 linears, and NVFP4 with RMSNorm / SwiGLU fused into the quantizers
 (nvfp4.fused.rmsnorm_linear / rmsnorm_swiglu_mlp, fused wgrad accumulation), with and without the
-weight-quantization cache (a micro-batch after the first under gradient accumulation).
+weight-quantization cache (a micro-batch after the first under gradient accumulation); "_res" also
+fuses the residual adds and the q / k / v hand-off (chunks=3, return_residual, residual=True: v0.8).
 
     python bench/bench_llama_block.py [--out bench/results/llama_block.json]
 
@@ -35,13 +36,23 @@ class LlamaBlock(torch.nn.Module):
         self.up = torch.nn.Linear(d, hidden, bias=False)
         self.down = torch.nn.Linear(hidden, d, bias=False)
         self.fused = False
+        self.fused_res = False
 
     def attn(self, qkv):
         b, t, _ = qkv.shape
         q, k, v = qkv.view(b, t, 3, self.heads, -1).permute(2, 0, 3, 1, 4)
         return F.scaled_dot_product_attention(q, k, v, is_causal=True).transpose(1, 2).reshape(b, t, -1)
 
+    def attn3(self, q, k, v):
+        b, t, _ = q.shape
+        q, k, v = (z.view(b, t, self.heads, -1).transpose(1, 2) for z in (q, k, v))
+        return F.scaled_dot_product_attention(q, k, v, is_causal=True).transpose(1, 2).reshape(b, t, -1)
+
     def forward(self, x):
+        if self.fused_res:
+            q, k, v, res = rmsnorm_linear(x, self.norm1, self.qkv, chunks=3, return_residual=True)
+            x = self.o_proj(self.attn3(q, k, v), residual=res)
+            return rmsnorm_swiglu_mlp(x, self.norm2, self.gate, self.up, self.down, residual=True)
         if self.fused:
             x = x + self.o_proj(self.attn(rmsnorm_linear(x, self.norm1, self.qkv)))
             return x + rmsnorm_swiglu_mlp(x, self.norm2, self.gate, self.up, self.down)
@@ -59,8 +70,9 @@ def step_time(d: int, variant: str, b: int = 16, t: int = 512) -> tuple[float, f
     blk = LlamaBlock(d, d // 128, hidden_size(d)).cuda()
     if variant != "bf16":
         convert_linears(blk, fuse_wgrad_accumulation=variant != "nvfp4",
-                        cache_weight_quantization=variant == "nvfp4_fused_cached")
+                        cache_weight_quantization=variant.endswith("_cached"))
         blk.fused = variant.startswith("nvfp4_fused")
+        blk.fused_res = variant.startswith("nvfp4_fused_res")
     x = torch.randn(b, t, d, device="cuda", requires_grad=True)
 
     def step():
@@ -75,6 +87,9 @@ def step_time(d: int, variant: str, b: int = 16, t: int = 512) -> tuple[float, f
     return sec, torch.cuda.max_memory_allocated() / 2**20
 
 
+VARIANTS = ("bf16", "nvfp4", "nvfp4_fused", "nvfp4_fused_cached", "nvfp4_fused_res", "nvfp4_fused_res_cached")
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--out", default="bench/results/llama_block.json")
@@ -83,11 +98,11 @@ def main():
     rows = []
     for d in (int(w) for w in a.widths.split(",")):
         r = {"d": d, "hidden": hidden_size(d)}
-        for v in ("bf16", "nvfp4", "nvfp4_fused", "nvfp4_fused_cached"):
+        for v in VARIANTS:
             sec, mib = step_time(d, v)
             r[f"{v}_ms"], r[f"peak_mib_{v}"] = sec * 1e3, mib
             torch.cuda.empty_cache()
-        for v in ("nvfp4", "nvfp4_fused", "nvfp4_fused_cached"):
+        for v in VARIANTS[1:]:
             r[f"speedup_{v}"] = r["bf16_ms"] / r[f"{v}_ms"]
         rows.append(r)
         print(json.dumps({k: round(v, 3) if isinstance(v, float) else v for k, v in r.items()}), flush=True)

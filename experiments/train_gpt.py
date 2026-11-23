@@ -37,9 +37,19 @@ class Block(nn.Module):
         self.fc1 = nn.Linear(d, 4 * d, bias=False)
         self.fc2 = nn.Linear(4 * d, d, bias=False)
         self.fused = False  # set by fuse_producers(): LayerNorm / GELU run inside the NVFP4 quantizers
+        self.fused_residual = False  # also q / k / v chunks and the residual adds (fuse_producers(residual=True))
+
+    def attend(self, q, k, v):
+        b, t, d = q.shape
+        q, k, v = (z.view(b, t, self.h, d // self.h).transpose(1, 2) for z in (q, k, v))
+        return F.scaled_dot_product_attention(q, k, v, is_causal=True).transpose(1, 2).reshape(b, t, d)
 
     def forward(self, x):
         b, t, d = x.shape
+        if self.fused_residual:
+            q, k, v, res = layernorm_linear(x, self.ln1, self.qkv, chunks=3, return_residual=True)
+            x = self.proj(self.attend(q, k, v), residual=res)
+            return layernorm_mlp(x, self.ln2, self.fc1, self.fc2, residual=True)
         if self.fused:
             q, k, v = layernorm_linear(x, self.ln1, self.qkv).split(d, dim=2)
         else:
@@ -52,13 +62,15 @@ class Block(nn.Module):
         return x + self.fc2(F.gelu(self.fc1(self.ln2(x)), approximate="tanh"))
 
 
-def fuse_producers(blocks) -> int:
-    """Run LayerNorm and GELU inside the NVFP4 quantizers in every block whose qkv / fc1 / fc2 are
-    NVFP4Linear (nvfp4.fused). Returns the number of fused blocks."""
+def fuse_producers(blocks, residual: bool = True) -> int:
+    """Run LayerNorm and GELU inside the NVFP4 quantizers in every block whose linears are NVFP4Linear
+    (nvfp4.fused); with ``residual``, also hand q / k / v over without a concatenation and fuse both
+    residual adds (into the GEMM epilogues and the LayerNorm backward). Returns the number of fused blocks."""
     n = 0
     for blk in blocks:
-        if all(isinstance(m, NVFP4Linear) and m.backend == "cuda" for m in (blk.qkv, blk.fc1, blk.fc2)):
+        if all(isinstance(m, NVFP4Linear) and m.backend == "cuda" for m in (blk.qkv, blk.proj, blk.fc1, blk.fc2)):
             blk.fused = True
+            blk.fused_residual = residual
             n += 1
     return n
 

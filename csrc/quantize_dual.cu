@@ -58,6 +58,10 @@ struct Params {
   // rht_seed, so the seeds can come from a GPU random generator: no host sync, CUDA-graph capturable
   // (every replay reads that replay's values), and traceable by torch.compile.
   const int64_t *row_seed_ptr, *col_seed_ptr, *rht_seed_ptr;
+  // Multi-part input (producer op kNone only): X = [part0 | part1 | ...] along C, each part a separate
+  // contiguous [R, part_cols] tensor (ProArgs::part), e.g. the q / k / v gradients of a fused qkv
+  // projection, quantized without first being concatenated. 0: X is one contiguous tensor.
+  int part_cols;
 };
 
 // Device seeds: thread i < 3 of a CTA loads seed i at kernel entry, parks it in shared memory after its
@@ -100,7 +104,8 @@ enum Pro : int {
   kGeluErf = 8,        // X = h:  gelu_erf(h)
   kGeluErfBwd = 9,     // X = dY: dY * gelu_erf'(h),           aux = h
 };
-// The four GELU variants add the per-column bias ProArgs::beta (if set) to h first.
+// The four GELU variants add the per-column bias ProArgs::beta (if set) to h first; the three SwiGLU
+// variants add ProArgs::beta (if set) to g and ProArgs::gamma (if set) to u first (the gate / up biases).
 
 template <typename T>
 struct ProArgs {
@@ -110,7 +115,16 @@ struct ProArgs {
   const float* beta;   // [C]   LayerNorm bias / bias added to the GELU input (optional)
   const T* aux;        // [R,C] second input (see Pro)
   const T* aux2;       // [R,C] third input (see Pro)
+  const T* part[3];    // multi-part input (Params::part_cols)
 };
+
+// Per-column bias b (optional) added to v[0..n) in fp32: the bias of the linear that produced v.
+template <int n>
+__device__ __forceinline__ void add_bias(float* v, const float* b, int gc) {
+  if (b == nullptr) return;
+#pragma unroll
+  for (int i = 0; i < n; ++i) v[i] = __fadd_rn(v[i], __ldg(b + gc + i));
+}
 
 __device__ __forceinline__ void unpack8(const uint4& u, float* v) {
   const __nv_bfloat162* h = reinterpret_cast<const __nv_bfloat162*>(&u);
@@ -146,19 +160,13 @@ __device__ __forceinline__ void apply_pro(float* v, const ProArgs<T>& pa, int64_
     for (int i = 0; i < VEC; ++i)
       v[i] = layernorm_apply(v[i], m, rs, __ldg(pa.gamma + gc + i), __ldg(pa.beta + gc + i));
   } else if constexpr (PRO == kGelu || PRO == kGeluErf) {
-    if (pa.beta) {
-#pragma unroll
-      for (int i = 0; i < VEC; ++i) v[i] = __fadd_rn(v[i], __ldg(pa.beta + gc + i));
-    }
+    add_bias<VEC>(v, pa.beta, gc);
 #pragma unroll
     for (int i = 0; i < VEC; ++i) v[i] = PRO == kGelu ? gelu_tanh(v[i]) : gelu_erf(v[i]);
   } else if constexpr (PRO == kGeluBwd || PRO == kGeluErfBwd) {
     float h[VEC];
     load_vec(pa.aux + off, h);
-    if (pa.beta) {
-#pragma unroll
-      for (int i = 0; i < VEC; ++i) h[i] = __fadd_rn(h[i], __ldg(pa.beta + gc + i));
-    }
+    add_bias<VEC>(h, pa.beta, gc);
 #pragma unroll
     for (int i = 0; i < VEC; ++i) v[i] = PRO == kGeluBwd ? gelu_tanh_backward(v[i], h[i]) : gelu_erf_backward(v[i], h[i]);
   } else if constexpr (PRO == kRmsNorm) {
@@ -168,17 +176,22 @@ __device__ __forceinline__ void apply_pro(float* v, const ProArgs<T>& pa, int64_
   } else if constexpr (PRO == kSwiglu) {
     float u[VEC];
     load_vec(pa.aux + off, u);
+    add_bias<VEC>(v, pa.beta, gc);
+    add_bias<VEC>(u, pa.gamma, gc);
 #pragma unroll
     for (int i = 0; i < VEC; ++i) v[i] = swiglu(v[i], u[i]);
   } else if constexpr (PRO == kSwigluBwdGate) {
     float g[VEC], u[VEC];
     load_vec(pa.aux + off, g);
     load_vec(pa.aux2 + off, u);
+    add_bias<VEC>(g, pa.beta, gc);
+    add_bias<VEC>(u, pa.gamma, gc);
 #pragma unroll
     for (int i = 0; i < VEC; ++i) v[i] = swiglu_backward_gate(v[i], g[i], u[i]);
   } else if constexpr (PRO == kSwigluBwdUp) {
     float g[VEC];
     load_vec(pa.aux + off, g);
+    add_bias<VEC>(g, pa.beta, gc);
 #pragma unroll
     for (int i = 0; i < VEC; ++i) v[i] = swiglu_backward_up(v[i], g[i]);
   }
@@ -200,7 +213,12 @@ __device__ __forceinline__ float load_tile(const T* __restrict__ x, const Params
     float v[VEC];
     if (gr < p.R && gc < p.C) {  // C % 16 == 0, so a vector is either fully inside or fully outside
       const int64_t off = static_cast<int64_t>(gr) * p.C + gc;
-      load_vec(x + off, v);
+      if (PRO == kNone && p.part_cols > 0) {  // part_cols % 16 == 0: a vector lies in one part
+        const int part = gc / p.part_cols;
+        load_vec(pa.part[part] + static_cast<int64_t>(gr) * p.part_cols + (gc - part * p.part_cols), v);
+      } else {
+        load_vec(x + off, v);
+      }
       apply_pro<T, PRO>(v, pa, off, gr, gc);
     } else {
 #pragma unroll
@@ -479,12 +497,14 @@ const int64_t* seed_ptr(const OptTensor& t, const torch::Tensor& x, const char* 
 
 // Shared host path of all quantize_dual entry points. `pro` selects the producer op; LayerNorm needs
 // mean / rstd / gamma / beta, the GELU backward needs `aux` (h).
+// `parts` (producer op kNone only): x is parts[0] and the quantized tensor is the concatenation of all parts
+// along dim 1 (see Params::part_cols).
 std::vector<torch::Tensor> run_dual(const torch::Tensor& x, int pro, const torch::Tensor* aux,
                                     const torch::Tensor* aux2, const float* mean,
                                     const float* rstd, const float* gamma, const float* beta, bool do_row, bool do_col,
                                     bool block_2d, bool row_sr, int64_t row_seed, bool col_sr, int64_t col_seed,
                                     bool col_rht, int64_t rht_seed, int64_t col_pad, const SeedTensors& seeds,
-                                    bool col_sums = false) {
+                                    bool col_sums = false, const std::vector<torch::Tensor>* parts = nullptr) {
   TORCH_CHECK(x.is_cuda() && x.dim() == 2 && x.is_contiguous(), "x must be a contiguous 2D CUDA tensor");
   TORCH_CHECK(x.scalar_type() == at::kBFloat16 || x.scalar_type() == at::kFloat, "x must be bf16 or fp32");
   TORCH_CHECK(reinterpret_cast<uintptr_t>(x.data_ptr()) % 16 == 0, "x must be 16-byte aligned");
@@ -495,6 +515,16 @@ std::vector<torch::Tensor> run_dual(const torch::Tensor& x, int pro, const torch
   Params p{};
   p.R = static_cast<int>(x.size(0));
   p.C = static_cast<int>(x.size(1));
+  const int nparts = parts ? static_cast<int>(parts->size()) : 1;
+  if (nparts > 1) {
+    TORCH_CHECK(pro == kNone && nparts <= 3, "at most 3 parts, without a producer op");
+    for (const auto& t : *parts)
+      TORCH_CHECK(t.is_cuda() && t.device() == x.device() && t.scalar_type() == x.scalar_type() && t.dim() == 2 &&
+                      t.is_contiguous() && t.sizes() == x.sizes() && reinterpret_cast<uintptr_t>(t.data_ptr()) % 16 == 0,
+                  "parts must be contiguous, 16-byte aligned tensors of one shape, dtype and device");
+    p.part_cols = p.C;
+    p.C *= nparts;
+  }
   TORCH_CHECK(p.C % kBlock == 0, "x.shape[1] (", p.C, ") must be a multiple of 16");
   TORCH_CHECK(!block_2d || p.R % kBlock == 0, "2D blocks need x.shape[0] % 16 == 0");
   TORCH_CHECK(!(block_2d && col_rht), "2D blocks and the RHT are not combined");
@@ -548,7 +578,9 @@ std::vector<torch::Tensor> run_dual(const torch::Tensor& x, int pro, const torch
     using T = std::remove_cv_t<std::remove_pointer_t<decltype(xp)>>;
     constexpr int PRO = decltype(pro_c)::value;
     ProArgs<T> pa{mean, rstd, gamma, beta, aux ? reinterpret_cast<const T*>(aux->data_ptr()) : nullptr,
-                  aux2 ? reinterpret_cast<const T*>(aux2->data_ptr()) : nullptr};
+                  aux2 ? reinterpret_cast<const T*>(aux2->data_ptr()) : nullptr, {nullptr, nullptr, nullptr}};
+    if (p.part_cols > 0)
+      for (int i = 0; i < nparts; ++i) pa.part[i] = reinterpret_cast<const T*>((*parts)[i].data_ptr());
     // amax passes are persistent: ~4 CTAs per SM, grid-stride
     const int max_ctas = 4 * at::cuda::getCurrentDeviceProperties()->multiProcessorCount;
     if (p.col_rht || PRO != kNone) {
@@ -558,7 +590,8 @@ std::vector<torch::Tensor> run_dual(const torch::Tensor& x, int pro, const torch
     } else {
       const int64_t nvec = x.numel() / (16 / static_cast<int64_t>(sizeof(T)));
       const int agrid = static_cast<int>(std::min<int64_t>((nvec + THREADS - 1) / THREADS, max_ctas));
-      amax_flat_kernel<T><<<agrid, THREADS, 0, stream>>>(xp, nvec, amax_ptr);
+      for (int i = 0; i < nparts; ++i)  // one pass per part: they share the atomic max
+        amax_flat_kernel<T><<<agrid, THREADS, 0, stream>>>(p.part_cols > 0 ? pa.part[i] : xp, nvec, amax_ptr);
     }
     dual_quantize_kernel<T, PRO><<<grid, THREADS, 0, stream>>>(xp, p, pa, amax_ptr, amax_col, o);
   };
@@ -633,6 +666,20 @@ std::vector<torch::Tensor> nvfp4_quantize_dual(torch::Tensor x, bool do_row, boo
   return run_dual(x, kNone, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, do_row, do_col, block_2d, row_sr,
                   row_seed,
                   col_sr, col_seed, col_rht, rht_seed, col_pad, {row_seed_t, col_seed_t, rht_seed_t});
+}
+
+// quantize_dual of the concatenation of 1-3 same-shaped tensors along dim 1 (e.g. the q, k, v gradients of a
+// fused qkv projection), read in place. With col_sums, a 7th output holds per-tile column sums ([tiles, C]
+// fp32; their sum over dim 0 is the gradient of a bias added to the quantized tensor).
+std::vector<torch::Tensor> nvfp4_quantize_dual_parts(std::vector<torch::Tensor> parts, bool do_row, bool do_col,
+                                                     bool row_sr, int64_t row_seed, bool col_sr, int64_t col_seed,
+                                                     bool col_rht, int64_t rht_seed, int64_t col_pad,
+                                                     const OptTensor& row_seed_t, const OptTensor& col_seed_t,
+                                                     const OptTensor& rht_seed_t, bool col_sums) {
+  TORCH_CHECK(!parts.empty(), "no input");
+  return run_dual(parts[0], kNone, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, do_row, do_col, false, row_sr,
+                  row_seed, col_sr, col_seed, col_rht, rht_seed, col_pad, {row_seed_t, col_seed_t, rht_seed_t},
+                  col_sums, &parts);
 }
 
 // LayerNorm fused into the dual quantizer: quantizes y = LayerNorm(x; gamma, beta, eps) without
@@ -755,30 +802,35 @@ std::vector<torch::Tensor> nvfp4_rmsnorm_quantize_dual(torch::Tensor x, torch::T
   return q;
 }
 
-// SwiGLU fused into the dual quantizer: quantizes silu(g) * u (bf16 gate / up projections) without
-// writing it.
+// SwiGLU fused into the dual quantizer: quantizes silu(g + bias_g) * (u + bias_u) (bf16 gate / up
+// projections, optional fp32 per-column biases added in fp32) without writing it.
 std::vector<torch::Tensor> nvfp4_swiglu_quantize_dual(torch::Tensor g, torch::Tensor u, bool do_row, bool do_col,
                                                       bool row_sr, int64_t row_seed, bool col_sr, int64_t col_seed,
                                                       bool col_rht, int64_t rht_seed, int64_t col_pad,
                                                       const OptTensor& row_seed_t, const OptTensor& col_seed_t,
-                                                      const OptTensor& rht_seed_t) {
+                                                      const OptTensor& rht_seed_t, const OptTensor& bias_g,
+                                                      const OptTensor& bias_u) {
   check_like(u, g, "u");
-  return run_dual(g, kSwiglu, &u, nullptr, nullptr, nullptr, nullptr, nullptr, do_row, do_col, false, row_sr,
-                  row_seed, col_sr, col_seed, col_rht, rht_seed, col_pad, {row_seed_t, col_seed_t, rht_seed_t});
+  return run_dual(g, kSwiglu, &u, nullptr, nullptr, nullptr, bias_ptr(bias_u, g), bias_ptr(bias_g, g), do_row, do_col,
+                  false, row_sr, row_seed, col_sr, col_seed, col_rht, rht_seed, col_pad,
+                  {row_seed_t, col_seed_t, rht_seed_t});
 }
 
 // SwiGLU backward fused into the dual quantizer: quantizes the gradient w.r.t. the gate projection,
 // dy * u * silu'(g) (gate = true), or w.r.t. the up projection, dy * silu(g) (gate = false), from the
-// bf16 gradient dy of silu(g) * u, without writing it.
+// bf16 gradient dy of silu(g) * u, without writing it. The biases (as in nvfp4_swiglu_quantize_dual) are
+// added to g and u first; with col_sums a 7th output holds per-tile column sums of the quantized gradient
+// (their sum over dim 0 is the gradient of that projection's bias).
 std::vector<torch::Tensor> nvfp4_swiglu_backward_quantize_dual(torch::Tensor dy, torch::Tensor g, torch::Tensor u,
                                                                bool gate, bool do_row, bool do_col, bool row_sr,
                                                                int64_t row_seed, bool col_sr, int64_t col_seed,
                                                                bool col_rht, int64_t rht_seed, int64_t col_pad,
                                                                const OptTensor& row_seed_t, const OptTensor& col_seed_t,
-                                                               const OptTensor& rht_seed_t) {
+                                                               const OptTensor& rht_seed_t, const OptTensor& bias_g,
+                                                               const OptTensor& bias_u, bool col_sums) {
   check_like(g, dy, "g");
   if (gate) check_like(u, dy, "u");
-  return run_dual(dy, gate ? kSwigluBwdGate : kSwigluBwdUp, &g, gate ? &u : nullptr, nullptr, nullptr, nullptr,
-                  nullptr, do_row, do_col, false, row_sr, row_seed, col_sr, col_seed, col_rht, rht_seed, col_pad,
-                  {row_seed_t, col_seed_t, rht_seed_t});
+  return run_dual(dy, gate ? kSwigluBwdGate : kSwigluBwdUp, &g, gate ? &u : nullptr, nullptr, nullptr,
+                  gate ? bias_ptr(bias_u, dy) : nullptr, bias_ptr(bias_g, dy), do_row, do_col, false, row_sr, row_seed,
+                  col_sr, col_seed, col_rht, rht_seed, col_pad, {row_seed_t, col_seed_t, rht_seed_t}, col_sums);
 }

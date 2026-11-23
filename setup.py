@@ -24,7 +24,8 @@ if os.environ.get("NVFP4_SKIP_CUDA") != "1":
     ext_modules = [
         CUDAExtension(
             name="nvfp4._C",
-            sources=["csrc/bindings.cpp", "csrc/quantize.cu", "csrc/quantize_dual.cu", "csrc/gemm.cu", "csrc/gemm_tma.cu"],
+            sources=["csrc/bindings.cpp", "csrc/quantize.cu", "csrc/quantize_dual.cu", "csrc/gemm.cu", "csrc/gemm_tma.cu",
+                     "csrc/norm.cu"],
             extra_compile_args={
                 "cxx": cxx,
                 "nvcc": ["-O3", "-std=c++20", f"-gencode=arch=compute_{arch},code=sm_{arch}",

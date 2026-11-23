@@ -207,9 +207,13 @@ def _weight_grad(ctx, param, dytq, xtq, w_dtype, backend_name: str):
 
 
 class _NVFP4LinearFn(torch.autograd.Function):
+    """y = [residual +] x W^T [+ bias] in NVFP4, in ``out_dtype`` (promoted with the residual's): the bf16
+    GEMM output cast to out_dtype, then bias and residual added (in the GEMM's epilogue on the CUDA
+    backend, bit-identical to reference.linear_epilogue, which the emulated backend runs)."""
+
     @staticmethod
     def forward(ctx, x2d, weight, backend_name: str, wgrad_rht: bool, need_dgrad: bool, need_wgrad: bool,
-                fuse_wgrad: bool, wcache):
+                fuse_wgrad: bool, wcache, bias=None, residual=None, out_dtype=torch.bfloat16):
         be = _BACKENDS[backend_name]
         # [dY row SR, dY^T SR, RHT]: drawn once per call; the backward reuses the RHT seed of X^T
         seeds = draw_seeds(3, x2d.device) if need_dgrad or need_wgrad else None
@@ -218,7 +222,12 @@ class _NVFP4LinearFn(torch.autograd.Function):
         xq, xtq = be.dual(x2d, col=need_wgrad, rht_seed=rht, col_pad=ALIGN)
         # W  -> 16x16 tiles; W^T (exact transpose) for dgrad
         wq, wtq = quantized_weight(weight, need_dgrad, backend_name, wcache)
-        y = be.mm(xq, wq, torch.bfloat16)                                   # [M, out]
+        if backend_name == "cuda" and (bias is not None or residual is not None):
+            y = ops.gemm(xq, wq, out_dtype, bias=bias, residual=residual)  # [M, out], epilogue fused
+        else:
+            y = be.mm(xq, wq, torch.bfloat16)                               # [M, out]
+            if bias is not None or residual is not None or out_dtype != torch.bfloat16:
+                y = ref.linear_epilogue(y, out_dtype, bias, residual)
         saved = [seeds] if seeds is not None else []
         if need_wgrad:
             saved += xtq.as_storage()
@@ -228,35 +237,51 @@ class _NVFP4LinearFn(torch.autograd.Function):
         ctx.backend_name, ctx.use_rht, ctx.w_dtype = backend_name, rht is not None, weight.dtype
         ctx.need_dgrad, ctx.need_wgrad = need_dgrad, need_wgrad
         ctx.param = weight if fuse_wgrad and backend_name == "cuda" else None
+        ctx.has_bias = bias is not None
         return y
 
     @staticmethod
     def backward(ctx, dy):
         be = _BACKENDS[ctx.backend_name]
         saved = list(ctx.saved_tensors)
-        do_dx = ctx.need_dgrad and ctx.needs_input_grad[0]
-        do_dw = ctx.need_wgrad and ctx.needs_input_grad[1]
+        nin = ctx.needs_input_grad
+        do_dx = ctx.need_dgrad and nin[0]
+        do_dw = ctx.need_wgrad and nin[1]
+        do_db = ctx.has_bias and nin[8]
+        grads = [None] * 11
+        if nin[9]:                                                          # residual: passed through
+            grads[9] = dy
         if not (do_dx or do_dw):
-            return (None,) * 8
+            if do_db:
+                grads[8] = dy.reshape(-1, dy.shape[-1]).float().sum(0)
+            return tuple(grads)
         seeds = saved[0]
         xtq = ops.NVFP4Tensor(*saved[1:4]) if ctx.need_wgrad else None
         wtq = ops.NVFP4Tensor(*saved[-3:]) if ctx.need_dgrad else None
         dy = dy.contiguous()
         if dy.dtype not in (torch.bfloat16, torch.float32):
             dy = dy.float()
-        # dY -> rowwise with SR for dgrad, and dY^T with RHT + SR for wgrad, from one read
-        dyq, dytq = be.dual(dy, row=do_dx, col=do_dw, row_sr_seed=seeds[0] if do_dx else None,
-                            col_sr_seed=seeds[1] if do_dw else None, rht_seed=seeds[2] if ctx.use_rht else None,
-                            col_pad=ALIGN)
-        dx = be.mm(dyq, wtq, torch.bfloat16) if do_dx else None              # [M, in]
-        dw = _weight_grad(ctx, ctx.param, dytq, xtq, ctx.w_dtype, ctx.backend_name) if do_dw else None
-        return dx, dw, None, None, None, None, None, None
+        # dY -> rowwise with SR for dgrad, and dY^T with RHT + SR for wgrad, from one read (+ the bias
+        # gradient, from column sums of the same read)
+        fused_db = do_db and ctx.backend_name == "cuda"
+        q = be.dual(dy, row=do_dx, col=do_dw, row_sr_seed=seeds[0] if do_dx else None,
+                    col_sr_seed=seeds[1] if do_dw else None, rht_seed=seeds[2] if ctx.use_rht else None,
+                    col_pad=ALIGN, **({"bias_grad": True} if fused_db else {}))
+        dyq, dytq = q[0], q[1]
+        if do_db:
+            grads[8] = q[2] if fused_db else dy.reshape(-1, dy.shape[-1]).float().sum(0)
+        grads[0] = be.mm(dyq, wtq, torch.bfloat16) if do_dx else None       # [M, in]
+        grads[1] = _weight_grad(ctx, ctx.param, dytq, xtq, ctx.w_dtype, ctx.backend_name) if do_dw else None
+        return tuple(grads)
 
 
 class NVFP4Linear(torch.nn.Linear):
     """nn.Linear with NVFP4 fprop/dgrad/wgrad. in/out features must be multiples of 128.
 
-    The bias (if any) is added in bf16 after the GEMM. Inputs are cast to bf16.
+    Inputs are cast to bf16. The bias (if any) is added to the output in its dtype, inside the GEMM's
+    epilogue (CUDA backend; its gradient comes from column sums the output-gradient quantizer computes
+    from the same read). ``forward(x, residual=r)`` returns ``r + self(x)`` with the add fused into the
+    epilogue as well, bit-identical to adding afterwards (the residual's gradient passes straight through).
 
     ``fuse_wgrad_accumulation``: when ``weight.grad`` already exists (fp32), add the new weight gradient
     to it inside the wgrad GEMM. Saves a full read-modify-write of the gradient per micro-batch under
@@ -295,20 +320,28 @@ class NVFP4Linear(torch.nn.Linear):
                 new.bias.copy_(lin.bias)
         return new
 
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
+    def forward(self, x: torch.Tensor, residual: torch.Tensor | None = None) -> torch.Tensor:
         lead = x.shape[:-1]
         x2d = x.reshape(-1, self.in_features).to(torch.bfloat16).contiguous()
         grad = torch.is_grad_enabled()
         fuse = self.fuse_wgrad_accumulation and not torch.compiler.is_compiling()
-        y = _NVFP4LinearFn.apply(x2d, self.weight, self.backend, self.wgrad_rht,
-                                 grad and x2d.requires_grad, grad and self.weight.requires_grad, fuse,
-                                 weight_cache(self))
         # Drop-in semantics: return the caller's dtype (bf16 under autocast / bf16 models).
         out_dtype = torch.get_autocast_dtype("cuda") if torch.is_autocast_enabled("cuda") else x.dtype
-        y = y.to(out_dtype)
-        if self.bias is not None:
-            y = y + self.bias.to(out_dtype)
-        return unflatten_output(y, lead, self.out_features)
+        if residual is not None and residual.shape != (*lead, self.out_features):
+            raise ValueError(f"residual must have shape {(*lead, self.out_features)}, got {tuple(residual.shape)}")
+        epi = (out_dtype in (torch.bfloat16, torch.float32)
+               and (residual is None or residual.dtype in (torch.bfloat16, torch.float32)))
+        bias = self.bias if epi else None
+        res2d = residual.reshape(-1, self.out_features) if epi and residual is not None else None
+        y = _NVFP4LinearFn.apply(x2d, self.weight, self.backend, self.wgrad_rht,
+                                 grad and x2d.requires_grad, grad and self.weight.requires_grad, fuse,
+                                 weight_cache(self), bias, res2d, out_dtype if epi else torch.bfloat16)
+        if not epi:  # e.g. fp16 outputs: cast and add outside
+            y = y.to(out_dtype)
+            if self.bias is not None:
+                y = y + self.bias.to(out_dtype)
+        y = unflatten_output(y, lead, self.out_features)
+        return residual + y if residual is not None and res2d is None else y
 
     def extra_repr(self) -> str:
         r = super().extra_repr() + f", backend={self.backend}, wgrad_rht={self.wgrad_rht}"
