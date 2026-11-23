@@ -82,8 +82,8 @@ def _accumulation_target(ctx, param):
     node (``loss.backward()``, not ``torch.autograd.grad`` or ``backward(inputs=...)`` excluding it) and
     the parameter is a leaf, so the result can be handed to that node (see _weight_grad).
     """
-    if param is None or _will_execute is None:
-        return None
+    if param is None or _will_execute is None or not param.is_leaf:
+        return None  # e.g. FSDP1's views into its flat parameter: autograd accumulates into the flat one
     g = param.grad
     if (g is None or g.dtype != torch.float32 or not g.is_contiguous() or g.shape != param.shape
             or g.device != param.device):

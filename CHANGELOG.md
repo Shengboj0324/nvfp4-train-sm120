@@ -1,5 +1,27 @@
 # Changelog
 
+## 0.6.0 — platforms and the remaining integration gaps (2026-11-22)
+
+- **Native Windows.** The extension builds with MSVC + nvcc (`tools\build.cmd`, `tools\check.cmd`;
+  setup.py picks MSVC flags) and passes the test suite on the GPU under Windows with PyTorch
+  2.7.1+cu128 / CUDA 12.9. CI gains a Windows job that builds against CUDA 13.0 + PyTorch 2.14.1 and
+  checks the FP4 MMA is in the SASS. `tools/guard.py` runs on Windows too (Win32 memory and CPU-load
+  sampling, process-tree kill).
+- **FSDP1 tested**: `FullyShardedDataParallel` (flat parameters and `use_orig_params=True`, `no_sync`
+  accumulation) gives gradients bit-identical to a single process, fused and unfused. Fused
+  accumulation now explicitly skips non-leaf parameters (FSDP1's views), which also avoids PyTorch's
+  warning about reading `.grad` of a non-leaf.
+- **Reproducible attention.** Under `torch.use_deterministic_algorithms(True)` a block with NVFP4
+  layers and PyTorch's default flash attention reproduces its gradients bit for bit (new test). The
+  soak now runs this way instead of on the slow math backend (~1.65× more iterations per minute), and
+  deterministic mode's NaN-filled allocations additionally check that no kernel reads uninitialized
+  output.
+- **Clear error for `CUDA_FORCE_PTX_JIT`.** With that variable set every sm_120 launch fails with "no
+  kernel image"; `nvfp4.available()` is False and the ops explain why.
+- Tests pass an explicit device mesh to FSDP2 (PyTorch's Windows builds have no NCCL) and account for
+  PyTorch 2.7's FSDP2 summing gradients over gloo where 2.14 averages them (measured on `nn.Linear`).
+  `torch.compile` tests use the `aot_eager` backend where Triton is missing. 324 tests.
+
 ## 0.5.0 — training-stack integration (2026-11-22)
 
 - **Seeds on the GPU.** The layers draw their stochastic-rounding / RHT seeds with the CUDA generator

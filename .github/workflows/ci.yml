@@ -6,7 +6,8 @@ on:
   pull_request:
 
 # GitHub-hosted runners have no GPU. CI therefore (1) runs the reference/emulation tests on CPU and
-# (2) proves the CUDA kernels compile for sm_120a with the CUDA 13 toolkit. Kernel correctness and
+# (2) proves the CUDA kernels compile for sm_120a with the CUDA 13 toolkit, on Linux and on Windows
+# (MSVC). Kernel correctness and
 # performance are verified on real sm_120 hardware with tools/check.sh (results in docs/RESULTS.md).
 jobs:
   cpu-tests:
@@ -41,5 +42,34 @@ jobs:
         run: |
           # sm_120 SASS for mma.sync kind::mxf4nvf4.block_scale.scale_vec::4X (verified locally)
           n=$(cuobjdump -sass nvfp4/_C*.so | grep -c "OMMA.SF.16864.F32.E2M1.E2M1.UE4M3.4X" || true)
+          echo "block-scaled FP4 MMA instructions in SASS: $n"
+          test "$n" -gt 0
+
+  cuda-compile-windows:
+    runs-on: windows-2022
+    timeout-minutes: 75
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - uses: Jimver/cuda-toolkit@v0.2.36
+        id: cuda
+        with:
+          cuda: "13.0.2"
+          method: network
+      - name: Python toolchain
+        run: |
+          python -m pip install -q -U pip setuptools wheel ninja numpy
+          python -m pip install -q torch==2.14.1 --index-url https://download.pytorch.org/whl/cu130
+      - name: Build extension for sm_120a (MSVC + nvcc)
+        shell: cmd
+        env:
+          MAX_JOBS: "2"
+        run: tools\build.cmd
+      - name: Check the block-scaled MMA made it into SASS
+        shell: bash
+        run: |
+          n=$(cuobjdump -sass nvfp4/_C*.pyd | grep -c "OMMA.SF.16864.F32.E2M1.E2M1.UE4M3.4X" || true)
           echo "block-scaled FP4 MMA instructions in SASS: $n"
           test "$n" -gt 0

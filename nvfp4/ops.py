@@ -23,8 +23,10 @@ Seed = Union[int, torch.Tensor, None]
 
 
 def available(device: int | torch.device | None = None) -> bool:
-    """True if the extension is built and ``device`` (default: current) is an sm_120 GPU."""
-    if _C is None or not torch.cuda.is_available():
+    """True if the extension is built and ``device`` (default: current) is an sm_120 GPU (and the
+    environment doesn't force PTX JIT compilation, which makes the kernels unlaunchable; see
+    ``nvfp4._library.PTX_JIT_MESSAGE``)."""
+    if _C is None or _lib.ptx_jit_forced() or not torch.cuda.is_available():
         return False
     return torch.cuda.get_device_capability(device) == SUPPORTED_CAPABILITY
 

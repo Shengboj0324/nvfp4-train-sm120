@@ -18,6 +18,15 @@ def _cuda_ok() -> bool:
 
 requires_sm120 = pytest.mark.skipif(not _cuda_ok(), reason="needs the built extension and an sm_120 GPU")
 
+# torch.compile backend for the tests: inductor needs Triton, which PyTorch's Windows wheels don't ship.
+# Without it, "aot_eager" still checks the parts that are this package's responsibility: dynamo traces
+# the layers without graph breaks (fullgraph=True) and AOTAutograd handles the custom ops' backward.
+try:
+    import triton  # noqa: F401
+    COMPILE_BACKEND = "inductor"
+except ImportError:
+    COMPILE_BACKEND = "aot_eager"
+
 
 @pytest.fixture(autouse=True)
 def _seed():

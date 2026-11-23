@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
-"""Run a command under a resource guard (Linux / WSL2).
+"""Run a command under a resource guard (Linux / WSL2 / native Windows).
 
-Samples GPU (nvidia-smi) and host (/proc) state every --interval seconds, appends a CSV log, and
-kills the whole process group of the command if any limit is crossed, so a long benchmark or
+Samples GPU (nvidia-smi) and host (/proc, or the Win32 API on Windows) state every --interval
+seconds, appends a CSV log, and kills the command's whole process tree if any limit is crossed, so a long benchmark or
 training run on a laptop can never drive the machine into a thermal or out-of-memory reset.
 
 Before starting, it waits for the GPU to cool below --start-max-temp and for the host load average
@@ -23,6 +23,8 @@ import subprocess
 import sys
 import time
 
+WINDOWS = os.name == "nt"
+
 
 def gpu_sample() -> dict:
     q = "temperature.gpu,power.draw,utilization.gpu,memory.used,memory.total,clocks.sm"
@@ -37,7 +39,58 @@ def gpu_sample() -> dict:
         return {}
 
 
+class _WinHost:
+    """Windows has no /proc and no load average: memory comes from GlobalMemoryStatusEx and "load1"
+    is busy CPUs (from GetSystemTimes), smoothed with the 60 s time constant of the Unix 1-min load
+    average so the same --max-load-per-cpu thresholds apply. (Busy CPUs ignore the run queue, so this
+    is never above the Unix value for the same work.)"""
+
+    def __init__(self):
+        import ctypes
+        from ctypes import wintypes
+        self.ct, self.wt = ctypes, wintypes
+
+        class MEMSTAT(ctypes.Structure):
+            _fields_ = [("dwLength", wintypes.DWORD), ("dwMemoryLoad", wintypes.DWORD),
+                        ("ullTotalPhys", ctypes.c_ulonglong), ("ullAvailPhys", ctypes.c_ulonglong),
+                        ("ullTotalPageFile", ctypes.c_ulonglong), ("ullAvailPageFile", ctypes.c_ulonglong),
+                        ("ullTotalVirtual", ctypes.c_ulonglong), ("ullAvailVirtual", ctypes.c_ulonglong),
+                        ("ullAvailExtendedVirtual", ctypes.c_ulonglong)]
+        self.MEMSTAT = MEMSTAT
+        self.k32 = ctypes.windll.kernel32
+        self.prev = self._times()
+        self.prev_t = time.time()
+        self.load = None
+
+    def _times(self):
+        idle, kern, user = (self.wt.FILETIME() for _ in range(3))
+        self.k32.GetSystemTimes(self.ct.byref(idle), self.ct.byref(kern), self.ct.byref(user))
+        v = lambda f: (f.dwHighDateTime << 32) | f.dwLowDateTime  # noqa: E731  100 ns units
+        return v(idle), v(kern) + v(user)  # kernel time includes idle time
+
+    def sample(self) -> dict:
+        m = self.MEMSTAT()
+        m.dwLength = self.ct.sizeof(m)
+        self.k32.GlobalMemoryStatusEx(self.ct.byref(m))
+        ncpu = os.cpu_count() or 1
+        if time.time() - self.prev_t < 0.5:  # need a measurable interval for the first sample
+            time.sleep(0.5)
+        (idle, total), t = self._times(), time.time()
+        d_idle, d_total = idle - self.prev[0], total - self.prev[1]
+        busy = ncpu * (1.0 - d_idle / d_total) if d_total > 0 else 0.0
+        a = 1.0 - pow(2.718281828, -(t - self.prev_t) / 60.0)
+        self.load = busy if self.load is None else self.load + a * (busy - self.load)
+        self.prev, self.prev_t = (idle, total), t
+        return {"host_mem_avail_mb": m.ullAvailPhys / 2**20, "host_mem_total_mb": m.ullTotalPhys / 2**20,
+                "load1": self.load, "ncpu": ncpu}
+
+
+_win_host = _WinHost() if WINDOWS else None
+
+
 def host_sample() -> dict:
+    if _win_host is not None:
+        return _win_host.sample()
     mem = {}
     with open("/proc/meminfo") as fh:
         for line in fh:
@@ -46,6 +99,19 @@ def host_sample() -> dict:
     load1 = os.getloadavg()[0]
     return {"host_mem_avail_mb": mem["MemAvailable"] / 1024, "host_mem_total_mb": mem["MemTotal"] / 1024,
             "load1": load1, "ncpu": os.cpu_count()}
+
+
+def start(cmd) -> subprocess.Popen:
+    if WINDOWS:
+        return subprocess.Popen(cmd, creationflags=subprocess.CREATE_NEW_PROCESS_GROUP)
+    return subprocess.Popen(cmd, start_new_session=True)
+
+
+def kill_tree(proc: subprocess.Popen, hard: bool) -> None:
+    if WINDOWS:  # taskkill /T takes the children (compiler workers, data loaders) with it
+        subprocess.run(["taskkill", "/PID", str(proc.pid), "/T"] + (["/F"] if hard else []), capture_output=True)
+    else:
+        os.killpg(proc.pid, signal.SIGKILL if hard else signal.SIGTERM)
 
 
 def wait_settled(max_load_per_cpu: float, max_s: float) -> float:
@@ -63,10 +129,12 @@ def wait_settled(max_load_per_cpu: float, max_s: float) -> float:
 def wait_cool(below_c: float, max_s: float) -> float:
     """Sample every 2 s until the GPU is below `below_c` (or max_s passes); returns seconds waited."""
     t0 = time.time()
+    if gpu_sample().get("gpu_temp_c", 0.0) < below_c:
+        return 0.0  # (nvidia-smi itself can take seconds on Windows: don't report that as waiting)
     while time.time() - t0 < max_s:
+        time.sleep(2.0)
         if gpu_sample().get("gpu_temp_c", 0.0) < below_c:
             break
-        time.sleep(2.0)
     return time.time() - t0
 
 
@@ -101,7 +169,7 @@ def main() -> int:
     waited = wait_settled(0.5 * a.max_load_per_cpu, 180.0)
     if waited > 1:
         print(f"[guard] waited {waited:.0f}s for the host load to settle", file=sys.stderr)
-    proc = subprocess.Popen(cmd, start_new_session=True)
+    proc = start(cmd)
     t0, strikes, peak = time.time(), 0, {"temp": 0.0, "power": 0.0, "gpu_mem": 0.0, "min_host_mem": 1e12}
     killed_reason = None
     while proc.poll() is None:
@@ -128,11 +196,11 @@ def main() -> int:
         strikes = strikes + 1 if reasons else 0
         if strikes >= a.hot_strikes:
             killed_reason = "; ".join(reasons)
-            os.killpg(proc.pid, signal.SIGTERM)
+            kill_tree(proc, hard=WINDOWS)  # console programs ignore a soft taskkill
             try:
                 proc.wait(timeout=15)
             except subprocess.TimeoutExpired:
-                os.killpg(proc.pid, signal.SIGKILL)
+                kill_tree(proc, hard=True)
             break
         time.sleep(a.interval)
     rc = proc.wait()
