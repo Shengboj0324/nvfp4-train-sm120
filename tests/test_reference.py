@@ -121,3 +121,17 @@ def test_producer_specs_match_torch():
     assert (ref.layernorm_apply(x, mean, rstd, w, b) - y).abs().max().item() < 1e-5
     (rd, _, _), (cd, _, _) = ref.layernorm_quantize_dual(x, w, b, mean, rstd, rht_seed=1, col_pad=128)
     assert rd.shape == (64, 128) and cd.shape == (256, 64)
+
+
+def test_non_finite_amax_gives_non_finite_scale():
+    # NaN must not quantize to finite values (fp32 max semantics would drop it).
+    genc, gdec = ref.global_scales(torch.tensor(float("nan")))
+    assert torch.isnan(genc) and torch.isnan(gdec)
+    genc, gdec = ref.global_scales(torch.tensor(float("inf")))
+    assert genc == 0 and torch.isinf(gdec)
+    genc, gdec = ref.global_scales(torch.tensor(0.0))
+    assert genc == 1 and gdec == 1
+    x = torch.randn(32, 64)
+    x[5, 5] = float("nan")
+    d, s, g = ref.quantize(x)
+    assert torch.isnan(g)

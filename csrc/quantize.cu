@@ -112,18 +112,18 @@ __global__ void amax_kernel(const T* __restrict__ x, QParams p, unsigned int* __
     float v[kBlock];
     load_block(x, p, orow, bcol, v);
 #pragma unroll
-    for (int i = 0; i < kBlock; ++i) m = fmaxf(m, fabsf(v[i]));
+    for (int i = 0; i < kBlock; ++i) m = nan_max(m, fabsf(v[i]));
   }
   // CTA-level reduction, then one atomic per CTA (same-address atomics serialize at the L2)
   __shared__ float red[32];
 #pragma unroll
-  for (int o = 16; o > 0; o >>= 1) m = fmaxf(m, __shfl_xor_sync(0xffffffffu, m, o));
+  for (int o = 16; o > 0; o >>= 1) m = nan_max(m, __shfl_xor_sync(0xffffffffu, m, o));
   if ((threadIdx.x & 31) == 0) red[threadIdx.x / 32] = m;
   __syncthreads();
   if (threadIdx.x < 32) {
     m = threadIdx.x < blockDim.x / 32 ? red[threadIdx.x] : 0.0f;
 #pragma unroll
-    for (int o = 16; o > 0; o >>= 1) m = fmaxf(m, __shfl_xor_sync(0xffffffffu, m, o));
+    for (int o = 16; o > 0; o >>= 1) m = nan_max(m, __shfl_xor_sync(0xffffffffu, m, o));
     if (threadIdx.x == 0) atomicMax(amax_bits, __float_as_uint(m));
   }
 }

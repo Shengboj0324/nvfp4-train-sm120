@@ -5,6 +5,7 @@
 
 #include <cuda_bf16.h>
 
+#include <atomic>
 #include <cstdint>
 #include <type_traits>
 
@@ -17,6 +18,20 @@ constexpr int WM = BM / WARPS_M, WN = BN / WARPS_N;  // 64 x 32 per warp
 constexpr int MI = WM / 16, NI = WN / 8;             // 4 x 4 MMA tiles per warp
 constexpr int MMA_THREADS = 32 * WARPS_M * WARPS_N;  // 256
 constexpr int kMaxSplits = 16;
+
+// cudaFuncSetAttribute applies to the current device only: record per device (bit = device index)
+// whether `kernel` may use `bytes` of dynamic shared memory, so multi-GPU processes work too.
+template <typename Kernel>
+inline cudaError_t ensure_smem_attr(Kernel kernel, int bytes, std::atomic<uint64_t>& done) {
+  int dev = 0;
+  cudaError_t err = cudaGetDevice(&dev);
+  if (err != cudaSuccess) return err;
+  const uint64_t bit = 1ull << (dev & 63);
+  if (done.load(std::memory_order_acquire) & bit) return cudaSuccess;
+  err = cudaFuncSetAttribute(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, bytes);
+  if (err == cudaSuccess) done.fetch_or(bit, std::memory_order_acq_rel);
+  return err;
+}
 
 struct Args {
   const uint8_t* a;    // [M, K/2]

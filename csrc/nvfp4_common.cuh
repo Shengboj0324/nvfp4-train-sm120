@@ -132,9 +132,16 @@ __device__ __forceinline__ float layernorm_apply(float x, float mean, float rstd
   return __fadd_rn(__fmul_rn(__fmul_rn(__fsub_rn(x, mean), rstd), gamma), beta);
 }
 
-// reference.global_scales: genc = 2688 / amax (1 if amax == 0); gdec = 1 / genc.
+// Running max of |x| for the global amax that keeps NaN: fmaxf drops NaN operands, which would let a
+// NaN input quantize to finite values and corrupt training silently. Once m is NaN it stays NaN, and
+// as uint bits a positive NaN is above +inf, so the atomicMax over CTAs keeps it too.
+__device__ __forceinline__ float nan_max(float m, float v) { return (v > m || v != v) ? v : m; }
+
+// reference.global_scales: genc = 2688 / amax (1 if amax == 0, NaN if amax is NaN); gdec = 1 / genc.
+// A NaN (or inf) anywhere in the tensor thus makes gdec non-finite and every GEMM output it feeds NaN.
 __device__ __forceinline__ float global_encode_scale(float amax) {
-  return amax > 0.0f ? __fdiv_rn(kE4M3Max * kE2M1Max, amax) : 1.0f;
+  if (amax > 0.0f) return __fdiv_rn(kE4M3Max * kE2M1Max, amax);
+  return amax == 0.0f ? 1.0f : __int_as_float(0x7fffffff);
 }
 
 // reference.quantize for one 16-element block whose abs-max (over the 1x16 or 16x16 block) is bmax.
