@@ -265,6 +265,11 @@ wgrad accumulation and fused producers; seed 0 of BF16 is the v0.2 BF16 run abov
   v0.3's single run, so v0.5's integration work cost no end-to-end speed.
 - Peak GPU temperature 76–79 °C; each NVFP4 run took 630 s, each BF16 run 805 s.
 
+**v0.8 rerun of seed 0** (`experiments/results/v0.8/`, residual-fused blocks, paired stochastic
+rounding, persistent GEMM): validation loss **1.5073** after 3000 steps vs v0.5's 1.5068 for the same
+seed (BF16: 1.4892), i.e. within the seed spread; 82.4k tokens/s vs 80.6k (+2.2% at this width,
+where the block step is small and attention / embeddings / the LM head are a large share); 613 s.
+
 ## 5. End-to-end pretraining: GPT-507M, d=2048 (`experiments/results/v0.2_wide/`, `…/v0.3_wide/`)
 
 This run tests the claim from §3 that wider models gain more.
