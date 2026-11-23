@@ -1,5 +1,12 @@
 # Changelog
 
+## 0.6.1 — Windows build with CUDA 13 (2026-11-23)
+
+- **Fixed: the TMA GEMM did not compile with MSVC and CUDA 13.** CUDA 13 declares `CUtensorMap`
+  `alignas(128)` (12.x: 64) and MSVC cannot pass a by-value kernel parameter aligned beyond 64 bytes
+  (error C2719). Under MSVC the kernel now takes a 64-byte-aligned copy with the same layout (TMA
+  needs 64); Linux builds are unchanged. Found by the new Windows CI job.
+
 ## 0.6.0 — platforms and the remaining integration gaps (2026-11-22)
 
 - **Native Windows.** The extension builds with MSVC + nvcc (`tools\build.cmd`, `tools\check.cmd`;
