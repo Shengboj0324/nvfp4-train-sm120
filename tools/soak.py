@@ -3,7 +3,10 @@ of a d=2048 model for a fixed wall-clock budget, checking continuously that
 
   * every loss, gradient and GEMM output is finite,
   * replaying a step with the same seed reproduces its gradients bit for bit (no races / stale state),
-  * a block trained through a captured CUDA graph (fresh GPU-drawn seeds every replay) stays finite,
+    for blocks with BF16 SDPA and with 8-bit attention (nvfp4.attention), and for 8-bit attention alone
+    at head dim 128 / 2048 tokens / GQA,
+  * a block trained through a captured CUDA graph (fresh GPU-drawn seeds every replay, 8-bit attention)
+    stays finite,
   * GEMM results stay bit-identical to their first computation (no drift, no hangs: the guard and the
     kernels' bounded waits turn a hang into an error).
 
@@ -24,15 +27,17 @@ sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "experiments"))
 from train_gpt import Block, fuse_producers  # noqa: E402
 
 from nvfp4 import ops  # noqa: E402
+from nvfp4.attention import attention  # noqa: E402
 from nvfp4.linear import convert_linears  # noqa: E402
 
 
-def make_block(d: int, fused: bool, seed: int) -> torch.nn.Module:
+def make_block(d: int, fused: bool, seed: int, attn8: bool = False) -> torch.nn.Module:
     torch.manual_seed(seed)
     blk = Block(d, d // 64).cuda()
     convert_linears(blk, fuse_wgrad_accumulation=fused)
     if fused:
         fuse_producers([blk])
+    blk.attn_8bit = attn8
     return blk
 
 
@@ -59,7 +64,18 @@ def main() -> int:
     os.environ.setdefault("CUBLAS_WORKSPACE_CONFIG", ":4096:8")
     torch.use_deterministic_algorithms(True)
 
-    blocks = {"unfused": make_block(a.d, False, 0), "fused": make_block(a.d, True, 0)}
+    blocks = {"unfused": make_block(a.d, False, 0), "fused": make_block(a.d, True, 0),
+              "fused_attn8": make_block(a.d, True, 0, attn8=True)}
+    # 8-bit attention alone at head dim 128, 2048 tokens, grouped-query (8 query / 2 key-value heads)
+    aq = torch.randn(2, 8, 2048, 128, device="cuda", dtype=torch.bfloat16, requires_grad=True)
+    akv = [torch.randn(2, 2, 2048, 128, device="cuda", dtype=torch.bfloat16, requires_grad=True) for _ in range(2)]
+
+    def attn_grads(do):
+        for t in (aq, *akv):
+            t.grad = None
+        out = attention(aq, akv[0], akv[1], causal=True)
+        out.backward(do)
+        return out.detach(), [t.grad.clone() for t in (aq, *akv)]
     opts = {k: torch.optim.AdamW(b.parameters(), lr=1e-4) for k, b in blocks.items()}
     T = 4096
     shapes = [(T, 6144, 2048), (T, 2048, 8192), (6144, 2048, T), (2048, 8192, T), (768, 768, 8192)]
@@ -71,7 +87,7 @@ def main() -> int:
 
     # A third block trains through a captured CUDA graph (forward, backward, optimizer step): seeds are
     # drawn on the GPU, so every replay uses fresh ones; checked for finite loss / weights.
-    gblk = make_block(a.d, False, 1)
+    gblk = make_block(a.d, False, 1, attn8=True)
     gopt = torch.optim.AdamW(gblk.parameters(), lr=1e-4, capturable=True)
     gx = torch.randn(8, 512, a.d, device="cuda")
 
@@ -115,6 +131,17 @@ def main() -> int:
                     return 1
                 checks += 1
             opts[name].step()
+        if it % 10 == 0:  # 8-bit attention at long context: finite, and its backward replays bit for bit
+            do = torch.randn_like(aq)
+            out, g1 = attn_grads(do)
+            _, g2 = attn_grads(do)
+            if not torch.isfinite(out).all() or not all(torch.isfinite(g).all() for g in g1):
+                print(f"FAIL non-finite 8-bit attention at iter {it}", flush=True)
+                return 1
+            if not all(torch.equal(g, h) for g, h in zip(g1, g2)):
+                print(f"FAIL 8-bit attention replay mismatch at iter {it}", flush=True)
+                return 1
+            checks += 1
         for qa, qb, ref in gemms:
             out = ops.gemm(qa, qb, torch.float32)
             if it % 10 == 0 and not torch.equal(out, ref):
@@ -128,7 +155,7 @@ def main() -> int:
     torch.cuda.synchronize()
     print(f"SOAK_OK {it} iterations, {checks} replay checks, {it * len(gemms)} extra GEMMs, "
           f"{it} CUDA-graph training steps, {a.minutes:.1f} min", flush=True)
-    del blocks, opts, gemms, graph, gblk, gopt
+    del blocks, opts, gemms, graph, gblk, gopt, aq, akv
     torch.cuda.empty_cache()
     return 0
 
