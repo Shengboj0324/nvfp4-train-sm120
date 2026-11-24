@@ -563,7 +563,8 @@ accumulation.
    Linux on the desktop RTX 5090 (CUDA 12.8, PyTorch 2.11). The smaller RTX 50 parts (5080 / 5070 /
    5060) share the architecture but have fewer SMs; the tile / split-K heuristics were tuned on the
    82- and 170-SM parts (a rental attempt on 2026-11-24 found no RTX 5070 Ti / 5060 Ti / 5070 capacity
-   and five RTX 5080 hosts whose containers never started). The attention kernels need nothing
+   and five RTX 5080 hosts whose containers never started; a second one later that day found none of the
+   four available on Runpod's Secure or Community cloud). The attention kernels need nothing
    SM-count specific: two forward CTAs per SM fit the 100 KB of shared memory every sm_120 SM has. On
    Windows, inductor needs Triton, which PyTorch's Windows wheels don't include.
 
