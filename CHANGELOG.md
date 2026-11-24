@@ -1,6 +1,28 @@
 # Changelog
 
-## Unreleased — validated on rented desktop RTX 5090s (2026-11-23)
+## 0.9.0 — 8-bit flash attention (2026-11-24)
+
+- **`nvfp4.attention`**: forward and backward attention kernels for sm_120 (DESIGN.md §7). Q K^T and
+  dO V^T on INT8 tensor cores with per-token scales (4× less error than E4M3 on the score products;
+  K centred by its mean first), P V, P^T dO, dS K and dS^T Q on MXFP8 (block-scaled E4M3, the only FP8
+  path with FP32 accumulation at full rate on consumer Blackwell); softmax statistics and accumulation
+  in FP32. Operands quantized once (`ops`-level `attn_quant`, one read) into the layouts both passes
+  need; P and dS quantized in registers through a permuted sequence order. Causal / full, GQA,
+  any length, head dims 64 / 128, bf16 / fp16, strided inputs, gradients in the inputs' layout, a
+  **bitwise-deterministic backward** (no atomics), `torch.compile` custom ops; anything else falls back
+  to SDPA.
+- Speed (RTX 5090 Laptop): forward 1.6–2.2× PyTorch's flash attention from 4k tokens, forward + backward
+  1.4–1.5× (head dim 128; 1.1–1.2× at 64). Llama block (d = 2048, fused NVFP4): 1.22× faster at 8192
+  tokens, 1.35× at 16384 (2.27× BF16). GPT-124M: validation loss unchanged (1.4892 with BF16 linears;
+  1.5095 vs 1.5073 with NVFP4 linears). `experiments/train_gpt.py --attn 8bit`,
+  `bench/bench_attention.py`, `bench/bench_long_context.py`.
+- GEMM: warp-tile ablation of the locked-clock gap (`NVFP4_NVCC_FLAGS=-DNVFP4_WARPS_N=2`, DESIGN.md §4.2):
+  a 64 × 64 warp tile needs more than 255 registers and runs at half speed, so the layout stays.
+  The cp.async loop's loaders no longer assume 256 threads.
+- Validated on smaller RTX 50 parts (rented; RESULTS.md §8). 682 tests (45 new); sanitizers cover the
+  attention kernels.
+
+## Validated on rented desktop RTX 5090s (2026-11-23)
 
 - **2× desktop RTX 5090** (CUDA 12.8, PyTorch 2.11): 625 tests incl. the two-GPU NCCL tests (DDP,
   FSDP1, FSDP2 bit-exact across two physical GPUs), sanitizers clean, soak OK; GEMM up to 1027 TFLOPS,
