@@ -534,9 +534,13 @@ accumulation.
    tile that would space the OMMAs out does not fit in 255 registers (v0.9 ablation, §4.2).
 2. **Attention** (v0.9: 8-bit, §7). The forward is 1.6–2.2× flash attention; in training, forward +
    backward gains only 1.14–1.18× at D = 128 once dQ is computed accurately, and at 4096 tokens the loss
-   is 0.5% higher than with BF16 attention. Ways forward: an 8-bit forward with an exact BF16 backward
-   (most of the speed of the forward, little of the error), V in INT8 per token (V in MXFP8 is the
-   largest forward error), FlashAttention-4's polynomial exp2 on the FMA pipe, and a deterministic dQ
+   is 0.5% higher than with BF16 attention. Tried and rejected: an 8-bit forward with PyTorch's exact
+   flash-attention backward. The backward recomputes P = exp(S − lse) from BF16 scores, and the 8-bit
+   forward's lse is off by up to 0.2 nats on random data (more on peaked real attention), so P stops
+   summing to one: 6% gradient error on random inputs, over 100% on trained activations. A BF16 Q K^T in
+   the forward would fix lse but cost most of the forward speedup, and flash's Delta = rowsum(dO ∘ O) from
+   an approximate O brings back the dQ cancellation above, in a kernel this package cannot change.
+   Remaining ways forward: V in INT8 per token (V in MXFP8 is the largest forward error), FlashAttention-4's polynomial exp2 on the FMA pipe, and a deterministic dQ
    without the recomputed products (ordered accumulation, as in FlashAttention-3's deterministic mode).
    Masks other than causal, packed sequences, dropout and head dims other than 64 / 128 fall back to
    SDPA.
