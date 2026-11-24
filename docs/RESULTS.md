@@ -14,13 +14,15 @@ There are three versions of the stack ([DESIGN.md](DESIGN.md) has the details):
 - **v0.3** adds the TMA GEMM main loop, split-K for small output grids, and LayerNorm /
   GELU / GELU-backward fused into quantization.
 - **v0.7** adds the weight-quantization cache and fused Llama-style blocks (§3.1–3.2).
-- **v0.8** (current) makes the TMA GEMM persistent (the pipeline carries across output tiles, refills
+- **v0.8** makes the TMA GEMM persistent (the pipeline carries across output tiles, refills
   start the moment a stage is free), fuses the residual adds, biases and the q/k/v hand-off (GEMM
   epilogue, in-place multi-part quantization, a LayerNorm / RMSNorm backward kernel that adds the
   residual gradient) and halves the stochastic-rounding hash work. §1 and §3 are v0.8 numbers.
 - **v0.4 – v0.6** did not change the kernels' speed: v0.4 hardened them (NaN propagation,
   checks, sanitizers), v0.5 moved the rounding seeds to the GPU and integrated the layers with
   `torch.compile`, CUDA graphs, DDP and FSDP2. v0.5 adds a three-seed quality study (§4.1).
+- **v0.9 – v0.11** add 8-bit attention (§7), the 2026 recipe options and a BF16-tail switch with a
+  three-seed ablation (§2.4, §4.2), and mixture-of-experts layers (§8).
 
 Raw data sits next to each table: `bench/results/*.json` and `experiments/results/**`.
 Every benchmark checks correctness against the fp64 reference before timing. Timings are the
@@ -114,6 +116,22 @@ without the producer fusion of [DESIGN.md §3.4](DESIGN.md):
 
 Gone from the step: the LayerNorm forward kernels, the GELU and GELU-backward kernels, the bf16 copy
 of the LayerNorm output, and the separate amax pass over each of those outputs.
+
+### 2.4 Recipe options (v0.11, `bench/results/quantize_recipes.json`)
+
+Dual quantizer (bf16 input, row + column outputs, column RHT, column padding 128; `bench/bench_sr_cost.py`),
+µs, for the recipe switches of [DESIGN.md §2.1](DESIGN.md). Activations use round-to-nearest, gradients
+stochastic rounding on both outputs:
+
+| shape | activation (RTN) | + Four Over Six | + MS-EDEN (RHT64) | gradient (SR) | + MS-EDEN |
+|---|---|---|---|---|---|
+| 8192 × 2304 | 87 | 136 (+57%) | 153 (+75%) | 118 | 172 (+45%) |
+| 8192 × 8192 | 436 | 540 (+24%) | 623 (+43%) | 487 | 736 (+51%) |
+| 16384 × 3072 | 333 | 418 (+26%) | 452 (+36%) | 379 | 524 (+38%) |
+
+Four Over Six quantizes every block twice; MS-EDEN's 64-point transform adds a shared-memory exchange
+per 64 rows, and the gradient operand an extra error reduction per block. In the GPT-124M step these
+cost 2% (Four Over Six), 3% (MS-EDEN) and 4% (both) of tokens/s (§4.2).
 
 ## 3. Transformer-block training step vs width (`bench/results/train_step.json`)
 
@@ -269,6 +287,49 @@ wgrad accumulation and fused producers; seed 0 of BF16 is the v0.2 BF16 run abov
 rounding, persistent GEMM): validation loss **1.5073** after 3000 steps vs v0.5's 1.5068 for the same
 seed (BF16: 1.4892), i.e. within the seed spread; 82.4k tokens/s vs 80.6k (+2.2% at this width,
 where the block step is small and attention / embeddings / the LM head are a large share); 613 s.
+
+### 4.2 Recipe ablations, three seeds (v0.11, `experiments/results/v0.10_ablate/`)
+
+The recipe options of [DESIGN.md §2.1](DESIGN.md), each run for seeds 0, 1 and 2 with the v0.10 stack
+(`experiments/run_ablation.sh NAME FLAGS`, summary: `experiments/ablation_summary.py`). Same setup as
+§4.1 (GPT-124M, 3000 steps, last 2 blocks BF16, fused wgrad and producers). Because a seed fixes the
+initialization, data order and rounding seeds, the difference to the baseline run of the same seed
+("paired") is far less noisy than either loss: compare the paired column's ± (std over seeds) with the
+±0.16 of the gaps themselves.
+
+| recipe | flags | val loss (mean) | vs BF16 | vs baseline, paired | per seed (paired) | wall time |
+|---|---|---|---|---|---|---|
+| baseline (v0.10 stack) | | 1.5099 | +1.32% ± 0.16 | | | 607 s |
+| Four Over Six | `--four-six` | 1.5095 | +1.30% | −0.03% ± 0.02 | −0.02 −0.05 −0.01 | 617 s |
+| MS-EDEN | `--ms-eden` | 1.5087 | +1.24% | −0.08% ± 0.05 | −0.06 −0.14 −0.05 | 626 s |
+| MS-EDEN + Four Over Six | `--ms-eden --four-six` | 1.5082 | +1.21% | −0.12% ± 0.05 | −0.11 −0.07 −0.17 | 633 s |
+| 1×16 weights | `--weight-1d` | 1.5081 | +1.20% | −0.12% ± 0.09 | −0.05 −0.22 −0.09 | 684 s |
+| 1×16 weights + Four Over Six | `--weight-1d --four-six` | 1.5080 | +1.20% | −0.13% ± 0.20 | +0.09 −0.17 −0.30 | 693 s |
+| 1×16 weights + MS-EDEN + Four Over Six (Quartet II's full set) | `--weight-1d --ms-eden --four-six` | 1.5070 | +1.13% | −0.19% ± 0.11 | −0.08 −0.19 −0.31 | 710 s¹ |
+| fc2 in BF16 in every block | `--hp-modules fc2` | 1.5058 | +1.05% | −0.27% ± 0.06 | −0.26 −0.34 −0.23 | 690 s |
+| **BF16 tail, last 10% of steps** | `--bf16-tail 0.1` | **1.4994** | **+0.62%** | **−0.70% ± 0.04** | −0.73 −0.70 −0.66 | 630 s |
+| BF16 tail + MS-EDEN + Four Over Six | `--bf16-tail 0.1 --ms-eden --four-six` | 1.4984 | +0.55% ± 0.05 | −0.76% ± 0.20 | −0.55 −0.81 −0.93 | 652 s |
+
+¹ seeds 0 and 2; seed 1 took 864 s (thermal throttling on the laptop). (BF16: 797 s per run. Seed 0 of BF16 and of the baseline are the losses of §4.1: 1.4892 and 1.5063.)
+
+- **The stochastic-rounding rewrite changed nothing measurable:** the baseline's +1.32% ± 0.16 matches
+  v0.5's +1.28% ± 0.11 with a different rounder and different random bits.
+- **The quantizer options all help, a little.** Four Over Six and MS-EDEN lower the loss on every seed,
+  but by 0.03–0.13%, a tenth of the gap or less. The 2026 papers report 3–25% gap reductions on
+  0.3–7B-parameter models trained for many more tokens per parameter; at 124M and 0.4 tokens per
+  parameter the forward-error fixes they target are not where this gap comes from. 1×16 weights help
+  about as much as MS-EDEN but cost 12% wall time (one dequantize and one more quantization per weight
+  and micro-batch without the weight cache). All three together (Quartet II's forward and wgrad changes, without its
+  dgrad rotation) give the largest quantizer-side reduction, −0.19%, at 17% wall time.
+- **The BF16 tail halves the gap** on every seed (−0.66 to −0.73%) for 4% of the wall time; the final
+  model is evaluated with BF16 layers. NVIDIA reports 1.5% → 0.5% for a 12B model switching for the last
+  18% of tokens. Evaluated with its NVFP4 layers instead, the tail-trained model is slightly worse than
+  the baseline (1.5075 / 1.5152 / 1.5134 vs 1.5063 / 1.5130 / 1.5106): its last weights adapted to BF16
+  arithmetic, so serve it in BF16 (or quantize it afresh for inference).
+- With the tail, MS-EDEN + Four Over Six add nothing resolvable (paired vs the tail alone: +0.19, −0.11,
+  −0.27%).
+- Keeping fc2 in BF16 (TetraJet-v2's suggestion) recovers a fifth of the gap for 14% wall time: a worse
+  trade than the tail.
 
 ## 5. End-to-end pretraining: GPT-507M, d=2048 (`experiments/results/v0.2_wide/`, `…/v0.3_wide/`)
 
@@ -437,6 +498,37 @@ on the activations of a model trained at 4096 tokens (`bench/attention_real_erro
 `bench/attention_qbwd_probe.py`, layers 0–9), default backward [`backward="8bit"`]: output 0.6–1.8%
 [0.7–2.3%], dQ 0.4–2.0% [0.3–0.6%; v0.9.0: 0.4–24%], dK 1.2–6.9% [2.8–7.1%], dV 0.2–2.1% [2.5–3.1%].
 GPT-124M (attention a small share of the step) trains at the same speed with either.
+
+## 8. Mixture of experts (v0.11, `bench/results/moe.json`, `experiments/results/v0.10_moe/`)
+
+`nvfp4.moe.MoE` layer, one training step (forward + backward, autocast BF16, 16,384 tokens), BF16 experts
+vs the same experts converted to NVFP4 (fused MLPs, fused wgrad accumulation; `bench/bench_moe.py`):
+
+| d | expert d_ff | experts | top-k | activation | BF16 ms | NVFP4 ms | speedup |
+|---|---|---|---|---|---|---|---|
+| 1024 | 2816 | 8 | 2 | SwiGLU | 34.8 | 20.0 | **1.74×** |
+| 2048 | 5632 | 8 | 2 | SwiGLU | 114.4 | 53.2 | **2.15×** |
+| 2048 | 1408 | 32 | 4 | SwiGLU | 148.9 | 119.6 | 1.25× |
+| 768 | 1536 | 8 | 2 | GELU (tanh) | 13.8 | 10.8 | 1.27× |
+
+The speedup follows the per-expert GEMM size, as for dense layers (§3): with 8 large experts the layer is
+GEMM-bound and NVFP4 gives 1.7–2.2×; with 32 small experts (≈2,000 tokens × 1,408 per expert) or at
+d = 768 the routing, sorting and per-expert launches that both precisions share take a larger share.
+
+**Training** (`experiments/run_moe.sh`): GPT-124M's dense MLPs replaced by 8-expert top-2 MoE MLPs with
+expert hidden size 1536 (compute-matched to the dense 4 d MLP; 294M parameters), TinyStories, 3000 steps,
+seed 0, load-balancing loss 0.01; NVFP4 run with the standard recipe (last 2 blocks BF16).
+
+| run | val loss | gap | tokens/s | peak memory |
+|---|---|---|---|---|
+| BF16 | 1.4830 | | 44.7k | 13.9 GB |
+| NVFP4 experts + linears | 1.4943 | +0.0113 (+0.76%) | 53.8k (+20.5%) | 13.0 GB |
+
+The MoE model reaches a lower loss than the dense one (BF16 1.4830 vs 1.4892, same seed), and the NVFP4
+gap is smaller than the dense model's +1.15% at this seed (one seed: within the dense model's
+seed-to-seed range of the gap, so not evidence that MoE is more robust). End-to-end speedup is lower
+than dense (+20% vs +32%) because routing and the per-layer host synchronization run at the same speed
+in both precisions.
 
 ## Reproduce
 

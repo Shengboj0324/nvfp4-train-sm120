@@ -25,18 +25,23 @@ import torch.nn.functional as F
 from nvfp4.attention import attention as attention_8bit
 from nvfp4.fused import layernorm_linear, layernorm_mlp
 from nvfp4.linear import NVFP4Linear, convert_linears
+from nvfp4.moe import MoE
 
 
 class Block(nn.Module):
-    def __init__(self, d: int, h: int):
+    def __init__(self, d: int, h: int, moe: tuple | None = None):
         super().__init__()
         self.h = h
         self.ln1 = nn.LayerNorm(d)
         self.qkv = nn.Linear(d, 3 * d, bias=False)
         self.proj = nn.Linear(d, d, bias=False)
         self.ln2 = nn.LayerNorm(d)
-        self.fc1 = nn.Linear(d, 4 * d, bias=False)
-        self.fc2 = nn.Linear(4 * d, d, bias=False)
+        self.moe = None
+        if moe is not None:  # (experts, top_k, d_ff): a mixture-of-experts MLP (nvfp4.moe)
+            self.moe = MoE(d, moe[2], moe[0], top_k=moe[1], activation="gelu_tanh")
+        else:
+            self.fc1 = nn.Linear(d, 4 * d, bias=False)
+            self.fc2 = nn.Linear(4 * d, d, bias=False)
         self.fused = False  # set by fuse_producers(): LayerNorm / GELU run inside the NVFP4 quantizers
         self.fused_residual = False  # also q / k / v chunks and the residual adds (fuse_producers(residual=True))
         self.attn_8bit = False  # nvfp4.attention (INT8 scores, MXFP8 probabilities) instead of BF16 SDPA
@@ -54,6 +59,13 @@ class Block(nn.Module):
 
     def forward(self, x):
         b, t, d = x.shape
+        if self.moe is not None:
+            if self.fused:
+                q, k, v = layernorm_linear(x, self.ln1, self.qkv).split(d, dim=2)
+            else:
+                q, k, v = self.qkv(self.ln1(x)).split(d, dim=2)
+            x = x + self.proj(self.attend(q, k, v))
+            return x + self.moe(self.ln2(x))
         if self.fused_residual:
             q, k, v, res = layernorm_linear(x, self.ln1, self.qkv, chunks=3, return_residual=True)
             x = self.proj(self.attend(q, k, v), residual=res)
@@ -76,19 +88,22 @@ def fuse_producers(blocks, residual: bool = True) -> int:
     residual adds (into the GEMM epilogues and the LayerNorm backward). Returns the number of fused blocks."""
     n = 0
     for blk in blocks:
-        if all(isinstance(m, NVFP4Linear) and m.backend == "cuda" for m in (blk.qkv, blk.proj, blk.fc1, blk.fc2)):
-            blk.fused = True
-            blk.fused_residual = residual
+        mods = (blk.qkv, blk.proj) if blk.moe is not None else (blk.qkv, blk.proj, blk.fc1, blk.fc2)
+        if all(isinstance(m, NVFP4Linear) and m.backend == "cuda" for m in mods):
+            blk.fused = True  # (MoE blocks: the qkv LayerNorm; the experts run nvfp4.fused.gelu_mlp)
+            blk.fused_residual = residual and blk.moe is None
             n += 1
     return n
 
 
 class GPT(nn.Module):
-    def __init__(self, vocab: int, d: int, layers: int, heads: int, ctx: int):
+    def __init__(self, vocab: int, d: int, layers: int, heads: int, ctx: int, moe: tuple | None = None,
+                 moe_aux: float = 0.01):
         super().__init__()
         self.wte = nn.Embedding(vocab, d)
         self.wpe = nn.Embedding(ctx, d)
-        self.blocks = nn.ModuleList(Block(d, heads) for _ in range(layers))
+        self.blocks = nn.ModuleList(Block(d, heads, moe) for _ in range(layers))
+        self.moe_aux = moe_aux
         self.ln_f = nn.LayerNorm(d)
         self.head = nn.Linear(d, vocab, bias=False)
         self.head.weight = self.wte.weight  # tied
@@ -110,6 +125,8 @@ class GPT(nn.Module):
         logits = self.head(self.ln_f(x))
         loss = None if targets is None else F.cross_entropy(logits.float().view(-1, logits.size(-1)),
                                                             targets.view(-1))
+        if loss is not None and self.training and self.blocks[0].moe is not None:
+            loss = loss + self.moe_aux * sum(blk.moe.aux_loss for blk in self.blocks)
         return logits, loss
 
 
@@ -158,6 +175,20 @@ def main():
                     help="attention: BF16 SDPA, or nvfp4.attention (8-bit) in the NVFP4 blocks (all blocks in BF16 mode)")
     ap.add_argument("--attn-backward", choices=["bf16", "8bit"], default="bf16",
                     help="backward of the 8-bit attention: exact flash backward of the 8-bit forward, or 8-bit GEMMs")
+    ap.add_argument("--four-six", action="store_true",
+                    help="Four Over Six adaptive block scales on the round-to-nearest NVFP4 operands (ops.set_four_six)")
+    ap.add_argument("--weight-1d", action="store_true",
+                    help="1x16 weight blocks, dgrad weight re-quantized from the fprop one (ops.set_weight_blocks)")
+    ap.add_argument("--ms-eden", action="store_true",
+                    help="MS-EDEN on the wgrad operands: 64-point RHT, EDEN-corrected scales instead of element SR")
+    ap.add_argument("--moe-experts", type=int, default=0, help="mixture-of-experts MLPs with this many experts")
+    ap.add_argument("--moe-topk", type=int, default=2)
+    ap.add_argument("--moe-dff", type=int, default=0, help="expert hidden size (default 4 d / top_k: compute-matched)")
+    ap.add_argument("--moe-aux", type=float, default=0.01, help="load-balancing loss coefficient")
+    ap.add_argument("--bf16-tail", type=float, default=0.0,
+                    help="train the last FRAC of the steps with the NVFP4 layers in BF16 (ops.set_high_precision)")
+    ap.add_argument("--hp-modules", default="",
+                    help="comma-separated linear names kept in BF16 in every block (e.g. fc2), besides --hp-last")
     ap.add_argument("--seed", type=int, default=0)
     ap.add_argument("--data", default=os.environ.get("NVFP4_DATA", os.path.expanduser("~/nvfp4_data")))
     ap.add_argument("--out", required=True)
@@ -178,10 +209,22 @@ def main():
     torch.backends.cudnn.allow_tf32 = True
     train = np.memmap(os.path.join(a.data, "train.bin"), dtype=np.uint16, mode="r")
     val = np.memmap(os.path.join(a.data, "val.bin"), dtype=np.uint16, mode="r")
-    model = GPT(50304, a.d, a.layers, a.heads, a.ctx).cuda()
+    moe = None
+    if a.moe_experts:
+        moe = (a.moe_experts, a.moe_topk, a.moe_dff or 4 * a.d // a.moe_topk)
+    model = GPT(50304, a.d, a.layers, a.heads, a.ctx, moe=moe, moe_aux=a.moe_aux).cuda()
     converted = []
     if a.precision == "nvfp4":
         skip = tuple(f"blocks.{i}." for i in range(a.layers - a.hp_last, a.layers))
+        hp = [m for m in a.hp_modules.split(",") if m]
+        skip += tuple(f"blocks.{i}.{m}" for i in range(a.layers) for m in hp)
+        from nvfp4 import ops as _ops
+        if a.four_six:
+            _ops.set_four_six(True)
+        if a.ms_eden:
+            _ops.set_ms_eden(True)
+        if a.weight_1d:
+            _ops.set_weight_blocks("1d")
         converted = convert_linears(model.blocks, skip=tuple(s[len("blocks."):] for s in skip),
                                     wgrad_rht=not a.no_rht, fuse_wgrad_accumulation=a.fuse_wgrad)
         if a.fuse_producers:
@@ -214,10 +257,19 @@ def main():
     tok_per_step = a.batch * a.ctx
     t_last, tokens_window = time.perf_counter(), 0
     t_start = t_last
+    tail_step = a.steps - int(round(a.steps * a.bf16_tail)) if a.precision == "nvfp4" and a.bf16_tail > 0 else None
     for step in range(a.steps + 1):
+        if step == tail_step:  # NVIDIA's precision switch: the rest of training with the NVFP4 layers in BF16
+            from nvfp4 import ops as _ops
+            _ops.set_high_precision(True)
+            log.write(json.dumps({"step": step, "high_precision": True}) + "\n")
         if step % a.eval_every == 0 or step == a.steps:
             vl = evaluate(model, val, a.micro_batch, a.ctx, n_batches=40)
             rec = {"step": step, "val_loss": vl, "elapsed_s": time.perf_counter() - t_start}
+            if tail_step is not None and step >= tail_step:  # the same weights evaluated with NVFP4 layers
+                _ops.set_high_precision(False)
+                rec["val_loss_nvfp4"] = evaluate(model, val, a.micro_batch, a.ctx, n_batches=40)
+                _ops.set_high_precision(True)
             log.write(json.dumps(rec) + "\n")
             if rank == 0:
                 print(rec, flush=True)

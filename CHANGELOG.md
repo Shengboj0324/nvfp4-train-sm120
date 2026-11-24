@@ -1,5 +1,53 @@
 # Changelog
 
+## 0.11.0 — recipe options, BF16 tail, mixture of experts, cheaper stochastic rounding (2026-11-24)
+
+- **`ops.set_high_precision(True)`, the BF16 tail** (NVIDIA arXiv 2509.25149 §4.4): while on, `NVFP4Linear`
+  and the `nvfp4.fused` sub-blocks compute exactly what the modules they replace would (BF16 GEMMs,
+  ordinary autograd; tested bit-identical), without touching weights or optimizer state, so a training
+  loop can switch for its last steps. GPT-124M, last 10% of steps, three seeds: gap to BF16
+  **+1.32% → +0.62%** (paired −0.70% ± 0.04, every seed), 4% more wall time.
+  `experiments/train_gpt.py --bf16-tail FRAC` (also logs the same weights' NVFP4 validation loss).
+- **Recipe options from the 2026 literature**, each bit-exact against the extended reference
+  (DESIGN.md §2.1, USAGE.md §3.5), off by default:
+  - `ops.set_four_six(True)` / `with ops.four_six_scales():`. Four Over Six block scales (each RTN block
+    picks max → 6 or max → 4, by squared error; tensor constant 256).
+  - `ops.set_ms_eden(True)`. MS-EDEN on the wgrad operands: a 64-point RHT (H4 ⊗ H16, the cross-lane
+    stage through shared memory) and the gradient quantized with RTN elements and an EDEN-corrected,
+    stochastically rounded E4M3 scale. Unbiased over the rotation; the bias test showed a 16-point
+    rotation is not enough.
+  - `ops.set_weight_blocks("1d")`. 1×16 weight blocks, with the dgrad weight re-quantized from the
+    dequantized fprop weight.
+  - Measured in a three-seed ablation harness (`experiments/run_ablation.sh`,
+    `experiments/ablation_summary.py`, paired by seed), RESULTS.md §4.2: −0.03% (Four Over Six), −0.08%
+    (MS-EDEN), −0.12% (both), −0.12% (1×16 weights), −0.19% (all three), −0.27% (fc2 kept BF16). The loss falls, but by at
+    most a fifth of the gap at this scale, for 2–14% wall time. Quantizer cost: RESULTS.md §2.4,
+    `bench/bench_sr_cost.py`.
+- **`nvfp4.moe.MoE`**: dropless top-k mixture-of-experts MLP (SwiGLU / GELU experts, fp32 router softmax,
+  Switch load-balancing loss). Tokens are sorted per expert and each expert runs the fused NVFP4 MLP on
+  its slice (one host sync per layer).
+  - Layer step: 1.74–2.15× BF16 with 8 experts, 1.25× with 32 small ones (`bench/bench_moe.py`).
+  - MoE GPT (8 experts, top-2, 294M parameters), one seed: +0.76% loss at +20% tokens/s
+    (`experiments/run_moe.sh`; `train_gpt.py --moe-experts`).
+- **Cheaper software stochastic rounding** (no `cvt.rs` on sm_120a). An integer-domain rounder with 8
+  random bits per element: one hash per four elements, plus Fitzgibbon & Felix's half-unit offset, which
+  removes few-bit SR's rounding bias.
+  - About 12 extra SASS instructions per element instead of 28.6: the dual quantizer with SR is 10–22%
+    faster.
+  - Same loss over three seeds (+1.32% ± 0.16 vs v0.5's +1.28%). The SR noise differs from 0.10's for the
+    same seed.
+- **Research survey** of the open problems: NVFP4 recipes, 8-bit attention, sm_120 GEMMs, software SR,
+  MoE. It ranks the techniques by impact and effort; probe code is included
+  (docs/research/nvfp4-open-problems-2026-11/).
+  - Tried from it and rejected with measurements (DESIGN.md §6): single-term INT8 P·V in attention
+    (dQ errors up to 10.6% on peaked layers).
+  - Not pursued: FlashAttention-4's exp2 offload (the forward is MMA-bound, not MUFU-bound).
+- README rewritten for developers: what runs in 4 bits, the API surface, the verification workflow.
+- Tests: 835 (814 passed, 21 skipped on this machine: environment-dependent cases). New: Four Over Six and MS-EDEN
+  bit-exact against the reference (and MS-EDEN's unbiasedness), 1×16 weights, MoE (routing, gradients vs
+  BF16, fused path), the BF16 tail (bit-identical to the replaced modules, switching back and forth),
+  8-bit SR bias bound.
+
 ## 0.10.0 — exact backward for 8-bit attention (2026-11-24)
 
 - **`nvfp4.attention(..., backward="bf16")`, the new default**: the 8-bit forward with PyTorch's

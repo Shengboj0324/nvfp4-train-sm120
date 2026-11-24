@@ -69,6 +69,67 @@ be bit-identical to it in every mode.
 All three GEMMs run on a **single "TN" kernel** (`D = A·B^T`, with both operands quantized along
 the contraction dimension). This works because the quantizer can emit transposed outputs directly.
 
+### 2.1 Recipe options from the 2026 literature (v0.11)
+
+The recipe above leaves GPT-124M +1.3% above BF16 in validation loss (RESULTS.md §4.1). The 2026 papers
+attribute most of such gaps to forward-pass quantization error, and propose fixes
+(docs/research/nvfp4-open-problems-2026-11/ surveys them). Four are implemented as process-wide switches
+(`nvfp4.ops`, USAGE.md §3.5), bit-exact against `nvfp4/reference.py` like the rest of the quantizer, and
+measured with a three-seed ablation harness (`experiments/run_ablation.sh`, paired by seed against the
+baseline: same initialization, data order and rounding seeds, so seed noise largely cancels).
+
+- **Four Over Six** (`set_four_six`, arXiv 2512.02010). E2M1 has no value between 4 and 6, so a block
+  whose maximum maps to 6 represents values near 5 badly. Each round-to-nearest 16-block is quantized
+  twice, with its maximum mapped to 6 and to 4, and keeps the candidate with the smaller squared error
+  (summed in the same order as the reference, so ties resolve identically). Mapping to 4 needs block
+  scales up to 448 · 6/4, so the tensor scale uses 256 instead of 448 as its E4M3 ceiling. Applies to
+  all RTN outputs (X, W, and X^T, W^T); stochastically rounded gradients are unchanged.
+- **MS-EDEN** (`set_ms_eden`, Quartet II, arXiv 2601.22813) for the wgrad operands. The RHT along the
+  tokens is widened from 16 to 64 points: H64 = H4 ⊗ H16, i.e. the existing per-lane 16-point butterfly
+  (on a slice of a 64-bit sign mask) followed by a 4-point butterfly across lanes through shared
+  memory, scaled by ½. The gradient operand dY^T is then quantized with round-to-nearest elements, and
+  each block's scale is corrected by EDEN's factor S = Σy² / Σy·q (y the scaled inputs, q the RTN codes)
+  and stochastically rounded to E4M3, which makes the product unbiased **over the random rotation**
+  rather than per element. With a 16-point transform the correction was measurably biased on
+  heavy-tailed inputs; with 64 points the bias test passes (`tests/test_ms_eden_cuda.py`). Scales follow the
+  paper's constants: a block maximum maps to 6.07 instead of 6, and the tensor scale uses 256 as its E4M3
+  ceiling, leaving room for the correction to raise a scale.
+  It removes the per-element random numbers from the gradient operand and halves its error.
+- **1×16 weights with re-quantization** (`set_weight_blocks("1d")`, Quartet II / Mosaic). fprop uses W
+  in 1×16 blocks along K (lower error than 16×16 blocks, and Four Over Six can choose per row); dgrad
+  uses the dequantized fprop weight re-quantized in 1×16 blocks along N, so both GEMMs see the same
+  weights up to a second rounding. Costs one dequantize and one extra quantization per weight per
+  micro-batch (amortized by `cache_weight_quantization` under gradient accumulation).
+- **BF16 tail** (`set_high_precision`, NVIDIA arXiv 2509.25149 §4.4): switch the NVFP4 layers to BF16 for
+  the last part of training. The layers keep their weights and optimizer state and fall back to the
+  modules they replace (fused sub-blocks to the unfused composition), so it can be flipped at any step.
+
+**Measured** (GPT-124M, TinyStories, 3000 steps, three seeds; RESULTS.md §4.2):
+
+| option | vs BF16 | vs baseline, paired | tokens/s cost |
+|---|---|---|---|
+| baseline (v0.10 recipe) | +1.32% | | |
+| Four Over Six | +1.30% | −0.03% ± 0.02 | −2% |
+| MS-EDEN | +1.24% | −0.08% ± 0.05 | −3% |
+| MS-EDEN + Four Over Six | +1.21% | −0.12% ± 0.05 | −4% |
+| 1×16 weights | +1.20% | −0.12% ± 0.09 | −12% |
+| 1×16 weights + Four Over Six | +1.20% | −0.13% ± 0.20 | −13% |
+| 1×16 weights + MS-EDEN + Four Over Six | +1.13% | −0.19% ± 0.11 | −17% |
+| fc2 kept in BF16 (precision budget) | +1.05% | −0.27% ± 0.06 | −12% |
+| **BF16 tail (last 10% of steps)** | **+0.62%** | **−0.70% ± 0.04** | −4% |
+| BF16 tail + MS-EDEN + Four Over Six | +0.55% | −0.76% ± 0.20 | −7% |
+
+Every quantizer option lowers the loss on average, and MS-EDEN's and Four Over Six's reductions have the
+same sign on every seed, but none removes more than a tenth of the gap at this scale: the forward-error
+fixes that gave the papers 3–25% gap reductions on 0.3–7B models give 2–10% here. The BF16 tail halves
+the gap on every seed for 4% of the run's time, and on top of it the quantizer options add nothing
+resolvable. So the quantizer options stay off by default (they change numerics and cost 2–13% throughput
+for ~0.1% loss), and the tail is the recommended addition (it is a training-loop decision, so it is a
+switch the loop flips, not a default). A tail-trained model should be served in BF16: evaluated with its
+NVFP4 layers it is no better than the baseline (RESULTS.md §4.2). Not implemented: MS-EDEN on the dgrad operands (it needs a rotation of W^T along N,
+incompatible with 2D weight blocks), the low-rank BF16 weight subspace of Full-Stack FP4 (+4%
+parameters) and oscillation damping (ALTO; aimed at gaps that grow with training, which ours does not).
+
 ## 3. Quantizers (`csrc/quantize_dual.cu`, `csrc/quantize.cu`)
 
 Every NVFP4 quantization makes two passes: an amax reduction, then the quantization itself. Global
@@ -118,18 +179,23 @@ bit-identical to the reference:
   that round to zero, so a 3-instruction SWAR fix-up (`clear_negative_zeros`) clears the sign of
   zero-magnitude nibbles, matching the reference.
 - **Stochastic rounding** has no hardware path on sm_120a: `ptxas` rejects `cvt.rs` (".rs not
-  supported on sm_120a"). It is done in software with no division and no int→float conversion:
-  - one 32-bit hash per **pair** of elements gives both their uniforms, 16 bits each
-    (`(h & 0xFFFF) · 2^-16`, `(h >> 16) · 2^-16`), assembled from mantissa bits (v0.8; until v0.7
-    every element hashed twice for a 24-bit uniform). The hash is most of SR's cost: SR now adds
-    34–43% to the plain dual quantizer instead of 48–61%. 16 bits bound the rounding bias at 2^-17 of
-    a grid step;
-  - the lower grid point is `a` with its mantissa truncated to 1 bit (for `a ≥ 1`);
-  - the step's reciprocal comes from the exponent bits, a power of two, so `(a − lo) / step` is exact
-    as a multiply;
-  - the chosen grid value is then converted exactly by the hardware convert.
-
-  Together these made the SR quantize pass about 1.5× faster than v0.1's version.
+  supported on sm_120a"; PTX ISA 9.5 allows it only on sm_100a / sm_103a / sm_107a). It is done in
+  software in the integer domain (v0.10), with 8 random bits per element, as NVIDIA's hardware SR uses:
+  - one 32-bit hash per **four** elements, keyed once per block by the seed (`hash(q + key)`,
+    `key = hash(lo ^ hash(hi))`), gives each element one byte;
+  - magnitudes below 1 are lifted into [1, 2) (`a + 1`), where E2M1's 0.5 spacing is one mantissa bit;
+    the random byte plus half a unit of it is added just below the one kept mantissa bit and the rest
+    is masked off: a carry rounds up (into the next binade on its own), and the result is an exact
+    E2M1 grid value that the hardware convert passes through. The half-unit offset is Fitzgibbon &
+    Felix's unbiased few-bit rounding ("SRF", ARITH 2025): without it few-bit SR rounds down 2^-9 of a
+    step too often (TE's software fallback has that bias), with it P(up) = round(256 f) / 256 for the
+    position f in the step, exact on average and within 2^-9 everywhere (`test_eight_bit_stochastic_
+    rounding_bias_is_bounded` checks all 256 bytes for 8000 values).
+  - v0.8–0.9 used one hash per pair, 16-bit uniforms and float-domain arithmetic (28.6 extra SASS
+    instructions per element vs ~12 now; docs/research/nvfp4-open-problems-2026-11/). Measured on the
+    dual quantizer with SR on both outputs (bf16 gradients 8192 × 2304 / 8192 × 8192 / 16384 × 3072):
+    152 / 602 / 536 µs before, 119 / 485 / 481 µs after (−10 to −22%); GPT-124M's NVFP4 validation loss
+    over three seeds is unchanged (+1.32% ± 0.16 vs BF16, v0.5: +1.28%; RESULTS.md §4.2).
 - **The RHT sign mask** (16 bits, derived from the seed) is computed once on the host for an integer
   seed. For a seed held in GPU memory (what the layers use, §3.5) each warp builds it with one hash per
   lane and a ballot. Sign flips are XORs of the float sign bit, identical to multiplying by −1.
@@ -142,10 +208,9 @@ bit-identical to the reference:
   so CPU and CUDA references and the kernels agree. `test_scale_rounding_tie` and
   `test_block_scale_uses_ieee_division` cover it. In PyTorch, `2688.0 / tensor` is likewise
   `reciprocal(tensor) * 2688`, so `global_scales` uses `torch.div`.
-- **Stochastic rounding is reproducible:** it uses a counter-based hash (`lowbias32`, applied twice
-  so the seed's high half is mixed in after the first round: different seeds do not give shifted
-  copies of one stream) of (seed, element-pair index), so SR is seedable and identical between CPU and
-  GPU. (The SR noise differs from v0.7's for the same seed.)
+- **Stochastic rounding is reproducible:** it uses a counter-based hash (`lowbias32`) of the element's
+  quad index plus a key that mixes both halves of the 64-bit seed, so SR is seedable and identical
+  between CPU and GPU. (The SR noise differs from v0.9's for the same seed.)
 
 ### 3.3 The single-output quantizer
 
@@ -506,6 +571,9 @@ Every benchmark checks correctness against the reference before it times anythin
 
 ## 6. Known limitations and next steps
 
+Done in v0.11: the recipe options of the 2026 literature with a three-seed ablation (§2.1), a BF16-tail
+precision switch, cheaper stochastic rounding (§3.2, item 3), mixture-of-experts layers (item 5), and a
+research survey of the open problems (docs/research/nvfp4-open-problems-2026-11/).
 Done in v0.9: 8-bit attention (§7; item 2 of v0.8), the warp-tile ablation of the locked-clock gap
 (§4.2, item 1).
 Done in v0.8: residual adds, biases and the q / k / v hand-off fused (§3.6, item 2 of v0.7),
@@ -541,18 +609,27 @@ accumulation.
    negligible. On a GPT-124M's activations at 4096 tokens (`bench/attention_skip_probe.py`) no tile
    qualifies even at a threshold of 2^-5 of the running row maximum (where in most layers under 1% of the
    individual probabilities fall below 2^-7 and at most 26% below 2^-5): attention there is too diffuse,
-   and the kernel's running maximum makes early tiles look larger still. Remaining ways forward: V in
-   INT8 per token, FlashAttention-4's polynomial exp2 on the FMA pipe. Masks other than causal, packed
+   and the kernel's running maximum makes early tiles look larger still. Also tried and rejected
+   (v0.11, `bench/attention_qbwd_probe.py`, variant `qb_int8pv`): a single-term INT8 P V (P at a fixed scale
+   127 / row maximum, V per channel, as SageBwd) under the same exact backward; on the peaked layers of the 4096-token model
+   dQ errors reach 3.6–10.6% (the two-term MXFP8 product: 0.4–2.0%), because small probabilities round
+   to zero. FlashAttention-4's polynomial exp2 was not pursued: the forward is bound by the MMA pipe
+   (INT8 and MXFP8 at 473 / 438 dense TFLOPS on this part), not by MUFU. Remaining way forward: V in INT8
+   per channel with P in two terms. Masks other than causal, packed
    sequences, dropout and head dims other than 64 / 128 fall back to SDPA.
-3. **Stochastic rounding is still software** (sm_120a has no `cvt.rs`): one 32-bit hash per element
-   pair, +34–43% on the plain dual quantizer.
+3. **Stochastic rounding is still software** (sm_120a has no `cvt.rs`, and PTX ISA 9.5 keeps it off every
+   sm_12x target): v0.10's integer-domain rounder with 8 random bits per element costs 10–22% less than
+   v0.9's; MS-EDEN (§2.1) removes element-wise random numbers from the wgrad gradient operand.
 4. **Weight cache limits.** In-place writes through `param.data` outside an optimizer step cannot be
    detected (`.data` deliberately gives the tensor a fresh autograd version counter); call
    `invalidate_weight_caches`. Under FSDP2 the cache hits only when the all-gathered weight lands at
    the same address within a step (the allocator's choice; correct either way).
 5. **Fused sub-blocks** cover GPT / BERT / ViT-style and Llama-style blocks, pre-norm or (via the
-   norm-free MLPs) post-norm, with biases anywhere. Mixture-of-experts layers (grouped GEMMs) are not
-   covered.
+   norm-free MLPs) post-norm, with biases anywhere. v0.11 adds mixture-of-experts MLPs (`nvfp4.moe.MoE`,
+   dropless top-k): tokens are sorted by expert and each expert runs the fused MLP on its slice, one
+   launch sequence per expert rather than a grouped GEMM. That is 1.7–2.2× BF16 with 8 large experts but
+   only 1.25× with 32 small ones (RESULTS.md §8), where a grouped (tile-list) GEMM over all experts would
+   help; the per-layer host synchronization for the expert sizes also rules out CUDA-graph capture.
 6. **Framework coverage.** DDP, FSDP1 and FSDP2 are tested with two ranks on one GPU over gloo and
    (v0.8) with NCCL across two physical RTX 5090s, bit-identical to a single process. Data-parallel
    *speed* depends on the host: on the rented two-GPU machine all-reduce ran at 2 GB/s (no P2P), so DDP

@@ -150,7 +150,45 @@ grows with the share of attention in the step (long context). Errors are those o
 forward (output ~1–3% relative to exact attention, vs ~0.2% for BF16 flash attention); validate on your
 model.
 
-### 3.4 Low-level ops
+### 3.4 Mixture of experts (v0.11)
+
+```python
+from nvfp4.moe import MoE
+moe = MoE(d=1024, d_ff=2816, n_experts=8, top_k=2, activation="swiglu")   # or "gelu_tanh", "gelu"
+nvfp4.convert_linears(moe, fuse_wgrad_accumulation=True)   # experts -> NVFP4 (the router stays BF16)
+y = moe(x)                                    # x [..., d]
+loss = loss + 0.01 * moe.aux_loss             # Switch load-balancing loss (1.0 when balanced)
+```
+
+Dropless top-k routing (softmax in fp32, weights renormalized over the k choices). Tokens are sorted by
+expert and each expert runs the fused NVFP4 MLP (`swiglu_mlp` / `gelu_mlp`) on its contiguous slice, so
+every expert's operands get their own tensor scales and the backward is the dense layers' path. The
+per-expert token counts are read on the host once per call (one synchronization per MoE layer, as in
+MegaBlocks), so a step with MoE layers is not CUDA-graph capturable and `torch.compile` breaks the graph
+there. `experiments/train_gpt.py --moe-experts 8` trains a GPT with MoE MLPs; `bench/bench_moe.py` times a
+layer (RESULTS.md §8).
+
+### 3.5 Recipe options (v0.11)
+
+Process-wide switches, read when a quantizer launches (set them before building / capturing the step):
+
+| Switch | Effect | Default |
+|---|---|---|
+| `ops.set_four_six(True)` (or `with ops.four_six_scales():`) | "Four Over Six" block scales on every round-to-nearest operand: each 16-block keeps the smaller-error of max → 6 and max → 4; tensor scale 6 · 256 / amax | off |
+| `ops.set_ms_eden(True)` | MS-EDEN on the wgrad operands: 64-point RHT along the tokens, and the gradient operand quantized with RTN elements and an EDEN-corrected, stochastically rounded block scale (unbiased, about half the error of element SR) | off |
+| `ops.set_weight_blocks("1d")` | 1×16 weight blocks for fprop, the dequantized fprop weight re-quantized along N for dgrad | `"2d"` (16×16) |
+| `ops.set_high_precision(True)` | BF16 tail: `NVFP4Linear` and the fused sub-blocks compute exactly what the modules they replace would (BF16 GEMMs, ordinary autograd) until switched off; weights and optimizer state are untouched, so flip it for the last ~10% of steps | off |
+
+The BF16 tail is the one option that closes a large part of the gap (+1.32% → about +0.6% at 10% of the
+steps, for ≈4% of the run's time); the quantizer options lower the loss by 0.03–0.13% each at
+GPT-124M scale for 2–13% throughput. Recommended: the default recipe plus a BF16 tail; add
+`set_ms_eden(True)` and `set_four_six(True)` only after checking them on your model.
+
+Their measured effect on GPT-124M is in RESULTS.md §4.2; `experiments/train_gpt.py` has `--four-six`,
+`--ms-eden`, `--weight-1d`, `--bf16-tail FRAC`, and `--hp-modules fc2` (keep a linear in BF16 in every
+block).
+
+### 3.6 Low-level ops
 
 ```python
 from nvfp4 import quantize, quantize_dual, gemm, norm_backward
@@ -211,7 +249,7 @@ sync, and changes on every CUDA-graph replay. Both give bit-identical results fo
 | Fused blocks | GPT / BERT / ViT style (LayerNorm, tanh or exact GELU) and Llama style (RMSNorm, SwiGLU), pre- or post-norm, biases anywhere, residual adds fused. Attention between them is yours: PyTorch's SDPA, or `nvfp4.attention` (§3.3). |
 | Attention | `nvfp4.attention` saves the dequantized q, k, v (default backward) or 8-bit copies in two layouts (`backward="8bit"`), as much memory as the BF16 tensors SDPA saves, plus the output; `torch.compile` traces it as custom ops. |
 | Version changes | v0.8 changed the stochastic-rounding generator (one hash per element pair) and quantizes fp32 output gradients without first rounding them to bf16: gradients are not bit-identical to v0.7's for the same seed (forward results are). |
-| Precision recipe | Keep embeddings, the LM head and the last 1–2 blocks in BF16. Measured quality gap at 124M / 507M parameters: +1.0–1.4% validation loss, constant over training; at 124M over three seeds +0.019 ± 0.002 nats (+1.28%) (RESULTS.md §4–5). Validate on your own model before relying on it. |
+| Precision recipe | Keep embeddings, the LM head and the last 1–2 blocks in BF16. Measured quality gap at 124M / 507M parameters: +1.0–1.4% validation loss, constant over training; at 124M over three seeds +0.019 ± 0.002 nats (+1.28%) (RESULTS.md §4–5). Training the last 10% of steps with `ops.set_high_precision(True)` halves it (+0.62%, RESULTS.md §4.2); serve such a model in BF16. Validate on your own model before relying on it. |
 | Throughput | Gains grow with width: GPT block fwd+bwd 1.8× BF16 at d=768, 2.7× at d=2048, 3.2× at d=4096 (3.5× for micro-batches after the first with the weight cache); Llama block 2.1–3.3× (3.6×) on an RTX 5090 Laptop GPU. |
 
 ## 6. Operating on a laptop / workstation

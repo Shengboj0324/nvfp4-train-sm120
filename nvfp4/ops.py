@@ -31,6 +31,95 @@ def available(device: int | torch.device | None = None) -> bool:
     return torch.cuda.get_device_capability(device) == SUPPORTED_CAPABILITY
 
 
+_FOUR_SIX = [False]  # mirrors the extension's switch (also used without the extension, by the emulation)
+
+
+def set_four_six(on: bool) -> None:
+    """Recipe switch: "Four Over Six" adaptive block scales (Cook et al., arXiv 2512.02010) on every
+    round-to-nearest NVFP4 output (activations, weights, their transposes; not the stochastically rounded
+    gradients): each 16-element block keeps whichever of max -> 6 and max -> 4 gives the smaller squared error,
+    with the tensor scale 6 * 256 / amax. Read when a quantizer is launched (so it also applies inside
+    torch.compile'd and CUDA-graph-captured code captured after the call)."""
+    _FOUR_SIX[0] = bool(on)
+    if _C is not None:
+        _C.set_four_six(bool(on))
+
+
+def four_six() -> bool:
+    """Whether Four Over Six block scales are on (``set_four_six``)."""
+    return _FOUR_SIX[0]
+
+
+_WEIGHT_BLOCKS = ["2d"]
+
+
+def set_weight_blocks(mode: str) -> None:
+    """Recipe switch for the NVFP4 layers' weights: "2d" (default; 16x16 blocks, so W and W^T are one
+    quantization, NVIDIA's recipe) or "1d" (1x16 blocks along K for fprop, which 4/6 can improve, and for
+    dgrad the dequantized fprop weight re-quantized along N; Quartet II / Mosaic NVFP4)."""
+    if mode not in ("2d", "1d"):
+        raise ValueError(f"weight blocks must be '2d' or '1d', got {mode!r}")
+    _WEIGHT_BLOCKS[0] = mode
+
+
+def weight_blocks() -> str:
+    """The weight block mode (``set_weight_blocks``)."""
+    return _WEIGHT_BLOCKS[0]
+
+
+_HIGH_PRECISION = [False]
+
+
+def set_high_precision(on: bool) -> None:
+    """Precision switch for the NVFP4 layers (NVIDIA, arXiv 2509.25149 §4.4: training the last ~10-20% of
+    tokens in BF16 recovers most of NVFP4's loss gap). While on, NVFP4Linear and the nvfp4.fused sub-blocks
+    compute exactly what the modules they replace would (nn.Linear / LayerNorm / activation in the caller's
+    dtype, autocast respected), with ordinary autograd; their weights, optimizer state and module structure
+    are unchanged, so it can be flipped at any step (and back). The 8-bit attention is not affected."""
+    _HIGH_PRECISION[0] = bool(on)
+
+
+def high_precision() -> bool:
+    """Whether the NVFP4 layers currently compute in high precision (``set_high_precision``)."""
+    return _HIGH_PRECISION[0]
+
+
+_MS_EDEN = [False]
+
+
+def set_ms_eden(on: bool) -> None:
+    """Recipe switch: MS-EDEN for the weight-gradient GEMM's operands (Quartet II, arXiv 2601.22813). The dual
+    quantizer's RHT outputs (X^T and dY^T, transformed along the tokens with one seed so the rotation cancels in
+    dW = dY^T X) use a 64-point randomized Hadamard transform instead of 16-point, and the stochastically
+    rounded one (dY^T) is quantized with round-to-nearest elements and an EDEN-corrected, stochastically
+    rounded block scale instead of element-wise stochastic rounding: unbiased, ~half the error. Needs
+    col_pad % 64 == 0 (NVFP4Linear uses 128)."""
+    _MS_EDEN[0] = bool(on)
+    if _C is not None:
+        _C.set_ms_eden(bool(on))
+
+
+def ms_eden() -> bool:
+    """Whether MS-EDEN is on (``set_ms_eden``)."""
+    return _MS_EDEN[0]
+
+
+class four_six_scales:
+    """Context manager: ``with ops.four_six_scales(True): ...`` sets the switch and restores it on exit."""
+
+    def __init__(self, on: bool = True):
+        self.on = bool(on)
+
+    def __enter__(self):
+        self.prev = four_six()
+        set_four_six(self.on)
+        return self
+
+    def __exit__(self, *exc):
+        set_four_six(self.prev)
+        return False
+
+
 @dataclass
 class NVFP4Tensor:
     """A 2D tensor quantized along its last dim: value = e2m1(data) * e4m3(scales) * gdec."""

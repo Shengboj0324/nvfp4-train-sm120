@@ -407,11 +407,22 @@ def _finish(y, x, lin, bias_done: bool, residual):
     return y if residual is None else residual + y
 
 
+def _norm(kind, x, norm):
+    """The unfused normalization (ops.set_high_precision): what the module computes in the caller's dtype."""
+    return x if norm is None else norm(x)
+
+
 def _norm_linear(kind, x, norm, lin, chunks, return_residual):
     d, x2d = _flat(x)
     _check_linear(lin, d)
     if chunks < 1 or lin.out_features % (chunks * 16):
         raise ValueError(f"out_features ({lin.out_features}) must split into {chunks} chunks of multiples of 16")
+    if ops.high_precision():  # residual handle = x itself (NVFP4Linear adds it outside)
+        y = torch.nn.Linear.forward(lin, _norm(kind, x, norm))
+        ys = (y,) if chunks == 1 else y.split(lin.out_features // chunks, dim=-1)
+        if chunks == 1:
+            return (y, x) if return_residual else y
+        return (*ys, x) if return_residual else ys
     kind, w, b, eps = _norm_args(kind, norm, d, x2d)
     dt = _out_dtype(x)
     bias = lin.bias if _epilogue(x2d, dt, False) else None  # else (fp16 output) added below
@@ -458,6 +469,10 @@ def _mlp_gelu(kind, x, norm, fc1, fc2, approximate, residual):
     _check_linear(fc2, fc1.out_features)
     if residual and fc2.out_features != d:
         raise ValueError(f"residual=True needs fc2.out_features == {d}")
+    if ops.high_precision():
+        h = torch.nn.functional.gelu(torch.nn.Linear.forward(fc1, _norm(kind, x, norm)), approximate=approximate)
+        y = torch.nn.Linear.forward(fc2, h)
+        return x + y if residual else y
     kind, w, b, eps = _norm_args(kind, norm, d, x2d)
     dt = _out_dtype(x)
     epi = _epilogue(x2d, dt, residual)
@@ -493,6 +508,11 @@ def _mlp_swiglu(kind, x, norm, gate, up, down, residual):
     _check_linear(down, gate.out_features)
     if residual and down.out_features != d:
         raise ValueError(f"residual=True needs down.out_features == {d}")
+    if ops.high_precision():
+        n = _norm(kind, x, norm)
+        h = torch.nn.functional.silu(torch.nn.Linear.forward(gate, n)) * torch.nn.Linear.forward(up, n)
+        y = torch.nn.Linear.forward(down, h)
+        return x + y if residual else y
     kind, w, b, eps = _norm_args(kind, norm, d, x2d)
     dt = _out_dtype(x)
     epi = _epilogue(x2d, dt, residual)

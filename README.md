@@ -1,134 +1,262 @@
 # nvfp4-train-sm120
 
-**4-bit (NVFP4) training on consumer Blackwell GPUs (RTX 50-series, `sm_120`), with 8-bit attention.**
+**NVFP4 (4-bit) training kernels and PyTorch layers for consumer Blackwell GPUs (RTX 50-series, `sm_120a`),
+with 8-bit flash attention and NVFP4 mixture-of-experts.**
 
-The repository contains block-scaled FP4 tensor-core GEMMs (a persistent TMA-fed main loop plus
-split-K, with bias / residual adds in the epilogue), bit-exact fused quantizers that emit an operand
-and its transpose in one pass (with 16-point random Hadamard transform and stochastic rounding, and
-with LayerNorm / RMSNorm / GELU / SwiGLU computed inside the quantizer), and drop-in layers and
-transformer sub-blocks that run the forward, input-gradient and weight-gradient GEMMs in NVFP4 and
-save only 4-bit operands for backward. Attention runs on INT8 / MXFP8 tensor cores (forward and a
-deterministic backward).
+`nvfp4` is a CUDA extension plus a thin PyTorch layer. It runs the forward, input-gradient (dgrad) and
+weight-gradient (wgrad) GEMMs of linear layers on the FP4 tensor cores, using NVIDIA's NVFP4 training
+recipe (E2M1 values, E4M3 scales per 16 elements, an FP32 tensor scale, 16×16 weight blocks, random
+Hadamard transform and stochastic rounding on gradients). Everything a training step needs around the
+GEMMs is built in: fused quantizers, a GEMM epilogue for bias and residual, fused norm / activation
+sub-blocks, attention and MoE. Every quantizer output is bit-exact against a pure-PyTorch executable
+spec ([`nvfp4/reference.py`](nvfp4/reference.py)).
 
-Consumer Blackwell has hardware FP4 tensor cores, but its programming model differs from datacenter
-Blackwell: warp-level `mma.sync` instead of `tcgen05`, no tensor memory, and about 99 KB of shared
-memory. Mainstream training stacks don't yet use it for training. These kernels are written for
-that model from the ground up (see [docs/DESIGN.md](docs/DESIGN.md)).
+```
+pip install --no-build-isolation .      # builds nvfp4._C for sm_120a (CUDA >= 12.8)
+python -c "import nvfp4; print(nvfp4.available())"
+```
 
-## Results on an RTX 5090 Laptop GPU
+## Contents
 
-Full details and raw data are in [docs/RESULTS.md](docs/RESULTS.md).
+- [Why a separate stack for sm_120](#why-a-separate-stack-for-sm_120)
+- [What runs in 4 bits](#what-runs-in-4-bits)
+- [Install](#install)
+- [API](#api)
+- [Performance](#performance-rtx-5090-laptop-unless-noted)
+- [Training quality](#training-quality)
+- [Verification and development](#verification-and-development)
+- [Repository layout](#repository-layout)
+- [Limitations](#limitations)
 
-| | |
-|---|---|
-| NVFP4 GEMM throughput | **273–441 TFLOPS**: **3.1–5.0× BF16 cuBLAS**; 0.91–1.98× cuBLASLt NVFP4 (above it on 10 of 11 shapes, up to 2× on short K) |
-| Fused dual quantizer | operand + transposed operand in one pass: **1.6–2.3×** faster than two separate quantizations |
-| GPT block fwd+bwd (v0.8) | **1.82× (d=768) → 2.65× (d=2048) → 3.22× (d=4096)** vs BF16 (**3.50×** for micro-batches after the first, with the weight cache), 5–12% less memory |
-| GPT-507M (d=2048) pretraining | val loss **1.6954 vs 1.6786** BF16 (+1.0%), **1.62× tokens/s, −39% GPU energy** |
-| GPT-124M (d=768) pretraining, 49M tokens | val loss **1.5062 vs 1.4892** BF16 (constant ~0.017 gap, no divergence), **+27% tokens/s, −22% GPU energy** |
-| Same, three seeds (v0.5) | gap **+0.019 ± 0.002** nats (+1.28%), constant over training for every seed; +27.7% tokens/s |
-| Framework integration (v0.5) | `torch.compile(fullgraph=True)` without graph breaks (bit-identical to eager), CUDA-graph capture of whole training steps, no host syncs, DDP and FSDP2 bit-exact vs single process |
-| Llama-style block (v0.7–v0.8) | RMSNorm, SwiGLU, residual adds and the q / k / v hand-off fused: **2.09× (d=1024) → 3.32× (d=4096)** vs BF16, 18–30% faster than unfused NVFP4; with the weight cache **up to 3.64×** |
-| v0.8 | persistent TMA GEMM (8–17% fewer cycles at locked clocks, 8192³ above cuBLASLt at the power limit); residual adds, biases and q / k / v fused into GEMM epilogues and a deterministic norm-backward kernel; post-norm blocks; stochastic rounding at half the hashing cost |
-| Desktop RTX 5090 ×2 (v0.8, rented) | GEMM **up to 1027 TFLOPS, 1.03–1.71× cuBLASLt** on every shape; GPT block 3.27× BF16 (3.46× cached), Llama 3.30× (3.49×); GPT-124M +32% tokens/s at the same loss; **NCCL across two GPUs** bit-exact (DDP, FSDP1, FSDP2); 625 tests + sanitizers clean on CUDA 12.8 / PyTorch 2.11 |
-| 8-bit attention (v0.9–v0.10) | INT8 scores + MXFP8 probabilities in the forward, the exact (flash) backward of that forward: **same loss as BF16 attention at 4096 tokens** (GPT-124M, 2 seeds), fwd+bwd 1.07–1.12× flash attention; forward-only up to **2.1×** (`backward="8bit"`, which also trains 1.12–1.18× at +0.5% loss) |
-| Platforms (v0.6) | Linux / WSL2 and **native Windows** (MSVC build, tests on the GPU, CI compile job); DDP, **FSDP1** and FSDP2 bit-exact; bitwise-reproducible training with PyTorch's flash attention in deterministic mode |
-| Correctness | quantizers and every fused producer (LayerNorm, RMSNorm, GELU tanh / exact, SwiGLU, with biases) **bit-exact** vs the reference spec; fused blocks' outputs bit-identical to the unfused composition; GEMM = fp64 reference to ~1e-7; compute-sanitizer clean (memcheck, racecheck, synccheck, initcheck); soak runs with bit-exact replays; 720 tests |
+## Why a separate stack for sm_120
 
-![loss curves](experiments/results/v0.3_wide/loss.png)
+The RTX 50-series and the datacenter Blackwell parts share the FP4 data formats but not the programming
+model. Kernels written for B200 (CUTLASS sm100 collectives, cuDNN / Transformer Engine FP4 paths) do not
+run on consumer parts.
 
-## Quick start (RTX 50-series)
+| | B200 / GB200 (`sm_100a`) | RTX 50 (`sm_120a`) |
+|---|---|---|
+| FP4 MMA | `tcgen05.mma`, one thread issues for the CTA, accumulators in tensor memory | warp-level `mma.sync...kind::mxf4nvf4.block_scale`, accumulators in registers |
+| Tensor memory (TMEM) | 256 KB / SM | none |
+| Shared memory / SM | 228 KB | ~100 KB (99 KB per block) |
+| Hardware stochastic rounding (`cvt.rs`) | yes | no (rejected by ptxas, done in software) |
+| Measured dense `mma.sync` peak (5090 Laptop) | | NVFP4 914 · INT8 473 · MXFP8 438 · BF16 121 TFLOPS |
+
+The GEMM ([`csrc/gemm_tma.cu`](csrc/gemm_tma.cu)) is therefore a persistent, TMA-fed `mma.sync` kernel
+with an mbarrier pipeline in registers. The quantizers fuse every element-wise producer that feeds a GEMM,
+because at 4 bits the quantize passes, not the GEMMs, set the step time
+([docs/DESIGN.md](docs/DESIGN.md) §3–4).
+
+## What runs in 4 bits
+
+For a linear layer `Y = X Wᵀ`, `NVFP4Linear` does:
+
+| GEMM | computation | A operand (NVFP4) | B operand (NVFP4) |
+|---|---|---|---|
+| fprop | `Y = X Wᵀ` | X, 1×16 blocks, round-to-nearest | W, 16×16 blocks |
+| dgrad | `dX = dY W` | dY, 1×16 blocks, stochastic rounding | Wᵀ (the same 16×16 blocks) |
+| wgrad | `dW = dYᵀ X` | dYᵀ, 16-point RHT along tokens, SR | Xᵀ, same RHT |
+
+- All three run on one TN kernel (`D = A·Bᵀ`). The **dual quantizer** emits an operand and its transpose
+  from one read of the BF16 / FP32 input. It can apply LayerNorm, RMSNorm, GELU, SwiGLU, or their
+  backwards while loading.
+- Only NVFP4 operands (about 0.56 bytes per element) are saved for backward.
+- Accumulation is FP32. The bias and the residual add happen in the GEMM epilogue, and wgrad can
+  accumulate into an existing FP32 `.grad` in place.
+- Attention (`nvfp4.attention`) runs Q Kᵀ in INT8 and P·V in MXFP8 (e4m3, P in two terms), with an exact
+  flash backward on the dequantized operands.
+- Embeddings, the LM head and (by convention) the last 1–2 blocks stay in BF16.
+
+## Install
+
+Requirements:
+
+- an `sm_120` GPU: RTX 5090 / 5080 / 5070 Ti / 5070 / 5060 Ti / 5060, or the laptop parts;
+- CUDA ≥ 12.8 (tested with 13.0, and 12.9 on Windows);
+- a CUDA build of PyTorch (tested with 2.14.1+cu130 and 2.11 on Linux, 2.7.1+cu128 on Windows);
+- Python ≥ 3.10.
 
 ```bash
-# WSL2 or Linux
-sudo tools/setup_wsl.sh            # CUDA 13.0 toolkit + venv with PyTorch 2.14 cu130 (~/nvfp4)
-pip install --no-build-isolation . # build the extension for sm_120a (or: pip wheel ... for a wheel)
-tools/check.sh                     # run all tests; `tools/check.sh release` adds sanitizers + soak
+# Linux / WSL2
+sudo tools/setup_wsl.sh                  # optional: CUDA 13.0 toolkit + venv with PyTorch cu130 in ~/nvfp4
+pip install --no-build-isolation .       # or: python setup.py build_ext --inplace (development)
+tools/check.sh                           # build + full test suite under the thermal guard
 ```
 
 ```bat
-:: native Windows (CUDA >= 12.8, Visual Studio 2022 C++, a CUDA build of PyTorch >= 2.7)
+:: native Windows (Visual Studio 2022 C++ workload, CUDA >= 12.8, CUDA PyTorch >= 2.7 in the active Python)
 tools\build.cmd
 tools\check.cmd
 ```
 
-**Integrating into a training stack:** read [docs/USAGE.md](docs/USAGE.md) (requirements, options,
-guarantees, production caveats, troubleshooting). Changes per version: [CHANGELOG.md](CHANGELOG.md).
+- **Without an `sm_120` GPU:** `NVFP4_SKIP_CUDA=1 pip install -e .` installs the Python package only.
+  `NVFP4Linear(..., backend="emulate")` then runs the identical recipe through the reference (on any
+  device, slowly), and GPU tests skip themselves.
+- **Integration guide:** [docs/USAGE.md](docs/USAGE.md) covers requirements, every option, guarantees,
+  production caveats and troubleshooting.
+
+## API
 
 ```python
-import torch
-from nvfp4 import NVFP4Linear, convert_linears
+import torch, nvfp4
+from nvfp4 import NVFP4Linear, convert_linears, ops
 
-layer = NVFP4Linear(4096, 4096, bias=False).cuda()        # in/out features must be multiples of 128
-y = layer(torch.randn(8192, 4096, device="cuda", dtype=torch.bfloat16))
+# 1. Drop-in linear layer (in / out features multiples of 128; autocast and fp32 / bf16 / fp16 inputs)
+lin = NVFP4Linear(4096, 4096, bias=True, fuse_wgrad_accumulation=True,
+                  cache_weight_quantization=True).cuda()
+y = lin(x)                       # x [..., 4096]
+y = lin(x, residual=r)           # r + lin(x), the add fused into the GEMM epilogue
 
-# or convert an existing model's block linears, keeping the last blocks in BF16:
-convert_linears(model.blocks, skip=("10.", "11."))
+# 2. Convert a model in place; keep the last blocks (and anything not % 128) in BF16
+convert_linears(model.blocks, skip=("10.", "11."), fuse_wgrad_accumulation=True)
 
-# transformer blocks with norm, activation and residual adds fused (Llama style; GPT: layernorm_*)
-from nvfp4 import rmsnorm_linear, rmsnorm_swiglu_mlp
+# 3. Fused transformer sub-blocks (norm / activation / residual inside the quantizers)
+from nvfp4 import layernorm_linear, layernorm_mlp, rmsnorm_linear, rmsnorm_swiglu_mlp
 q, k, v, res = rmsnorm_linear(x, blk.norm1, blk.qkv, chunks=3, return_residual=True)
-x = blk.o_proj(attn(q, k, v), residual=res)               # x + o_proj(attn), add in the GEMM epilogue
-x = rmsnorm_swiglu_mlp(x, blk.norm2, blk.gate, blk.up, blk.down, residual=True)  # x + down(silu(g) * u)
+x = blk.o_proj(attn(q, k, v), residual=res)
+x = rmsnorm_swiglu_mlp(x, blk.norm2, blk.gate, blk.up, blk.down, residual=True)
 
-# 8-bit flash attention (q [B, H, N, D], k / v [B, Hkv, N, D]); a drop-in for causal / full SDPA
+# 4. 8-bit flash attention: q [B, H, N, D], k / v [B, Hkv, N, D], D in {64, 128}; GQA, causal or full
 from nvfp4.attention import attention
-o = attention(q, k, v, causal=True)
+o = attention(q, k, v, causal=True)            # backward="bf16" (default, exact) | "8bit" (faster, +0.5% loss)
 
-# reuse quantized weights across the micro-batches of an optimizer step
-convert_linears(model.blocks, cache_weight_quantization=True)
+# 5. Mixture of experts: dropless top-k, NVFP4 experts with the fused MLPs
+from nvfp4.moe import MoE
+moe = MoE(d=1024, d_ff=2816, n_experts=8, top_k=2, activation="swiglu").cuda()
+convert_linears(moe, fuse_wgrad_accumulation=True)
+y = moe(x); loss = loss + 0.01 * moe.aux_loss
 
-# low-level ops
-from nvfp4 import quantize, gemm
-qa = quantize(a)                                          # NVFP4Tensor(data, scales, gdec)
-qb = quantize(b, block_2d=True)
-d = gemm(qa, qb)                                          # D = A @ B^T on FP4 tensor cores
+# 6. Recipe switches (process-wide, read at kernel launch)
+ops.set_high_precision(True)     # BF16 tail: NVFP4 layers compute in BF16 from here on (flip back any time)
+ops.set_ms_eden(True)            # MS-EDEN wgrad operands (64-point RHT, unbiased scale-level SR)
+ops.set_four_six(True)           # Four Over Six block scales on round-to-nearest operands
+ops.set_weight_blocks("1d")      # 1x16 weight blocks + re-quantized dgrad weight (default "2d")
+
+# 7. Low-level ops
+qa = ops.quantize(a)                                   # NVFP4Tensor(data u8 [M, K/2], scales e4m3-as-u8 [M, K/16], gdec fp32)
+qb, qbt = ops.quantize_dual(b, block_2d=True)          # b and bᵀ from one read
+d = ops.gemm(qa, qb, torch.bfloat16, bias=bias, residual=r)  # r + a @ bᵀ + bias
 ```
 
-Requirements: an sm_120 GPU (RTX 5090/5080/5070/5060 or their laptop parts), CUDA ≥ 12.8 (tested
-with 13.0, and 12.9 on Windows), and a CUDA build of PyTorch (tested with 2.14.1+cu130 and, on
-Windows, 2.7.1+cu128). On a machine without such a GPU, `NVFP4Linear(..., backend="emulate")`
-runs the same recipe through the pure-PyTorch reference.
+| Module | Public surface |
+|---|---|
+| [`nvfp4.linear`](nvfp4/linear.py) | `NVFP4Linear`, `convert_linears`, `WeightQuantCache`, `invalidate_weight_caches` |
+| [`nvfp4.fused`](nvfp4/fused.py) | `layernorm_linear`, `layernorm_mlp`, `gelu_mlp`, `rmsnorm_linear`, `rmsnorm_swiglu_mlp`, `swiglu_mlp` |
+| [`nvfp4.attention`](nvfp4/attention.py) | `attention(q, k, v, *, causal, scale, smooth_k, backward)` (falls back to SDPA outside its coverage) |
+| [`nvfp4.moe`](nvfp4/moe.py) | `MoE(d, d_ff, n_experts, top_k, activation, bias, normalize_weights)`, `.aux_loss`, `.last_counts` |
+| [`nvfp4.ops`](nvfp4/ops.py) | `quantize`, `quantize_dual` (+ `layernorm_` / `rmsnorm_` / `gelu_` / `swiglu_` fused variants and backwards), `gemm`, `norm_backward`, recipe switches, `available` |
+| [`nvfp4.reference`](nvfp4/reference.py) | pure-PyTorch spec: `quantize`, `quantize_dual`, `dequantize`, `apply_rht`, `e2m1_round_stochastic`, ... |
 
-## Layout
+**Guarantees** ([USAGE.md §4](docs/USAGE.md)):
+
+- **Reproducibility:** for a fixed seed, results are bit-reproducible run to run, and the same in eager,
+  `torch.compile(fullgraph=True)` and CUDA-graph replay.
+- **No host synchronization** in the dense layers. Rounding seeds live on the GPU.
+- **Distributed:** DDP, FSDP1 and FSDP2 produce gradients bit-identical to a single process.
+
+## Performance (RTX 5090 Laptop unless noted)
+
+Raw data and methodology are in [docs/RESULTS.md](docs/RESULTS.md) and `bench/results/*.json`; every
+benchmark checks results against the reference before timing.
+
+| Component | Result |
+|---|---|
+| NVFP4 GEMM | 273–441 TFLOPS on the laptop: 3.1–5.0× BF16 cuBLAS, 0.91–1.98× cuBLASLt NVFP4 (ahead on 10 of 11 shapes). Desktop RTX 5090: **up to 1027 TFLOPS**, 1.03–1.71× cuBLASLt on every shape |
+| Dual quantizer | operand + transpose in one pass, 1.6–2.3× faster than two quantizations |
+| GPT block, fwd + bwd | 1.82× (d = 768) → 2.65× (d = 2048) → 3.22× (d = 4096) vs BF16; 3.50× with the weight cache |
+| Llama block (RMSNorm, SwiGLU) | 2.09× (d = 1024) → 3.32× (d = 4096) vs BF16; up to 3.64× cached |
+| 8-bit attention | forward 1.2–1.6× FlashAttention (SDPA), fwd + bwd 1.07–1.12× at BF16 quality; forward-only up to 2.1× (`backward="8bit"`) |
+| MoE layer, fwd + bwd | 1.74× (d = 1024, 8 experts) → 2.15× (d = 2048, 8 experts); 1.25× with 32 small experts |
+| End to end | GPT-124M +32% tokens/s, −22% GPU energy; GPT-507M 1.62× tokens/s, −39% energy; MoE GPT (8 experts) +20% tokens/s |
+
+## Training quality
+
+The test bed is GPT-2-style models pretrained on TinyStories: 3000 steps, 49M tokens, embeddings and
+the last 2 of 12 blocks in BF16. Losses are final validation loss, with gaps relative to BF16.
+
+| Setup | Gap vs BF16 | Throughput vs BF16 |
+|---|---|---|
+| GPT-124M, default recipe, 3 seeds | +1.32% ± 0.16 (+0.019 nats), constant over training | +32% |
+| GPT-507M (d = 2048), default recipe | +1.0% | +62% |
+| GPT-124M + **BF16 tail** (last 10% of steps in BF16), 3 seeds | **+0.62%** | +27% |
+| GPT-124M + MS-EDEN + Four Over Six, 3 seeds | +1.21% | +26% |
+| GPT-124M, 8-bit attention at 4096 tokens, 2 seeds | same as BF16 attention | |
+| MoE GPT (8 experts, 294M parameters), 1 seed | +0.76% | +20% |
+
+The 2026 recipe options (Four Over Six, MS-EDEN, 1×16 weights) each lower the loss by only 0.03–0.13% (0.19% all together)
+at this scale. Switching to BF16 for the last tenth of training removes about half of the gap
+([DESIGN.md §2.1](docs/DESIGN.md), [RESULTS.md §4.2](docs/RESULTS.md)). Validate the recipe on your own
+model before relying on it.
+
+## Verification and development
+
+```bash
+python setup.py build_ext --inplace              # incremental build of nvfp4/_C (MAX_JOBS to limit nvcc)
+pytest -q tests/                                 # GPU tests skip without sm_120
+pytest -q tests/test_reference.py                # spec-only tests, run anywhere (CI runs these on CPU)
+tools/check.sh release                           # tests + compute-sanitizer (memcheck / racecheck /
+                                                 #   synccheck / initcheck) + 5-minute soak with bit-exact replays
+tools/run.sh NAME script.py [args]               # run any job under tools/guard.py
+```
+
+- **The spec is the contract.** Change [`nvfp4/reference.py`](nvfp4/reference.py) first, then make the
+  CUDA quantizer match it bit for bit; `tests/test_*_cuda.py` compare outputs with `torch.equal`, not a
+  tolerance. GEMMs are checked against an fp64 matmul of the dequantized operands.
+- **Thermal guard.** [`tools/guard.py`](tools/guard.py) wraps every build, test and benchmark. It samples
+  GPU temperature, power, memory and host RAM, and kills the job past configurable limits. It was written
+  for laptops, where a sustained 175 W load has crashed the display driver.
+- **Benchmarks:** `bench/bench_gemm.py`, `bench_quantize.py`, `bench_train_step.py`,
+  `bench_llama_block.py`, `bench_attention.py`, `bench_long_context.py`, `bench_moe.py`,
+  `bench_sr_cost.py`.
+- **Experiments:**
+  - Data and single runs: `experiments/prepare_tinystories.py`, then
+    `experiments/train_gpt.py --precision {bf16,nvfp4} [--fuse-wgrad --fuse-producers --attn 8bit --moe-experts 8 --bf16-tail 0.1 ...]`.
+  - Three-seed recipe ablations: `experiments/run_ablation.sh NAME FLAGS...`, summarized by
+    `experiments/ablation_summary.py`.
+- **CI** ([`.github/workflows/ci.yml`](.github/workflows/ci.yml)) runs the spec tests on CPU and builds
+  the extension for `sm_120a` on Linux and Windows. It checks that the block-scaled MMA made it into SASS
+  and reports register spills. GPU tests run locally.
+
+## Repository layout
 
 ```
-csrc/quantize_dual.cu  fused BF16/FP32 -> NVFP4 rowwise + transposed (RHT, SR, 16x16 2D) in one pass,
-                       optionally applying LayerNorm / RMSNorm / GELU / SwiGLU (and backwards) while loading
-csrc/quantize.cu       single-output quantizer (rowwise / transposed / 16x16 2D, RHT, stochastic rounding)
-csrc/gemm_tma.cu       mma.sync kind::mxf4nvf4 block-scaled TN GEMM, persistent TMA + mbarrier pipeline
-csrc/gemm.cu           cp.async GEMM main loop (short K / fallback) and host dispatch
-csrc/gemm_common.cuh   shared epilogue: deterministic split-K, fused fp32 accumulate, bias / residual add
-csrc/norm.cu           LayerNorm / RMSNorm backward (+ residual gradient), deterministic
-csrc/attention.cu      8-bit flash attention: operand quantizer, forward, deterministic dQ / dK-dV kernels
-nvfp4/reference.py     executable spec of the format and recipe (pure PyTorch)
-nvfp4/linear.py        NVFP4Linear autograd layer + convert_linears
-nvfp4/attention.py     attention(q, k, v, causal=...) autograd function (SDPA fallback)
-nvfp4/fused.py         layernorm_linear / layernorm_mlp / rmsnorm_linear / rmsnorm_swiglu_mlp / gelu_mlp /
-                       swiglu_mlp: fused transformer sub-blocks
-tests/                 bit-exact / reference tests (GPU tests auto-skip without sm_120)
-bench/                 GEMM, quantizer and transformer-block benchmarks (+ results/)
-experiments/           TinyStories GPT pretraining: BF16 vs NVFP4 (+ results/)
-tools/guard.py         runs jobs under GPU temperature / memory / host-RAM limits, with cooldowns
-tools/sanitize.sh      compute-sanitizer over every kernel variant; tools/soak.py: long-run soak test
-docs/                  USAGE.md (integration guide), DESIGN.md, RESULTS.md, research/
+csrc/gemm_tma.cu        persistent TMA + mbarrier block-scaled mma.sync TN GEMM (kind::mxf4nvf4)
+csrc/gemm.cu            cp.async main loop (short K / fallback), tile + split-K dispatch
+csrc/gemm_common.cuh    epilogue: deterministic split-K, fused fp32 accumulate, bias / residual add
+csrc/quantize_dual.cu   fused row + transposed quantizer: 2D blocks, RHT16 / RHT64, SR, Four Over Six,
+                        MS-EDEN, LayerNorm / RMSNorm / GELU / SwiGLU (and backwards) applied while loading
+csrc/quantize.cu        single-output quantizer; process-wide recipe switches
+csrc/nvfp4_common.cuh   E2M1 / E4M3 conversion, integer-domain stochastic rounding, hashing, Hadamard
+csrc/norm.cu            LayerNorm / RMSNorm backward with the residual gradient, deterministic
+csrc/attention.cu       8-bit flash attention: operand quantizer, INT8 / MXFP8 forward, 8-bit backward
+csrc/bindings.cpp       torch op registrations (fake tensors for torch.compile in nvfp4/_library.py)
+nvfp4/reference.py      executable spec of format and recipe
+nvfp4/ops.py            Python ops, NVFP4Tensor, recipe switches
+nvfp4/linear.py         NVFP4Linear autograd, weight-quantization cache, convert_linears
+nvfp4/fused.py          fused transformer sub-blocks (autograd functions)
+nvfp4/attention.py      attention() with both backwards and the SDPA fallback
+nvfp4/moe.py            MoE layer: routing, expert sort, per-expert fused NVFP4 MLPs, load-balancing loss
+tests/                  835 tests: bit-exact vs spec, autograd, compile / graphs, DDP / FSDP, MoE, attention
+bench/, experiments/    benchmarks and pretraining runs, each with results/ (raw JSON / JSONL)
+tools/                  build, check, guard, sanitize, soak, WSL setup, Runpod session script
+docs/                   USAGE.md, DESIGN.md, RESULTS.md, research/ (survey of open problems, Nov 2026)
 ```
 
-## Status and limitations
+## Limitations
 
-Verified on the RTX 5090 Laptop and on two rented desktop RTX 5090s with the test, sanitizer and
-soak suites above and end-to-end pretraining comparisons; validate the precision recipe on your own model before relying on
-it. The known gaps are listed in
-[docs/DESIGN.md §6](docs/DESIGN.md#6-known-limitations-and-next-steps):
-- at equal clocks the GEMM keeps the tensor pipe 71% busy vs cuBLASLt's ~90%; at real clocks it is
-  ahead of cuBLASLt on every shape (laptop and desktop RTX 5090), and the larger warp tile that would
-  close it does not fit in 255 registers (v0.9 ablation);
-- 8-bit attention speeds up the forward up to 2.1× but training only 1.07–1.12× at BF16 quality (or
-  1.12–1.18× at +0.5% loss at 4096 tokens); it covers causal / full masks, head dims 64 / 128 (other
-  cases use SDPA);
-- hardware stochastic rounding (`cvt.rs`) isn't available on sm_120a, so SR runs in software;
-- tested on the RTX 5090 Laptop and the desktop RTX 5090 (also two of them over NCCL); not yet on
-  the smaller RTX 50 parts.
+The full list is in [DESIGN.md §6](docs/DESIGN.md#6-known-limitations-and-next-steps).
+
+- **Locked-clock GEMM efficiency.** At locked clocks the GEMM keeps the tensor pipe 71% busy, vs
+  cuBLASLt's ~90%. At real clocks it is ahead of cuBLASLt on every benchmarked shape.
+- **8-bit attention training speedup is small:** 1.07–1.12× at BF16 quality. The exact backward runs at
+  BF16 speed, and P·V needs two e4m3 terms. Coverage is causal or full masks and head dims 64 / 128;
+  everything else falls back to SDPA.
+- **MoE runs per expert.** There is one launch sequence per expert rather than a grouped GEMM, and one
+  host sync per layer, so MoE steps are not CUDA-graph capturable.
+- **Stochastic rounding is software** (no `cvt.rs` on sm_120a), at about 12 extra instructions per
+  element.
+- **Hardware coverage.** Tested on the RTX 5090 Laptop and the desktop RTX 5090 (two over NCCL), not yet
+  on the smaller RTX 50 parts.
 
 ## License
 

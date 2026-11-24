@@ -87,5 +87,38 @@ for (B, H, Hk, N, D, causal) in [(1, 2, 1, 77, 64, True), (1, 2, 2, 200, 128, Fa
     qa_, ka_, va_ = (torch.randn(B, h, N, D, device=d, dtype=torch.bfloat16, requires_grad=True) for h in (H, Hk, Hk))
     for bwd in ("bf16", "8bit"):
         attention(qa_, ka_, va_, causal=causal, backward=bwd).float().square().mean().backward()
+# v0.11 recipe options: Four Over Six (row / col / 2D), MS-EDEN (RHT64 column phase, EDEN scales; host and
+# device seeds), 1x16 weights with re-quantization, the BF16 tail, MoE (sorted per-expert fused MLPs)
+for R in (80, 130):
+    for dt in (torch.bfloat16, torch.float32):
+        xr = torch.randn(R, 128, device=d, dtype=dt)
+        with ops.four_six_scales(True):
+            ops.quantize(xr)
+            ops.quantize_dual(xr, rht_seed=3, col_pad=128)
+            ops.quantize_dual(torch.randn(64, 128, device=d), block_2d=True)
+        ops.set_ms_eden(True)
+        ops.quantize_dual(xr, row_sr_seed=1, col_sr_seed=2, rht_seed=3, col_pad=128)
+        ops.quantize_dual(xr, rht_seed=3, col_pad=64)
+        s = torch.randint(0, 2**62, (3,), device=d, dtype=torch.int64)
+        ops.quantize_dual(xr, row_sr_seed=s[0], col_sr_seed=s[1], rht_seed=s[2], col_pad=128)
+        ops.set_ms_eden(False)
+ops.set_weight_blocks("1d")
+ops.set_four_six(True)
+lw = NVFP4Linear(128, 256, bias=False).to(d)
+lw(xg).float().square().mean().backward()
+ops.set_four_six(False)
+ops.set_weight_blocks("2d")
+ops.set_high_precision(True)
+layernorm_mlp(xg, ln, fc1, fc2).float().mean().backward()
+ops.set_high_precision(False)
+from nvfp4 import convert_linears  # noqa: E402
+from nvfp4.moe import MoE  # noqa: E402
+for act in ("swiglu", "gelu_tanh"):
+    moe = MoE(128, 256, 4, top_k=2, activation=act).to(d)
+    convert_linears(moe)
+    xm = torch.randn(150, 128, device=d, requires_grad=True)
+    with torch.autocast("cuda", dtype=torch.bfloat16):
+        ym = moe(xm)
+    (ym.float().square().mean() + moe.aux_loss).backward()
 torch.cuda.synchronize()
 print("DRIVE_OK")

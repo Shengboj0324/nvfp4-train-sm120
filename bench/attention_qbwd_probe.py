@@ -9,6 +9,7 @@ errors vs exact fp32 attention, on random data and on real GPT-124M activations,
   qb        flash backward(q', k', v', our one-term-P o, our lse)
   qb_lse    flash backward(q', k', v', exact o of (q', k', v'), our lse)   -- isolates the output (Delta) error
   qb_p1/p2  flash backward(q', k', v', emulated o with P in one / two e4m3 terms, our lse)
+  qb_int8pv flash backward with P V emulated in one INT8 product (P per row, V per channel)
 (docs/DESIGN.md §7: why the one-term forward's o breaks dQ and the two-term one does not.)
 """
 import math
@@ -58,6 +59,9 @@ def emul_fwd(qf, kf, vf, scale, causal, terms):
             s = s.masked_fill(mask, float("-inf"))
         p = torch.exp(s - s.amax(-1, keepdim=True))
         l = p.sum(-1, keepdim=True)
+        if terms == 8:  # single-term INT8 P (fixed scale 127 / row max), as an s8 MMA would take it
+            outs.append((torch.round(p * 127) / 127) @ vf[b] / l)
+            continue
         hi = (p * 128).to(torch.float8_e4m3fn).float()
         pq = hi
         if terms == 2:
@@ -104,10 +108,15 @@ def run(q, k, v, do, causal=True):
     # exact attention of the quantized inputs (o in input dtype, lse natural)
     oq, lseq = torch.ops.aten._scaled_dot_product_flash_attention(qq, kq, vq, 0.0, causal, False, scale=scale)[:2]
     outs = {"qb": (o8, lse_nat), "qb_lse": (oq, lse_nat)}
+    outs = {n: (o, lse, vq) for n, (o, lse) in outs.items()}
     for terms in (1, 2):
-        outs[f"qb_p{terms}"] = (emul_fwd(qf, kf, vf, scale, causal, terms).to(dt), lse_nat)
-    for name, (o, lse) in outs.items():
-        dq, dk, dv = flash_bwd(do, qq, kq, vq, o, lse, causal, scale)
+        outs[f"qb_p{terms}"] = (emul_fwd(qf, kf, vf, scale, causal, terms).to(dt), lse_nat, vq)
+    # single-term INT8 P V: P int8 (per row), V int8 with one scale per channel over the sequence (an s8 MMA
+    # applies a column scale after accumulation); the backward then runs on that V
+    vi8 = R.int8_token_fake(v.float().transpose(-1, -2)).transpose(-1, -2)
+    outs["qb_int8pv"] = (emul_fwd(qf, kf, vi8, scale, causal, 8).to(dt), lse_nat, vi8.to(dt))
+    for name, (o, lse, vb) in outs.items():
+        dq, dk, dv = flash_bwd(do, qq, kq, vb, o, lse, causal, scale)
         res[name] = (o, dq, dk, dv)
     out = {}
     for name, r in res.items():

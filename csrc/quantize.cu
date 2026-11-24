@@ -16,6 +16,8 @@
 #include <cuda_bf16.h>
 #include <torch/extension.h>
 
+#include <atomic>
+
 #include "nvfp4_common.cuh"
 
 namespace nvfp4 {
@@ -33,6 +35,7 @@ struct QParams {
   bool transpose;
   bool use_rht;
   bool lanes_along_cols;  // lanes = consecutive blocks of one row (rowwise 1D); else consecutive rows
+  bool four_six;          // 4/6 block scales (round-to-nearest only)
   uint32_t rht_mask;  // rht_sign_mask(rht_seed)
 };
 
@@ -140,7 +143,7 @@ __global__ void quantize_kernel(const T* __restrict__ x, QParams p, const unsign
   const bool valid = block_coords(p, warp, lane, orow, bcol);
 
   // global scales: genc = 2688 / amax (1 if amax == 0), gdec = 1 / genc
-  const float genc = global_encode_scale(__uint_as_float(*amax_bits));
+  const float genc = global_encode_scale(__uint_as_float(*amax_bits), !kStochastic && p.four_six);
   if (blockIdx.x == 0 && threadIdx.x == 0) *gdec_out = __fdiv_rn(1.0f, genc);
 
   float v[kBlock];
@@ -158,12 +161,24 @@ __global__ void quantize_kernel(const T* __restrict__ x, QParams p, const unsign
 
   uint2 packed;
   const uint64_t lin0 = static_cast<uint64_t>(orow) * p.C_out + bcol * kBlock;
-  const uint8_t s = quantize16<kStochastic>(v, bmax, genc, sr_seed, lin0, packed);
+  const uint8_t s = (!kStochastic && p.four_six) ? quantize16_four_six(v, bmax, genc, packed)
+                                                 : quantize16<kStochastic>(v, bmax, genc, sr_seed, lin0, packed);
   *reinterpret_cast<uint2*>(data + static_cast<int64_t>(orow) * (p.C_out / 2) + bcol * (kBlock / 2)) = packed;
   scales[static_cast<int64_t>(orow) * nbc + bcol] = s;
 }
 
 }  // namespace nvfp4
+
+namespace nvfp4 {
+static std::atomic<bool> g_four_six{false}, g_ms_eden{false};
+bool four_six_enabled() { return g_four_six.load(std::memory_order_relaxed); }
+bool ms_eden_enabled() { return g_ms_eden.load(std::memory_order_relaxed); }
+}  // namespace nvfp4
+
+void nvfp4_set_four_six(bool on) { nvfp4::g_four_six.store(on); }
+bool nvfp4_four_six() { return nvfp4::four_six_enabled(); }
+void nvfp4_set_ms_eden(bool on) { nvfp4::g_ms_eden.store(on); }
+bool nvfp4_ms_eden() { return nvfp4::ms_eden_enabled(); }
 
 // Returns {data uint8 [R_out, C_out/2], scales uint8 [R_out, C_out/16], gdec fp32 [1]}.
 std::vector<torch::Tensor> nvfp4_quantize(torch::Tensor x, bool transpose, bool block_2d, bool stochastic,
@@ -181,6 +196,7 @@ std::vector<torch::Tensor> nvfp4_quantize(torch::Tensor x, bool transpose, bool 
   p.use_rht = use_rht;
   p.rht_mask = rht_sign_mask(static_cast<uint64_t>(rht_seed));
   p.lanes_along_cols = !transpose && !block_2d;
+  p.four_six = four_six_enabled() && !stochastic;
   TORCH_CHECK(p.C_out % kBlock == 0, "quantized dim (", p.C_out, ") must be a multiple of 16");
   TORCH_CHECK(!block_2d || p.R_out % kBlock == 0, "2D blocks need the other dim (", p.R_out, ") % 16 == 0");
 

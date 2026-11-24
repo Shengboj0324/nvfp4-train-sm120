@@ -62,7 +62,7 @@ class _QuantizerEmulate:
     @staticmethod
     def dual(x, **kw):
         kw = {k: int(v) if isinstance(v, torch.Tensor) else v for k, v in kw.items()}  # seed tensors -> ints
-        outs = ref.quantize_dual(x, **kw)
+        outs = ref.quantize_dual(x, four_six=ops.four_six(), ms_eden=ops.ms_eden(), **kw)
         return tuple(None if o is None else ops.NVFP4Tensor(o[0], o[1], o[2].reshape(1)) for o in outs)
 
     @staticmethod
@@ -122,20 +122,34 @@ def _count_optimizer_step(optimizer, args, kwargs):
 register_optimizer_step_post_hook(_count_optimizer_step)
 
 
+def _quantize_weight(be, w: torch.Tensor, need_t: bool):
+    """(W, W^T or None) in NVFP4: 16x16 blocks (one quantization, exact transpose), or with
+    ops.weight_blocks("1d") 1x16 blocks along K for fprop and, for dgrad, the dequantized fprop weight
+    re-quantized along N (Quartet II / Mosaic: both GEMMs see the fprop weight up to a second rounding)."""
+    if ops.weight_blocks() == "2d":
+        return be.dual(w, col=need_t, block_2d=True)
+    wq, _ = be.dual(w, col=False)
+    if not need_t:
+        return wq, None
+    _, wtq = be.dual(wq.dequantize(), row=False, col=True)
+    return wq, wtq
+
+
 def quantized_weight(weight: torch.Tensor, need_t: bool, backend_name: str, cache: WeightQuantCache | None):
-    """(W, W^T or None) in NVFP4 with 16x16 blocks, from ``cache`` when it is still valid."""
+    """(W, W^T or None) in NVFP4 (16x16 blocks unless ops.weight_blocks() == "1d"), from ``cache`` when it is
+    still valid."""
     be = _BACKENDS[backend_name]
     if cache is not None and not cache.bypass and torch.cuda.is_current_stream_capturing():
         cache.clear()
         cache.bypass = True
     if cache is None or cache.bypass or backend_name != "cuda" or not weight.is_leaf:
-        return be.dual(weight.detach(), col=need_t, block_2d=True)
+        return _quantize_weight(be, weight.detach(), need_t)
     key = (_optimizer_steps[0], weight.data_ptr(), weight._version, weight.dtype, tuple(weight.shape),
-           weight.device)
+           weight.device, ops.four_six(), ops.weight_blocks())
     if cache.key == key and (cache.wtq is not None or not need_t):
         cache.hits += 1
         return cache.wq, (cache.wtq if need_t else None)
-    wq, wtq = be.dual(weight.detach(), col=need_t, block_2d=True)
+    wq, wtq = _quantize_weight(be, weight.detach(), need_t)
     cache.key, cache.wq, cache.wtq = key, wq, wtq
     cache.misses += 1
     return wq, wtq
@@ -321,6 +335,12 @@ class NVFP4Linear(torch.nn.Linear):
         return new
 
     def forward(self, x: torch.Tensor, residual: torch.Tensor | None = None) -> torch.Tensor:
+        if ops.high_precision():  # ops.set_high_precision: plain nn.Linear
+            if residual is not None and residual.shape != (*x.shape[:-1], self.out_features):
+                raise ValueError(f"residual must have shape {(*x.shape[:-1], self.out_features)}, got "
+                                 f"{tuple(residual.shape)}")
+            y = super().forward(x)
+            return y if residual is None else residual + y
         lead = x.shape[:-1]
         x2d = x.reshape(-1, self.in_features).to(torch.bfloat16).contiguous()
         grad = torch.is_grad_enabled()

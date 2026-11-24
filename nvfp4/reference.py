@@ -88,29 +88,35 @@ def hash_u32(x: torch.Tensor) -> torch.Tensor:
     return x
 
 
-def sr_uniform(seed: int, index: torch.Tensor) -> torch.Tensor:
-    """Uniform [0, 1) fp32 for each linear element index, 16-bit resolution. Elements 2k and 2k + 1 share
-    one hash of the pair index k (keyed by the 64-bit seed): the low half for 2k, the high half for 2k + 1."""
+def sr_key(seed: int) -> int:
+    """32-bit key of a 64-bit stochastic-rounding seed: hash(lo ^ hash(hi))."""
+    hi = hash_u32(torch.tensor([(seed >> 32) & _M32], dtype=torch.int64))
+    return int(hash_u32(hi ^ (seed & _M32)).item())
+
+
+def sr_bits(seed: int, index: torch.Tensor) -> torch.Tensor:
+    """8 random bits (int64 0..255) per linear element index: elements 4q .. 4q + 3 take bytes 0 .. 3 of
+    hash(q + key(seed)) (one hash per four elements, as NVIDIA's hardware SR feeds 8 bits per E2M1 element)."""
     index = index.to(torch.int64)
-    h = hash_u32(hash_u32((index >> 1) ^ (seed & _M32)) + ((seed >> 32) & _M32))
-    return ((h >> (16 * (index & 1))) & 0xFFFF).to(torch.float32) * (1.0 / 65536.0)
+    h = hash_u32((index >> 2) + sr_key(seed))
+    return (h >> (8 * (index & 3))) & 0xFF
 
 
-def e2m1_round_stochastic(v: torch.Tensor, u: torch.Tensor) -> torch.Tensor:
-    """Unbiased stochastic rounding to E2M1 (saturating at 6). ``u`` ~ U[0,1) per element."""
-    a = v.abs().clamp(max=E2M1_MAX)
-    grid = E2M1_GRID.to(v.device)
-    # lo code: largest grid point <= a
-    lo = (a.unsqueeze(-1) >= grid).sum(-1) - 1  # 0..7
-    lo = lo.clamp(0, 7)
-    hi = (lo + 1).clamp(max=7)
-    glo, ghi = grid[lo], grid[hi]
-    width = ghi - glo
-    p_up = torch.where(width > 0, (a - glo) / torch.where(width > 0, width, torch.ones_like(width)),
-                       torch.zeros_like(a))
-    code = torch.where(u < p_up, hi, lo).int()
-    sign = (v < 0).int() & (code > 0).int()
-    return code | (sign << 3)
+def e2m1_round_stochastic(v: torch.Tensor, r8: torch.Tensor) -> torch.Tensor:
+    """Stochastic rounding of fp32 values to E2M1 codes (saturating at 6) with 8 random bits per element.
+
+    Integer-domain, as the kernels: magnitudes below 1 are lifted into [1, 2) (where E2M1's 0.5 spacing is one
+    mantissa bit), then the random byte plus half a unit of it (the unbiased "SRF" few-bit rounding of
+    Fitzgibbon & Felix, ARITH 2025) is added below the one kept mantissa bit and the rest is truncated. The
+    probability of rounding up is round(256 f) / 256 for the fractional position f in the grid step (exact on
+    average; within 2^-9 of f)."""
+    a = v.float().abs()
+    off = (a < 1.0).float()
+    z = a + off
+    b = z.view(torch.int32).to(torch.int64) + (r8.to(torch.int64) << 14) + (1 << 13)
+    b = (b & 0xFFC00000).to(torch.int32).view(torch.float32)
+    r = torch.minimum(b - off, torch.full_like(b, E2M1_MAX))
+    return e2m1_round_rne(torch.where(v < 0, -r, r))
 
 
 # --------------------------------------------------------------------------------------------------
@@ -123,9 +129,10 @@ def hadamard16() -> torch.Tensor:
     return h  # entries +-1, H H^T = 16 I
 
 
-def rht_signs(seed: int) -> torch.Tensor:
-    """16 random signs derived from ``seed`` with the same hash used on the GPU."""
-    bits = hash_u32(torch.arange(16, dtype=torch.int64) ^ (seed & _M32)) & 1
+def rht_signs(seed: int, n: int = 16) -> torch.Tensor:
+    """``n`` random signs derived from ``seed`` with the same hash used on the GPU (the first 16 do not
+    depend on n)."""
+    bits = hash_u32(torch.arange(n, dtype=torch.int64) ^ (seed & _M32)) & 1
     return 1.0 - 2.0 * bits.to(torch.float32)
 
 
@@ -134,33 +141,60 @@ def rht_matrix(seed: int) -> torch.Tensor:
     return rht_signs(seed).unsqueeze(1) * hadamard16() * 0.25
 
 
-def apply_rht(x: torch.Tensor, seed: int) -> torch.Tensor:
+def apply_rht(x: torch.Tensor, seed: int, n: int = 16) -> torch.Tensor:
     """Apply M = diag(s) H / 4 to every 16-element block along the last dim: y = x_blk @ M.
 
     Computed as sign flip -> fast Walsh-Hadamard butterflies (h = 1, 2, 4, 8) -> * 0.25, in fp32, in
     exactly the order the CUDA kernel uses, so results are bit-identical (a dense matmul would not be).
     Mathematically equal to ``x_blk @ rht_matrix(seed)`` (H is symmetric).
+
+    n = 64 (MS-EDEN): the 64-point RHT diag(s64) H64 / 8 on every 64-element block, as the dual quantizer
+    computes it: the 16-point butterflies of each 16-block with its slice of the 64 signs (* 0.25), then the
+    4-point Hadamard across the four 16-blocks (* 0.5), H64 = H4 (x) H16.
     """
+    if n == 64:
+        *lead, c = x.shape
+        assert c % 64 == 0
+        v = x.float().reshape(-1, 64) * rht_signs(seed, 64).to(x.device)
+        v = _wht16(v.reshape(-1, BLOCK)).reshape(-1, 4, BLOCK)
+        w0, w1, w2, w3 = v[:, 0], v[:, 1], v[:, 2], v[:, 3]
+        a, d01, e, d23 = w0 + w1, w0 - w1, w2 + w3, w2 - w3
+        return (torch.stack([a + e, d01 + d23, a - e, d01 - d23], 1) * 0.5).reshape(*lead, c)
+    assert n == 16
     *lead, c = x.shape
     assert c % BLOCK == 0
     v = x.float().reshape(-1, BLOCK) * rht_signs(seed).to(x.device)
+    return _wht16(v).reshape(*lead, c)
+
+
+def _wht16(v: torch.Tensor) -> torch.Tensor:
+    """Butterflies h = 1, 2, 4, 8 and * 0.25 on [n, 16] (the kernel's order)."""
     h = 1
     while h < BLOCK:
         v = v.reshape(-1, BLOCK // (2 * h), 2, h)
         a, b = v[:, :, 0, :], v[:, :, 1, :]
         v = torch.stack([a + b, a - b], 2)
         h *= 2
-    return (v.reshape(-1, BLOCK) * 0.25).reshape(*lead, c)
+    return v.reshape(-1, BLOCK) * 0.25
 
 
 # --------------------------------------------------------------------------------------------------
 # Tensor quantization
 # --------------------------------------------------------------------------------------------------
-def global_scales(amax: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+FOUR_SIX_E4M3_MAX = 256.0  # tensor-scale constant with 4/6 block scales (a block mapped to 4 needs 1.5x)
+
+
+EDEN_S = 6.07210636138916        # fp32 of (1 / 0.93) * 6 * 16 / 17: MS-EDEN's block-max grid point
+EDEN_NUM = 1554.459228515625      # fp32 of EDEN_S * 256: MS-EDEN's tensor-scale numerator
+
+
+def global_scales(amax: torch.Tensor, four_six: bool = False, eden: bool = False) -> tuple[torch.Tensor, torch.Tensor]:
+    """genc = 6 * 448 / amax (6 * 256 / amax with 4/6 block scales, EDEN_S * 256 / amax for MS-EDEN),
+    gdec = 1 / genc."""
     # NB: `scalar / tensor` in PyTorch is reciprocal(tensor) * scalar (two roundings); use true
     # IEEE division so this matches the kernel's __fdiv_rn bit for bit.
     amax = amax.float()
-    num = torch.full_like(amax, E4M3_MAX * E2M1_MAX)
+    num = torch.full_like(amax, EDEN_NUM if eden else (FOUR_SIX_E4M3_MAX if four_six else E4M3_MAX) * E2M1_MAX)
     genc = torch.where(amax > 0, torch.div(num, torch.where(amax > 0, amax, torch.ones_like(amax))),
                        torch.ones_like(amax))
     # A NaN anywhere must not quantize to finite values: it makes the decode scale (and so every
@@ -169,13 +203,61 @@ def global_scales(amax: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
     return genc, torch.div(torch.ones_like(genc), genc)
 
 
+def _rtn_candidate(blocks, bamax, div: float, genc):
+    """Round-to-nearest quantization of the blocks with the block max mapped to ``div`` (6 or 4): codes, scale
+    bytes, and the squared error in the encoded domain, sum((|v| - q)^2) * sf^2, summed in element order
+    (as the kernel, so that the 4/6 choice matches it bit for bit)."""
+    s_target = torch.div(bamax, torch.full_like(bamax, div)) * genc
+    s = e4m3_from_float(torch.minimum(s_target, torch.tensor(E4M3_MAX, device=blocks.device)))
+    sf = e4m3_to_float(s)
+    enc = torch.where(sf > 0, genc / torch.where(sf > 0, sf, torch.ones_like(sf)), torch.zeros_like(sf))
+    v = blocks * enc.unsqueeze(-1)
+    codes = e2m1_round_rne(v)
+    d = v.abs() - e2m1_decode(codes & 7).float()
+    e = torch.zeros_like(sf)
+    for i in range(BLOCK):
+        e = e + d[..., i] * d[..., i]
+    return codes, s, e * (sf * sf)
+
+
+def _eden_blocks(blocks, bamax, genc, seed: int):
+    """MS-EDEN (Quartet II): RTN codes at the block scale bmax / EDEN_S * genc, then the scale replaced by an
+    E4M3 stochastic rounding of S * sf, S = sum(y^2) / sum(y q) per block (element order; 1 if all codes are 0).
+    The random byte of block k is sr_bits(seed, k); below E4M3's normal range (2^-6) the scale is RN."""
+    s_target = torch.div(bamax, torch.full_like(bamax, EDEN_S)) * genc
+    sf = e4m3_to_float(e4m3_from_float(torch.minimum(s_target, torch.tensor(E4M3_MAX, device=blocks.device))))
+    enc = torch.where(sf > 0, genc / torch.where(sf > 0, sf, torch.ones_like(sf)), torch.zeros_like(sf))
+    y = blocks * enc.unsqueeze(-1)
+    codes = e2m1_round_rne(y)
+    q = e2m1_decode(codes).float()
+    yy, yq = torch.zeros_like(sf), torch.zeros_like(sf)
+    for i in range(BLOCK):
+        yy = yy + y[..., i] * y[..., i]
+        yq = yq + y[..., i] * q[..., i]
+    corr = torch.where(yq > 0, yy / torch.where(yq > 0, yq, torch.ones_like(yq)), torch.ones_like(yq))
+    t = corr * sf
+    r8 = sr_bits(seed, torch.arange(t.numel(), device=t.device, dtype=torch.int64)).reshape(t.shape)
+    bits = t.view(torch.int32).to(torch.int64) + (r8 << 12) + (1 << 11)
+    t_sr = (bits & 0xFFF00000).to(torch.int32).view(torch.float32)
+    t = torch.where(t >= 0.015625, t_sr, t)
+    s = e4m3_from_float(torch.minimum(t, torch.tensor(E4M3_MAX, device=t.device)))
+    return codes, s
+
+
 def quantize(x: torch.Tensor, *, block_2d: bool = False, stochastic: bool = False, seed: int = 0,
-             amax: torch.Tensor | None = None):
+             amax: torch.Tensor | None = None, four_six: bool = False, eden: bool = False):
     """Quantize a 2D tensor along its last dim. Returns (data uint8 [R,C/2], scales uint8 [R,C/16], gdec fp32).
 
     block_2d: one scale per 16x16 tile (rows r..r+15 share scales), so that quantize(W) and
               quantize(W.T) represent exactly the same values (NVIDIA recipe for weights).
     stochastic: unbiased stochastic rounding of the E2M1 step (gradients).
+    four_six: "Four Over Six" adaptive block scales (round-to-nearest only; ignored with ``stochastic``):
+              each block is quantized with its max mapped to 6 and to 4 and keeps the one with the smaller
+              squared error, and the tensor scale uses 256 instead of 448 so the 1.5x scale fits E4M3
+              (Cook et al., arXiv 2512.02010).
+    eden: MS-EDEN instead of element-wise stochastic rounding (with ``stochastic``; Quartet II, arXiv 2601.22813):
+          RTN elements, the block scale stochastically rounded with the EDEN correction (see _eden_blocks).
+          Unbiased when ``x`` was randomly rotated (the dual quantizer's 64-point RHT).
     """
     assert x.dim() == 2
     r, c = x.shape
@@ -183,12 +265,27 @@ def quantize(x: torch.Tensor, *, block_2d: bool = False, stochastic: bool = Fals
     xf = x.float()
     if amax is None:
         amax = xf.abs().max()
-    genc, gdec = global_scales(amax)
+    eden = eden and stochastic
+    four_six = four_six and not stochastic
+    genc, gdec = global_scales(amax, four_six, eden)
     blocks = xf.reshape(r, c // BLOCK, BLOCK)
     bamax = blocks.abs().amax(-1)  # [R, C/16]
     if block_2d:
         assert r % BLOCK == 0, f"rows {r} must be a multiple of {BLOCK} for 2D blocks"
         bamax = bamax.reshape(r // BLOCK, BLOCK, c // BLOCK).amax(1, keepdim=True).expand(-1, BLOCK, -1).reshape(r, c // BLOCK)
+    if eden:
+        codes, s = _eden_blocks(blocks, bamax, genc, seed)
+        codes = codes.reshape(r, c).to(torch.uint8)
+        data = (codes[:, 0::2] | (codes[:, 1::2] << 4)).to(torch.uint8)
+        return data.contiguous(), s.contiguous(), gdec.reshape(()).float()
+    if four_six:
+        c6, s6, e6 = _rtn_candidate(blocks, bamax, E2M1_MAX, genc)
+        c4, s4, e4 = _rtn_candidate(blocks, bamax, 4.0, genc)
+        pick4 = e4 < e6
+        codes = torch.where(pick4.unsqueeze(-1), c4, c6).reshape(r, c).to(torch.uint8)
+        s = torch.where(pick4, s4, s6)
+        data = (codes[:, 0::2] | (codes[:, 1::2] << 4)).to(torch.uint8)
+        return data.contiguous(), s.contiguous(), gdec.reshape(()).float()
     # NB: `tensor / python_scalar` on CUDA is computed as tensor * (1/scalar), which is not IEEE division
     # and differs at E4M3 rounding ties; divide by a full tensor so CPU, CUDA and the kernels agree.
     s_target = torch.div(bamax, torch.full_like(bamax, E2M1_MAX)) * genc
@@ -198,7 +295,7 @@ def quantize(x: torch.Tensor, *, block_2d: bool = False, stochastic: bool = Fals
     v = blocks * enc.unsqueeze(-1)
     if stochastic:
         idx = torch.arange(r * c, device=x.device, dtype=torch.int64).reshape(r, c // BLOCK, BLOCK)
-        codes = e2m1_round_stochastic(v, sr_uniform(seed, idx))
+        codes = e2m1_round_stochastic(v, sr_bits(seed, idx))
     else:
         codes = e2m1_round_rne(v)
     codes = codes.reshape(r, c).to(torch.uint8)
@@ -208,7 +305,7 @@ def quantize(x: torch.Tensor, *, block_2d: bool = False, stochastic: bool = Fals
 
 def quantize_dual(x: torch.Tensor, *, row: bool = True, col: bool = True, block_2d: bool = False,
                   row_sr_seed: int | None = None, col_sr_seed: int | None = None, rht_seed: int | None = None,
-                  col_pad: int = 16):
+                  col_pad: int = 16, four_six: bool = False, ms_eden: bool = False):
     """Spec of the fused dual quantizer: (quantize(x), quantize(RHT(pad_rows(x, col_pad).T))).
 
     Either output is None when disabled. A seed of None means round-to-nearest-even.
@@ -216,13 +313,16 @@ def quantize_dual(x: torch.Tensor, *, row: bool = True, col: bool = True, block_
     xf = x.float()
     r_out = c_out = None
     if row:
-        r_out = quantize(xf, block_2d=block_2d, stochastic=row_sr_seed is not None, seed=row_sr_seed or 0)
+        r_out = quantize(xf, block_2d=block_2d, stochastic=row_sr_seed is not None, seed=row_sr_seed or 0,
+                         four_six=four_six)
     if col:
         pad = (-xf.shape[0]) % col_pad
         y = torch.nn.functional.pad(xf, (0, 0, 0, pad)).T.contiguous()
+        eden = ms_eden and rht_seed is not None
         if rht_seed is not None:
-            y = apply_rht(y, rht_seed)
-        c_out = quantize(y, block_2d=block_2d, stochastic=col_sr_seed is not None, seed=col_sr_seed or 0)
+            y = apply_rht(y, rht_seed, 64 if eden else 16)
+        c_out = quantize(y, block_2d=block_2d, stochastic=col_sr_seed is not None, seed=col_sr_seed or 0,
+                         four_six=four_six, eden=eden)
     return r_out, c_out
 
 

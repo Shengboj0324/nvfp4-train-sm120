@@ -1,0 +1,35 @@
+[
+ {
+  "shape": [
+   8192,
+   2304
+  ],
+  "activation_rn_us": 87.14559555053711,
+  "gradient_sr_us": 117.97439575195314,
+  "activation_four_six_us": 136.36287689208984,
+  "activation_ms_eden_us": 152.78207778930664,
+  "gradient_ms_eden_us": 171.53919219970706
+ },
+ {
+  "shape": [
+   8192,
+   8192
+  ],
+  "activation_rn_us": 436.32129669189453,
+  "gradient_sr_us": 487.1923065185547,
+  "activation_four_six_us": 540.3340911865234,
+  "activation_ms_eden_us": 623.3843231201172,
+  "gradient_ms_eden_us": 736.219482421875
+ },
+ {
+  "shape": [
+   16384,
+   3072
+  ],
+  "activation_rn_us": 333.0860900878906,
+  "gradient_sr_us": 378.73470306396484,
+  "activation_four_six_us": 418.44158172607416,
+  "activation_ms_eden_us": 452.4358367919922,
+  "gradient_ms_eden_us": 524.2822265625
+ }
+]

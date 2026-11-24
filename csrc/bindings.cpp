@@ -55,6 +55,10 @@ torch::Tensor nvfp4_gemm(torch::Tensor a, torch::Tensor sfa, torch::Tensor gdec_
                          bool accumulate, int64_t impl, int64_t splits, c10::optional<torch::Tensor> bias,
                          c10::optional<torch::Tensor> residual, bool bias_round);
 
+void nvfp4_set_four_six(bool on);
+bool nvfp4_four_six();
+void nvfp4_set_ms_eden(bool on);
+bool nvfp4_ms_eden();
 std::vector<torch::Tensor> nvfp4_attn_quant(torch::Tensor x, const OptTensor& mean, const OptTensor& o, bool want_row,
                                             bool want_col, bool want_bf16, bool want_deq);
 std::vector<torch::Tensor> nvfp4_attn_fwd(torch::Tensor q, torch::Tensor qs, torch::Tensor k, torch::Tensor ks,
@@ -131,6 +135,13 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
         py::arg("b"), py::arg("sfb"), py::arg("gdec_b"), py::arg("out_dtype"), py::arg("out") = py::none(),
         py::arg("accumulate") = false, py::arg("impl") = 0, py::arg("splits") = 0, py::arg("bias") = py::none(),
         py::arg("residual") = py::none(), py::arg("bias_round") = false);
+  m.def("set_four_six", &nvfp4_set_four_six, "Enable / disable Four Over Six block scales on round-to-nearest NVFP4 outputs",
+        py::arg("on"));
+  m.def("four_six", &nvfp4_four_six, "Whether Four Over Six block scales are enabled");
+  m.def("set_ms_eden", &nvfp4_set_ms_eden,
+        "Enable / disable MS-EDEN (64-point RHT, EDEN-corrected scales instead of element SR) on wgrad operands",
+        py::arg("on"));
+  m.def("ms_eden", &nvfp4_ms_eden, "Whether MS-EDEN is enabled");
   m.def("attn_quant", &nvfp4_attn_quant,
         "Attention operand quantization: x [B, H, N, D] -> int8 row / MXFP8 col (transposed, permuted) layouts (+ delta)",
         py::arg("x"), py::arg("mean") = py::none(), py::arg("o") = py::none(), py::arg("want_row") = true,

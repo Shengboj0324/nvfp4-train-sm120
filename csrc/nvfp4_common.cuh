@@ -31,32 +31,22 @@ __host__ __device__ __forceinline__ uint32_t hash_u32(uint32_t x) {
   return x;
 }
 
-// reference.sr_uniform2: the stochastic-rounding uniforms of elements 2k and 2k + 1 from one 32-bit hash of
-// the pair index k (keyed by the 64-bit seed), 16 bits each: u0 = (h & 0xFFFF) * 2^-16, u1 = (h >> 16) * 2^-16.
-// Built without int->float conversions: 0x3F800000 | (n << 7) is 1 + n * 2^-16, and subtracting 1 is exact.
-// (One hash per two elements: sm_120a has no cvt.rs, so the hash is most of stochastic rounding's cost.)
-__device__ __forceinline__ void sr_uniform2(uint64_t seed, uint64_t pair, float& u0, float& u1) {
-  const uint32_t k = static_cast<uint32_t>(pair);  // reference masks the int64 pair index to 32 bits
-  const uint32_t h = hash_u32(hash_u32(k ^ static_cast<uint32_t>(seed)) + static_cast<uint32_t>(seed >> 32));
-  u0 = __fsub_rn(__uint_as_float(0x3F800000u | ((h & 0xFFFFu) << 7)), 1.0f);
-  u1 = __fsub_rn(__uint_as_float(0x3F800000u | ((h >> 16) << 7)), 1.0f);
+// reference.sr_key / sr_bits: 8 random bits per element. Elements 4q .. 4q + 3 take bytes 0 .. 3 of
+// hash(q + key), key = hash(lo ^ hash(hi)) of the 64-bit seed (computed once per block; one hash per four
+// elements: sm_120a has no cvt.rs, so the hash is a large part of stochastic rounding's cost).
+__device__ __forceinline__ uint32_t sr_key(uint64_t seed) {
+  return hash_u32(hash_u32(static_cast<uint32_t>(seed >> 32)) ^ static_cast<uint32_t>(seed));
 }
 
-// Stochastic rounding of y onto the signed E2M1 grid, returned as a float grid value (bit-identical to
-// e2m1_decode(reference.e2m1_round_stochastic(y, u)) up to the sign of zero). Same arithmetic as the reference:
-// glo = largest grid point <= a, p_up = (a - glo) / step, round up iff u < p_up. For a >= 1 the grid is
-// "1 mantissa bit", so glo is a with its mantissa truncated to 1 bit and 1/step = 2^(1-E) comes from the
-// exponent bits; below 1 the grid is {0, 0.5, 1} with step 0.5.
-__device__ __forceinline__ float e2m1_sr_value(float y, float u) {
-  const float a = fminf(fabsf(y), kE2M1Max);
-  const uint32_t abits = __float_as_uint(a);
-  const bool ge1 = a >= 1.0f;
-  const float glo = ge1 ? __uint_as_float(abits & 0xFFC00000u) : (a >= 0.5f ? 0.5f : 0.0f);
-  const uint32_t e = abits >> 23;                                            // biased exponent (a >= 0)
-  const float inv_w = ge1 ? __uint_as_float((255u - e) << 23) : 2.0f;       // 1 / step
-  const float w = ge1 ? __uint_as_float((e - 1u) << 23) : 0.5f;             // step = 2^(E-1)
-  const float p_up = __fmul_rn(__fsub_rn(a, glo), inv_w);                   // 0 when a == 6
-  const float r = (u < p_up) ? __fadd_rn(glo, w) : glo;
+// reference.e2m1_round_stochastic, as a float grid value (the RN convert after it is exact): magnitudes below 1
+// are lifted into [1, 2), where E2M1's 0.5 spacing is one mantissa bit; the random byte r8 plus half a unit of
+// it (unbiased few-bit "SRF" rounding) is added below the kept mantissa bit and the rest truncated (a carry
+// moves to the next binade on its own). P(up) = round(256 f) / 256 for the position f within the grid step.
+__device__ __forceinline__ float e2m1_sr_value(float y, uint32_t r8) {
+  const float a = fabsf(y);
+  const float off = a < 1.0f ? 1.0f : 0.0f;
+  const uint32_t b = (__float_as_uint(__fadd_rn(a, off)) + ((r8 & 0xFFu) << 14) + (1u << 13)) & 0xFFC00000u;
+  const float r = fminf(__fsub_rn(__uint_as_float(b), off), kE2M1Max);
   return __uint_as_float(__float_as_uint(r) | (__float_as_uint(y) & 0x80000000u));
 }
 
@@ -66,6 +56,22 @@ __host__ __device__ __forceinline__ uint32_t rht_sign_mask(uint64_t seed) {
   uint32_t m = 0;
   for (int i = 0; i < kBlock; ++i) m |= (hash_u32(static_cast<uint32_t>(i) ^ static_cast<uint32_t>(seed)) & 1u) << i;
   return m;
+}
+
+// reference.rht_signs(seed, 64): the 64 signs of the 64-point RHT (the first 16 are rht_sign_mask's).
+__host__ __device__ __forceinline__ uint64_t rht_sign_mask64(uint64_t seed) {
+  uint64_t m = 0;
+  for (int i = 0; i < 64; ++i)
+    m |= static_cast<uint64_t>(hash_u32(static_cast<uint32_t>(i) ^ static_cast<uint32_t>(seed)) & 1u) << i;
+  return m;
+}
+
+// rht_sign_mask64 computed by a whole warp (two ballots; convergent).
+__device__ __forceinline__ uint64_t rht_sign_mask64_warp(uint64_t seed) {
+  const unsigned lane = threadIdx.x & 31u;
+  const uint32_t lo = __ballot_sync(0xffffffffu, hash_u32(lane ^ static_cast<uint32_t>(seed)) & 1u);
+  const uint32_t hi = __ballot_sync(0xffffffffu, hash_u32((lane + 32u) ^ static_cast<uint32_t>(seed)) & 1u);
+  return static_cast<uint64_t>(lo) | (static_cast<uint64_t>(hi) << 32);
 }
 
 // rht_sign_mask computed by a whole warp: lane i < 16 hashes bit i, one ballot assembles the mask.
@@ -184,16 +190,36 @@ __device__ __forceinline__ float layernorm_apply(float x, float mean, float rstd
 // as uint bits a positive NaN is above +inf, so the atomicMax over CTAs keeps it too.
 __device__ __forceinline__ float nan_max(float m, float v) { return (v > m || v != v) ? v : m; }
 
-// reference.global_scales: genc = 2688 / amax (1 if amax == 0, NaN if amax is NaN); gdec = 1 / genc.
-// A NaN (or inf) anywhere in the tensor thus makes gdec non-finite and every GEMM output it feeds NaN.
-__device__ __forceinline__ float global_encode_scale(float amax) {
-  if (amax > 0.0f) return __fdiv_rn(kE4M3Max * kE2M1Max, amax);
+// reference.global_scales: genc = 2688 / amax (1536 / amax with 4/6 block scales; 1 if amax == 0, NaN if amax
+// is NaN); gdec = 1 / genc. A NaN (or inf) anywhere in the tensor thus makes gdec non-finite and every GEMM
+// output it feeds NaN.
+constexpr float kFourSixE4M3Max = 256.0f;
+__device__ __forceinline__ float global_encode_scale(float amax, bool four_six = false) {
+  if (amax > 0.0f) return __fdiv_rn((four_six ? kFourSixE4M3Max : kE4M3Max) * kE2M1Max, amax);
+  return amax == 0.0f ? 1.0f : __int_as_float(0x7fffffff);
+}
+
+// Host-side recipe switch for "Four Over Six" block scales on every round-to-nearest NVFP4 output
+// (nvfp4.ops.set_four_six; read when a quantizer is launched). Defined in quantize.cu.
+bool four_six_enabled();
+// Host-side recipe switch for MS-EDEN (nvfp4.ops.set_ms_eden): the dual quantizer's RHT outputs use a 64-point
+// RHT, and its stochastically rounded RHT outputs (the wgrad gradient operand) MS-EDEN instead of element SR.
+bool ms_eden_enabled();
+
+// MS-EDEN (Quartet II, arXiv 2601.22813): round-to-nearest with the block max mapped to s = 6 * 16/17 / 0.93
+// (clipping slightly; minimises the MSE of N(0, 1)), tensor scale genc = s * 256 / amax (headroom for the
+// correction), then the per-block EDEN factor S = <y, y> / <y, Q(y)> folded into the E4M3 block scale with
+// stochastic rounding. Unbiased over the RHT signs and the scale rounding; no element-wise random numbers.
+constexpr float kEdenS = 6.07210636138916f;      // fp32 of (1 / 0.93) * 6 * 16 / 17
+constexpr float kEdenNum = 1554.459228515625f;   // fp32 of kEdenS * 256
+__device__ __forceinline__ float eden_encode_scale(float amax) {
+  if (amax > 0.0f) return __fdiv_rn(kEdenNum, amax);
   return amax == 0.0f ? 1.0f : __int_as_float(0x7fffffff);
 }
 
 // reference.quantize for one 16-element block whose abs-max (over the 1x16 or 16x16 block) is bmax.
 // Returns the UE4M3 scale byte and the 16 E2M1 codes packed low-nibble-first into `packed`.
-// Stochastic rounding uses sr_uniform2(sr_seed, (lin0 + i) / 2), lin0 = linear index of element 0 (even).
+// Stochastic rounding uses sr_bits(sr_seed, lin0 + i), lin0 = linear index of element 0 (a multiple of 4).
 template <bool kStochastic>
 __device__ __forceinline__ uint8_t quantize16(const float (&v)[kBlock], float bmax, float genc, uint64_t sr_seed,
                                               uint64_t lin0, uint2& packed) {
@@ -202,14 +228,16 @@ __device__ __forceinline__ uint8_t quantize16(const float (&v)[kBlock], float bm
   const float sf = e4m3_to_float(s);
   const float enc = sf > 0.0f ? __fdiv_rn(genc, sf) : 0.0f;
   uint32_t lo = 0, hi = 0;
+  uint32_t key = 0, h = 0;
+  if constexpr (kStochastic) key = sr_key(sr_seed);
 #pragma unroll
   for (int i = 0; i < kBlock; i += 2) {
     float y0 = __fmul_rn(v[i], enc), y1 = __fmul_rn(v[i + 1], enc);
     if constexpr (kStochastic) {  // round onto the grid first; the convert below is then exact
-      float u0, u1;
-      sr_uniform2(sr_seed, (lin0 + i) >> 1, u0, u1);
-      y0 = e2m1_sr_value(y0, u0);
-      y1 = e2m1_sr_value(y1, u1);
+      if ((i & 3) == 0) h = hash_u32(static_cast<uint32_t>((lin0 + i) >> 2) + key);
+      const uint32_t r = h >> (8 * (i & 3));
+      y0 = e2m1_sr_value(y0, r);
+      y1 = e2m1_sr_value(y1, r >> 8);
     }
     const uint32_t b = cvt_e2m1x2_rn(y0, y1);
     if (i < 8)
@@ -219,6 +247,91 @@ __device__ __forceinline__ uint8_t quantize16(const float (&v)[kBlock], float bm
   }
   packed = make_uint2(clear_negative_zeros(lo), clear_negative_zeros(hi));
   return s;
+}
+
+// Magnitude of a 3-bit E2M1 code: 0, 0.5, then (1 + m / 2) * 2^(e - 1) for code = 2 e + m.
+__device__ __forceinline__ float e2m1_mag(uint32_t c) {
+  return c >= 2u ? __uint_as_float(((126u + (c >> 1)) << 23) | ((c & 1u) << 22)) : (c ? 0.5f : 0.0f);
+}
+
+// reference._rtn_candidate: round-to-nearest with the block scale target bdiv * genc (bdiv = bmax / 6 or
+// bmax / 4); returns the scale byte, the codes, and the squared error sum((|y| - q)^2) * sf^2 (summed in
+// element order).
+__device__ __forceinline__ uint8_t rtn16_err(const float (&v)[kBlock], float bdiv, float genc, uint2& packed,
+                                            float& err) {
+  const float s_target = fminf(__fmul_rn(bdiv, genc), kE4M3Max);
+  const uint8_t s = e4m3_from_float(s_target);
+  const float sf = e4m3_to_float(s);
+  const float enc = sf > 0.0f ? __fdiv_rn(genc, sf) : 0.0f;
+  uint32_t lo = 0, hi = 0;
+  float e = 0.0f;
+#pragma unroll
+  for (int i = 0; i < kBlock; i += 2) {
+    const float y0 = __fmul_rn(v[i], enc), y1 = __fmul_rn(v[i + 1], enc);
+    const uint32_t b = cvt_e2m1x2_rn(y0, y1);
+    const float d0 = __fsub_rn(fabsf(y0), e2m1_mag(b & 7u));
+    const float d1 = __fsub_rn(fabsf(y1), e2m1_mag((b >> 4) & 7u));
+    e = __fadd_rn(e, __fmul_rn(d0, d0));
+    e = __fadd_rn(e, __fmul_rn(d1, d1));
+    if (i < 8)
+      lo |= b << (4 * i);
+    else
+      hi |= b << (4 * (i - 8));
+  }
+  packed = make_uint2(clear_negative_zeros(lo), clear_negative_zeros(hi));
+  err = __fmul_rn(e, __fmul_rn(sf, sf));
+  return s;
+}
+
+// reference.quantize(eden=True) for one block: RTN codes at the MS-EDEN block scale, then the scale replaced by
+// SR_e4m3(S * sf) with S = sum(y^2) / sum(y q) (summed in element order; S = 1 if the codes are all zero). The
+// scale's stochastic rounding uses the random byte sr_bits(seed, blk) (blk = block linear index) on the E4M3
+// grid (3 mantissa bits; the SRF half-unit offset as for E2M1), and round-to-nearest below E4M3's normal range.
+__device__ __forceinline__ uint8_t quantize16_eden(const float (&v)[kBlock], float bmax, float genc, uint64_t seed,
+                                                  uint64_t blk, uint2& packed) {
+  const float s_target = fminf(__fmul_rn(__fdiv_rn(bmax, kEdenS), genc), kE4M3Max);
+  const float sf = e4m3_to_float(e4m3_from_float(s_target));
+  const float enc = sf > 0.0f ? __fdiv_rn(genc, sf) : 0.0f;
+  uint32_t lo = 0, hi = 0;
+  float yy = 0.0f, yq = 0.0f;
+#pragma unroll
+  for (int i = 0; i < kBlock; i += 2) {
+    const float y0 = __fmul_rn(v[i], enc), y1 = __fmul_rn(v[i + 1], enc);
+    const uint32_t b = cvt_e2m1x2_rn(y0, y1);
+    const float m0 = e2m1_mag(b & 7u), m1 = e2m1_mag((b >> 4) & 7u);
+    const float q0 = (b & 8u) ? -m0 : m0, q1 = (b & 0x80u) ? -m1 : m1;
+    yy = __fadd_rn(yy, __fmul_rn(y0, y0));
+    yq = __fadd_rn(yq, __fmul_rn(y0, q0));
+    yy = __fadd_rn(yy, __fmul_rn(y1, y1));
+    yq = __fadd_rn(yq, __fmul_rn(y1, q1));
+    if (i < 8)
+      lo |= b << (4 * i);
+    else
+      hi |= b << (4 * (i - 8));
+  }
+  packed = make_uint2(clear_negative_zeros(lo), clear_negative_zeros(hi));
+  const float corr = yq > 0.0f ? __fdiv_rn(yy, yq) : 1.0f;
+  float t = __fmul_rn(corr, sf);
+  if (t >= 0.015625f) {  // E4M3 normal range: SR onto its 3-mantissa-bit grid
+    const uint32_t h = hash_u32(static_cast<uint32_t>(blk >> 2) + sr_key(seed));
+    const uint32_t r8 = (h >> (8 * (blk & 3u))) & 0xFFu;
+    t = __uint_as_float((__float_as_uint(t) + (r8 << 12) + (1u << 11)) & 0xFFF00000u);
+  }
+  return e4m3_from_float(fminf(t, kE4M3Max));
+}
+
+// reference.quantize(four_six=True) for one block (round-to-nearest): the candidate with the block max mapped
+// to 4 replaces the standard one (max mapped to 6) when its squared error is strictly smaller. genc must come
+// from global_encode_scale(amax, true).
+__device__ __forceinline__ uint8_t quantize16_four_six(const float (&v)[kBlock], float bmax, float genc,
+                                                      uint2& packed) {
+  uint2 p6, p4;
+  float e6, e4;
+  const uint8_t s6 = rtn16_err(v, __fdiv_rn(bmax, kE2M1Max), genc, p6, e6);
+  const uint8_t s4 = rtn16_err(v, __fdiv_rn(bmax, 4.0f), genc, p4, e4);
+  const bool four = e4 < e6;
+  packed = four ? p4 : p6;
+  return four ? s4 : s6;
 }
 
 }  // namespace nvfp4

@@ -71,6 +71,28 @@ def test_stochastic_rounding_is_unbiased():
     assert (mean - x).abs()[0, 1:].mean() < 0.5 * (det - x).abs()[0, 1:].mean()
 
 
+def test_eight_bit_stochastic_rounding_bias_is_bounded():
+    # all 256 values of the random byte for values across every E2M1 binade (both signs): the mean of the
+    # rounded values is within 2^-9 of a grid step of the input (the SRF half-unit offset; without it every
+    # value would sit 2^-9 step low), never rounds outside the two neighbouring grid points, and saturates at 6
+    torch.manual_seed(5)
+    v = torch.cat([torch.rand(4000) * 6.0, torch.tensor([0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0, 6.5, 1e-30])])
+    v = torch.cat([v, -v])
+    r8 = torch.arange(256)
+    out = ref.e2m1_decode(ref.e2m1_round_stochastic(v[:, None].expand(-1, 256), r8[None, :].expand(v.numel(), -1)))
+    a = v.abs().clamp(max=6.0)
+    step = torch.where(a < 2, 0.5, torch.where(a < 4, 1.0, 2.0))
+    lo = torch.floor(a / step) * step
+    assert ((out.abs() >= lo[:, None] - 1e-6) & (out.abs() <= (lo + step)[:, None] + 1e-6)).all()
+    assert out.abs().max() <= 6.0
+    bias = (out.mean(1) - torch.where(v < 0, -a, a)).abs() / step
+    assert bias.max() <= 2.0 ** -9 + 1e-6
+    # grid points stay exactly where they are
+    grid = torch.tensor([0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0])
+    g = ref.e2m1_decode(ref.e2m1_round_stochastic(grid[:, None].expand(-1, 256), r8[None, :].expand(8, -1)))
+    assert torch.equal(g, grid[:, None].expand(-1, 256))
+
+
 def test_gemm_reference_matches_dequantized_matmul():
     torch.manual_seed(4)
     a, b = torch.randn(32, 128), torch.randn(48, 128)

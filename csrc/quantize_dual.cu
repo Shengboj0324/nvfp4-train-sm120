@@ -52,8 +52,11 @@ struct Params {
   int R_pad;       // col output row length (R rounded up to the col padding multiple)
   int R_tiles;     // rows covered by the grid (R_pad if col output, else R)
   bool do_row, do_col, row_sr, col_sr, col_rht, block_2d;
+  bool row_46, col_46;  // 4/6 block scales on the (round-to-nearest) row / col output
   uint64_t row_seed, col_seed;
-  uint32_t rht_mask;  // rht_sign_mask(rht_seed)
+  uint64_t rht_mask;  // rht_sign_mask(rht_seed), or rht_sign_mask64 with rht64
+  bool rht64;         // 64-point RHT along the col output's rows (MS-EDEN recipe; R_pad % 64 == 0)
+  bool col_eden;      // MS-EDEN instead of element SR on the col output
   // Optional device-resident seeds (int64 scalars). When set they replace row_seed / col_seed /
   // rht_seed, so the seeds can come from a GPU random generator: no host sync, CUDA-graph capturable
   // (every replay reads that replay's values), and traceable by torch.compile.
@@ -71,7 +74,7 @@ struct Params {
 // ran even without device seeds and made these issue-bound kernels ~10% slower.)
 struct Seeds {
   uint64_t row, col;
-  uint32_t rht_mask;
+  uint64_t rht_mask;
 };
 
 __device__ __forceinline__ const int64_t* seed_ptr(const Params& p, unsigned i) {
@@ -82,7 +85,31 @@ __device__ __forceinline__ const int64_t* seed_ptr(const Params& p, unsigned i) 
 __device__ __forceinline__ Seeds resolve_seeds(const Params& p, const int64_t (&s_seed)[3]) {
   return {p.row_seed_ptr ? static_cast<uint64_t>(s_seed[0]) : p.row_seed,
           p.col_seed_ptr ? static_cast<uint64_t>(s_seed[1]) : p.col_seed,
-          p.rht_seed_ptr ? rht_sign_mask_warp(static_cast<uint64_t>(s_seed[2])) : p.rht_mask};
+          p.rht_seed_ptr ? (p.rht64 ? rht_sign_mask64_warp(static_cast<uint64_t>(s_seed[2]))
+                                    : rht_sign_mask_warp(static_cast<uint64_t>(s_seed[2])))
+                         : p.rht_mask};
+}
+
+// The column RHT of block b (rows 16 b .. 16 b + 15 of the tile) of column c, in place in v: the 16-point RHT
+// with this block's signs and, with rht64, the 4-point Hadamard across the tile's four blocks (x 0.5) through
+// the tile: H64 = H4 (x) H16 (reference.apply_rht(n=64), same operation order). Convergent when rht64 (all
+// threads, once per tile).
+__device__ __forceinline__ void col_rht(float (&v)[kBlock], uint64_t mask, bool rht64, float (*tile)[TILE + 1],
+                                        int b, int c) {
+  rht16(v, rht64 ? static_cast<uint32_t>(mask >> (16 * b)) & 0xFFFFu : static_cast<uint32_t>(mask));
+  if (!rht64) return;
+  __syncthreads();  // every thread has read its block from the tile
+#pragma unroll
+  for (int i = 0; i < kBlock; ++i) tile[b * kBlock + i][c] = v[i];
+  __syncthreads();
+#pragma unroll
+  for (int i = 0; i < kBlock; ++i) {
+    const float w0 = tile[i][c], w1 = tile[kBlock + i][c], w2 = tile[2 * kBlock + i][c], w3 = tile[3 * kBlock + i][c];
+    const float a = __fadd_rn(w0, w1), d01 = __fsub_rn(w0, w1), e = __fadd_rn(w2, w3), d23 = __fsub_rn(w2, w3);
+    const float r = b == 0 ? __fadd_rn(a, e) : b == 1 ? __fadd_rn(d01, d23) : b == 2 ? __fsub_rn(a, e)
+                                                                                : __fsub_rn(d01, d23);
+    v[i] = r * 0.5f;
+  }
 }
 
 struct Outputs {
@@ -295,7 +322,7 @@ __global__ void __launch_bounds__(THREADS) amax_tile_kernel(const T* __restrict_
   __shared__ int64_t s_rht_seed;
   const bool seed_loader = threadIdx.x == 0 && p.rht_seed_ptr != nullptr;
   const int64_t rht_seed = seed_loader ? __ldg(p.rht_seed_ptr) : 0;
-  uint32_t rht_mask = p.rht_mask;
+  uint64_t rht_mask = p.rht_mask;
   bool first = true;
   const int tiles_c = (p.C + TILE - 1) / TILE;
   const int ntiles = tiles_c * ((p.R + TILE - 1) / TILE);  // padding rows add nothing
@@ -309,13 +336,15 @@ __global__ void __launch_bounds__(THREADS) amax_tile_kernel(const T* __restrict_
     if (first && seed_loader) s_rht_seed = rht_seed;
     __syncthreads();
     if (first) {  // uniform: every thread runs the same iterations
-      if (p.rht_seed_ptr) rht_mask = rht_sign_mask_warp(static_cast<uint64_t>(s_rht_seed));
+      if (p.rht_seed_ptr)
+        rht_mask = p.rht64 ? rht_sign_mask64_warp(static_cast<uint64_t>(s_rht_seed))
+                           : rht_sign_mask_warp(static_cast<uint64_t>(s_rht_seed));
       first = false;
     }
     float v[kBlock];
 #pragma unroll
     for (int i = 0; i < kBlock; ++i) v[i] = tile[b * kBlock + i][c];
-    rht16(v, rht_mask);
+    col_rht(v, rht_mask, p.rht64, tile, b, c);
 #pragma unroll
     for (int i = 0; i < kBlock; ++i) m_rht = nan_max(m_rht, fabsf(v[i]));
   }
@@ -395,7 +424,7 @@ __global__ void __launch_bounds__(THREADS) dual_quantize_kernel(const T* __restr
   float v[kBlock];
 
   if (p.do_row) {
-    const float genc = global_encode_scale(__uint_as_float(*amax_row));
+    const float genc = global_encode_scale(__uint_as_float(*amax_row), p.row_46);
     if (first) *o.row_gdec = __fdiv_rn(1.0f, genc);
     const int gr = r0 + k, gb = c0 / kBlock + b;
     float bmax = 0.0f;
@@ -406,8 +435,9 @@ __global__ void __launch_bounds__(THREADS) dual_quantize_kernel(const T* __restr
     }
     if (p.block_2d) bmax = max16(bmax);
     const uint64_t lin0 = static_cast<uint64_t>(gr) * p.C + gb * kBlock;
-    st.scales[k][b] = p.row_sr ? quantize16<true>(v, bmax, genc, seeds.row, lin0, st.codes[k][b])
-                               : quantize16<false>(v, bmax, genc, 0, lin0, st.codes[k][b]);
+    st.scales[k][b] = p.row_sr   ? quantize16<true>(v, bmax, genc, seeds.row, lin0, st.codes[k][b])
+                      : p.row_46 ? quantize16_four_six(v, bmax, genc, st.codes[k][b])
+                                 : quantize16<false>(v, bmax, genc, 0, lin0, st.codes[k][b]);
     __syncthreads();
     store_stage(st, o.row_data, o.row_scales, p.C / 2, r0, min(TILE, p.R - r0), c0 / kBlock,
                 min(4, (p.C - c0) / kBlock));
@@ -415,19 +445,22 @@ __global__ void __launch_bounds__(THREADS) dual_quantize_kernel(const T* __restr
   }
 
   if (p.do_col) {
-    const float genc = global_encode_scale(__uint_as_float(*amax_col));
+    const float genc = p.col_eden ? eden_encode_scale(__uint_as_float(*amax_col))
+                                  : global_encode_scale(__uint_as_float(*amax_col), p.col_46);
     if (first) *o.col_gdec = __fdiv_rn(1.0f, genc);
     const int gc = c0 + k, gb = r0 / kBlock + b;  // logical row / block column of X^T
 #pragma unroll
     for (int i = 0; i < kBlock; ++i) v[i] = tile[b * kBlock + i][k];
-    if (p.col_rht) rht16(v, seeds.rht_mask);
+    if (p.col_rht) col_rht(v, seeds.rht_mask, p.rht64, tile, b, k);
     float bmax = 0.0f;
 #pragma unroll
     for (int i = 0; i < kBlock; ++i) bmax = fmaxf(bmax, fabsf(v[i]));
     if (p.block_2d) bmax = max16(bmax);
     const uint64_t lin0 = static_cast<uint64_t>(gc) * p.R_pad + gb * kBlock;
-    st.scales[k][b] = p.col_sr ? quantize16<true>(v, bmax, genc, seeds.col, lin0, st.codes[k][b])
-                               : quantize16<false>(v, bmax, genc, 0, lin0, st.codes[k][b]);
+    st.scales[k][b] = p.col_eden ? quantize16_eden(v, bmax, genc, seeds.col, lin0 >> 4, st.codes[k][b])
+                      : p.col_sr   ? quantize16<true>(v, bmax, genc, seeds.col, lin0, st.codes[k][b])
+                      : p.col_46 ? quantize16_four_six(v, bmax, genc, st.codes[k][b])
+                                 : quantize16<false>(v, bmax, genc, 0, lin0, st.codes[k][b]);
     __syncthreads();
     // the last tile row may extend past R_pad (and the last tile column past C)
     store_stage(st, o.col_data, o.col_scales, p.R_pad / 2, c0, min(TILE, p.C - c0), r0 / kBlock,
@@ -540,9 +573,15 @@ std::vector<torch::Tensor> run_dual(const torch::Tensor& x, int pro, const torch
   p.col_sr = col_sr;
   p.col_rht = do_col && col_rht;
   p.block_2d = block_2d;
+  p.row_46 = four_six_enabled() && !row_sr;
+  p.col_46 = four_six_enabled() && !col_sr;
   p.row_seed = static_cast<uint64_t>(row_seed);
   p.col_seed = static_cast<uint64_t>(col_seed);
-  p.rht_mask = rht_sign_mask(static_cast<uint64_t>(rht_seed));
+  p.rht64 = ms_eden_enabled() && p.col_rht;
+  p.col_eden = p.rht64 && col_sr;
+  TORCH_CHECK(!p.rht64 || p.R_pad % 64 == 0, "MS-EDEN's 64-point RHT needs col_pad % 64 == 0");
+  p.rht_mask = p.rht64 ? rht_sign_mask64(static_cast<uint64_t>(rht_seed))
+                       : static_cast<uint64_t>(rht_sign_mask(static_cast<uint64_t>(rht_seed)));
   p.row_seed_ptr = seed_ptr(seeds.row, x, "row_seed tensor");
   p.col_seed_ptr = seed_ptr(seeds.col, x, "col_seed tensor");
   p.rht_seed_ptr = seed_ptr(seeds.rht, x, "rht_seed tensor");
