@@ -507,7 +507,7 @@ Every benchmark checks correctness against the reference before it times anythin
 ## 6. Known limitations and next steps
 
 Done in v0.9: 8-bit attention (§7; item 2 of v0.8), the warp-tile ablation of the locked-clock gap
-(§4.2, item 1), validation on the smaller RTX 50 parts (item 7).
+(§4.2, item 1).
 Done in v0.8: residual adds, biases and the q / k / v hand-off fused (§3.6, item 2 of v0.7),
 SwiGLU gate / up biases and norm-free MLPs for post-norm blocks (item 5), a persistent GEMM with early
 refills that recovers about half of the locked-clock gap (§4.2, item 1), stochastic rounding at half
@@ -555,8 +555,10 @@ accumulation.
 7. **Platform.** Linux, WSL2 and native Windows build and pass the tests on the RTX 5090 Laptop, and
    Linux on the desktop RTX 5090 (CUDA 12.8, PyTorch 2.11). The smaller RTX 50 parts (5080 / 5070 /
    5060) share the architecture but have fewer SMs; the tile / split-K heuristics were tuned on the
-   82- and 170-SM parts. On Windows, inductor needs Triton, which PyTorch's Windows wheels don't
-   include.
+   82- and 170-SM parts (a rental attempt on 2026-11-24 found no RTX 5070 Ti / 5060 Ti / 5070 capacity
+   and five RTX 5080 hosts whose containers never started). The attention kernels need nothing
+   SM-count specific: two forward CTAs per SM fit the 100 KB of shared memory every sm_120 SM has. On
+   Windows, inductor needs Triton, which PyTorch's Windows wheels don't include.
 
 ## 7. 8-bit attention (`csrc/attention.cu`, `nvfp4/attention.py`, v0.9)
 

@@ -19,8 +19,10 @@
 - GEMM: warp-tile ablation of the locked-clock gap (`NVFP4_NVCC_FLAGS=-DNVFP4_WARPS_N=2`, DESIGN.md §4.2):
   a 64 × 64 warp tile needs more than 255 registers and runs at half speed, so the layout stays.
   The cp.async loop's loaders no longer assume 256 threads.
-- Validated on smaller RTX 50 parts (rented; RESULTS.md §8). 682 tests (45 new); sanitizers cover the
-  attention kernels.
+- 682 tests (45 new); sanitizers cover the attention kernels; `tools/pod_session.sh` also runs the
+  attention and long-context benchmarks. Validation on the smaller RTX 50 parts is still open: on
+  2026-11-24 Runpod had no RTX 5070 Ti / 5060 Ti / 5070 capacity, and five Community RTX 5080 hosts never
+  started a container (with three start commands and Runpod's own image).
 
 ## Validated on rented desktop RTX 5090s (2026-11-23)
 
