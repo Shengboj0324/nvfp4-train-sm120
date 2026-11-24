@@ -55,6 +55,18 @@ torch::Tensor nvfp4_gemm(torch::Tensor a, torch::Tensor sfa, torch::Tensor gdec_
                          bool accumulate, int64_t impl, int64_t splits, c10::optional<torch::Tensor> bias,
                          c10::optional<torch::Tensor> residual, bool bias_round);
 
+std::vector<torch::Tensor> nvfp4_attn_quant(torch::Tensor x, const OptTensor& mean, const OptTensor& o, bool want_row,
+                                            bool want_col);
+std::vector<torch::Tensor> nvfp4_attn_fwd(torch::Tensor q, torch::Tensor qs, torch::Tensor k, torch::Tensor ks,
+                                          torch::Tensor vt, torch::Tensor vts, int64_t N, bool causal, double scale,
+                                          c10::ScalarType dtype);
+std::vector<torch::Tensor> nvfp4_attn_bwd(torch::Tensor q, torch::Tensor qs, torch::Tensor qt, torch::Tensor qts,
+                                          torch::Tensor k, torch::Tensor ks, torch::Tensor kt, torch::Tensor kts,
+                                          torch::Tensor v, torch::Tensor vs, torch::Tensor g, torch::Tensor gs,
+                                          torch::Tensor gt, torch::Tensor gts, torch::Tensor lse, torch::Tensor delta,
+                                          int64_t N, bool causal, double scale, c10::ScalarType dtype,
+                                          const std::vector<int64_t>& dq_stride, const std::vector<int64_t>& dk_stride);
+
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
   m.doc() = "NVFP4 kernels for sm_120 (consumer Blackwell)";
   m.def("quantize", &nvfp4_quantize, "BF16/FP32 -> NVFP4 (data, scales, gdec)", py::arg("x"),
@@ -118,4 +130,16 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
         py::arg("b"), py::arg("sfb"), py::arg("gdec_b"), py::arg("out_dtype"), py::arg("out") = py::none(),
         py::arg("accumulate") = false, py::arg("impl") = 0, py::arg("splits") = 0, py::arg("bias") = py::none(),
         py::arg("residual") = py::none(), py::arg("bias_round") = false);
+  m.def("attn_quant", &nvfp4_attn_quant,
+        "Attention operand quantization: x [B, H, N, D] -> int8 row / MXFP8 col (transposed, permuted) layouts (+ delta)",
+        py::arg("x"), py::arg("mean") = py::none(), py::arg("o") = py::none(), py::arg("want_row") = true,
+        py::arg("want_col") = true);
+  m.def("attn_fwd", &nvfp4_attn_fwd, "8-bit flash attention forward -> (o [B, N, H, D], lse)", py::arg("q"),
+        py::arg("qs"), py::arg("k"), py::arg("ks"), py::arg("vt"), py::arg("vts"), py::arg("N"), py::arg("causal"),
+        py::arg("scale"), py::arg("dtype"));
+  m.def("attn_bwd", &nvfp4_attn_bwd, "8-bit flash attention backward -> (dq, dk, dv), [B, H(k), N, D] with the given strides",
+        py::arg("q"), py::arg("qs"), py::arg("qt"), py::arg("qts"), py::arg("k"), py::arg("ks"), py::arg("kt"),
+        py::arg("kts"), py::arg("v"), py::arg("vs"), py::arg("g"), py::arg("gs"), py::arg("gt"), py::arg("gts"),
+        py::arg("lse"), py::arg("delta"), py::arg("N"), py::arg("causal"), py::arg("scale"), py::arg("dtype"),
+        py::arg("dq_stride") = std::vector<int64_t>{}, py::arg("dk_stride") = std::vector<int64_t>{});
 }
