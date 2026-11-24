@@ -418,3 +418,85 @@ def snr_db(ref: torch.Tensor, approx: torch.Tensor) -> float:
     err = (ref.double() - approx.double()).pow(2).mean().item()
     sig = ref.double().pow(2).mean().item()
     return 10.0 * math.log10(sig / err) if err > 0 else float("inf")
+
+
+# --- MXFP8 attention (nvfp4.attention) ----------------------------------------------------------------------
+
+def _sigma(k: int) -> int:
+    return 16 * (k >> 4) + 8 * ((k & 3) >> 1) + 2 * ((k & 15) >> 2) + (k & 1)
+
+
+ATTN_SIGMA = [_sigma(k) for k in range(32)]  # token at k-position k of a 32-block in the col layout
+
+
+def mxfp8_scale_exp(amax: torch.Tensor) -> torch.Tensor:
+    """Biased UE8M0 exponent of the smallest power of two 2^E with amax / 2^E <= 448, clamped to [1, 253]."""
+    bits = (amax.float() * (1.0 / 448.0)).view(torch.int32)
+    e = (bits >> 23) + ((bits & 0x7FFFFF) != 0).to(torch.int32)
+    return e.clamp(1, 253)
+
+
+def mxfp8_quantize(x: torch.Tensor, dim: int = -1) -> tuple[torch.Tensor, torch.Tensor]:
+    """MXFP8 along ``dim`` (blocks of 32): returns (E4M3 codes as torch.float8_e4m3fn, biased UE8M0 exponents
+    [..., n/32] with ``dim`` moved last). Value = code * 2^(e - 127)."""
+    xm = x.float().movedim(dim, -1)
+    blocks = xm.reshape(*xm.shape[:-1], xm.shape[-1] // 32, 32)
+    e = mxfp8_scale_exp(blocks.abs().amax(-1))
+    inv = torch.exp2((127 - e).float()).unsqueeze(-1)
+    codes = (blocks * inv).clamp(-448.0, 448.0).to(torch.float8_e4m3fn)
+    return codes.reshape(xm.shape), e
+
+
+def mxfp8_fake(x: torch.Tensor, dim: int = -1) -> torch.Tensor:
+    """Quantize-dequantize (fp32) along ``dim`` with MXFP8 blocks of 32."""
+    codes, e = mxfp8_quantize(x, dim)
+    xm = codes.float().reshape(*codes.shape[:-1], codes.shape[-1] // 32, 32)
+    xm = xm * torch.exp2((e - 127).float()).unsqueeze(-1)
+    return xm.reshape(codes.shape).movedim(-1, dim)
+
+
+def int8_token_quantize(x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+    """Symmetric INT8 with one scale per row (last dim): codes rn(x * (127 / amax)), scale amax / 127."""
+    xf = x.float()
+    am = xf.abs().amax(-1, keepdim=True)
+    # correctly rounded fp32 divisions, as in the kernel (PyTorch divides by a scalar via its reciprocal)
+    inv = torch.where(am > 0, (127.0 / am.double()).float(), torch.zeros_like(am))
+    codes = torch.round(xf * inv).clamp(-127, 127).to(torch.int8)
+    return codes, (am.double() / 127.0).float().squeeze(-1)
+
+
+def int8_token_fake(x: torch.Tensor) -> torch.Tensor:
+    codes, s = int8_token_quantize(x)
+    return codes.float() * s.unsqueeze(-1)
+
+
+def _pad_seq(x: torch.Tensor, mult: int = 128) -> torch.Tensor:
+    n = x.shape[-2]
+    pad = (n + mult - 1) // mult * mult - n
+    return torch.nn.functional.pad(x, (0, 0, 0, pad)) if pad else x
+
+
+def attention_8bit(q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, *, causal: bool = False,
+                   scale: float | None = None, smooth_k: bool = True) -> torch.Tensor:
+    """fp32 emulation of nvfp4.attention's forward ([B, H, N, D] inputs, K/V heads may divide H): Q and K
+    (minus its per-channel mean over the sequence) quantized to INT8 per token, V to MXFP8 along the sequence,
+    as the kernels do, and the probabilities rounded to E4M3 as 256 p. The kernel takes p relative to the
+    running maximum of its 64-key tiles and this emulation relative to the row maximum, so individual P values
+    can round differently (both are unbiased to within E4M3 precision)."""
+    B, H, N, D = q.shape
+    scale = D ** -0.5 if scale is None else scale
+    kk = k.float()
+    if smooth_k:
+        kk = kk - kk.mean(dim=2, keepdim=True)
+    qf = int8_token_fake(q)
+    kf = int8_token_fake(kk)
+    vf = mxfp8_fake(_pad_seq(v.float()), dim=-2)[..., :N, :]
+    rep = H // k.shape[1]
+    kf, vf = kf.repeat_interleave(rep, 1), vf.repeat_interleave(rep, 1)
+    s = (qf @ kf.transpose(-1, -2)) * scale
+    if causal:
+        s = s.masked_fill(torch.ones(N, N, dtype=torch.bool, device=q.device).triu(1), float("-inf"))
+    m = s.amax(-1, keepdim=True)
+    p = torch.exp(s - m)
+    p8 = (p * 256).clamp(max=448.0).to(torch.float8_e4m3fn).float() / 256
+    return (p8 @ vf) / p.sum(-1, keepdim=True)

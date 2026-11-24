@@ -21,6 +21,7 @@ import torch.nn.functional as F
 sys.path.insert(0, os.path.dirname(__file__))
 from bench_gemm import timeit  # noqa: E402
 
+from nvfp4.attention import attention as attention_8bit  # noqa: E402
 from nvfp4.fused import rmsnorm_linear, rmsnorm_swiglu_mlp  # noqa: E402
 from nvfp4.linear import convert_linears  # noqa: E402
 
@@ -37,16 +38,22 @@ class LlamaBlock(torch.nn.Module):
         self.down = torch.nn.Linear(hidden, d, bias=False)
         self.fused = False
         self.fused_res = False
+        self.attn8 = False  # nvfp4.attention instead of BF16 SDPA (bench_long_context.py)
+
+    def sdpa(self, q, k, v):
+        if self.attn8:
+            return attention_8bit(q, k, v, causal=True)
+        return F.scaled_dot_product_attention(q, k, v, is_causal=True)
 
     def attn(self, qkv):
         b, t, _ = qkv.shape
         q, k, v = qkv.view(b, t, 3, self.heads, -1).permute(2, 0, 3, 1, 4)
-        return F.scaled_dot_product_attention(q, k, v, is_causal=True).transpose(1, 2).reshape(b, t, -1)
+        return self.sdpa(q, k, v).transpose(1, 2).reshape(b, t, -1)
 
     def attn3(self, q, k, v):
         b, t, _ = q.shape
         q, k, v = (z.view(b, t, self.heads, -1).transpose(1, 2) for z in (q, k, v))
-        return F.scaled_dot_product_attention(q, k, v, is_causal=True).transpose(1, 2).reshape(b, t, -1)
+        return self.sdpa(q, k, v).transpose(1, 2).reshape(b, t, -1)
 
     def forward(self, x):
         if self.fused_res:

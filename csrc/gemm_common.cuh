@@ -13,7 +13,11 @@ namespace nvfp4 {
 namespace gemm {
 
 constexpr int BM = 128, BN = 128;                    // CTA tile (both main loops)
-constexpr int WARPS_M = 2, WARPS_N = 4;              // 8 MMA warps
+// NVFP4_WARPS_N = 2 builds 4 MMA warps of 64 x 64 (one per scheduler; an ablation, docs/DESIGN.md §4.2)
+#ifndef NVFP4_WARPS_N
+#define NVFP4_WARPS_N 4
+#endif
+constexpr int WARPS_M = 2, WARPS_N = NVFP4_WARPS_N;  // 8 MMA warps
 constexpr int WM = BM / WARPS_M, WN = BN / WARPS_N;  // 64 x 32 per warp
 constexpr int MI = WM / 16, NI = WN / 8;             // 4 x 4 MMA tiles per warp
 constexpr int MMA_THREADS = 32 * WARPS_M * WARPS_N;  // 256
@@ -110,7 +114,7 @@ __device__ __forceinline__ void mma_nvfp4(float (&d)[4], const uint32_t (&a)[4],
 }
 
 // Barrier over the 256 MMA threads only (the TMA kernel's producer warp does not take part).
-__device__ __forceinline__ void mma_threads_sync() { asm volatile("bar.sync 1, 256;\n" ::: "memory"); }
+__device__ __forceinline__ void mma_threads_sync() { asm volatile("bar.sync 1, %0;\n" ::"n"(MMA_THREADS) : "memory"); }
 
 // Visits the fragment elements this thread owns: f(i, j, h, row, col) for acc[i][j][2h], acc[i][j][2h+1]
 // at D[row, col], D[row, col + 1].

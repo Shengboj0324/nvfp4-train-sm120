@@ -81,5 +81,10 @@ for (m, n, k) in [(200, 72, 256), (130, 260, 1280), (64, 64, 2048), (2048, 2000,
             ops.gemm(qa, qb, out=out, accumulate=True, impl=impl, splits=s)
             ops.gemm(qa, qb, torch.bfloat16, bias=bias, residual=res, impl=impl, splits=s)
             ops.gemm(qa, qb, torch.float32, bias=bias, residual=res.bfloat16(), impl=impl, splits=s)
+# 8-bit attention (nvfp4.attention): forward + backward, ragged lengths, GQA, causal / full, both head dims
+from nvfp4.attention import attention  # noqa: E402
+for (B, H, Hk, N, D, causal) in [(1, 2, 1, 77, 64, True), (1, 2, 2, 200, 128, False), (2, 4, 2, 130, 128, True)]:
+    qa_, ka_, va_ = (torch.randn(B, h, N, D, device=d, dtype=torch.bfloat16, requires_grad=True) for h in (H, Hk, Hk))
+    attention(qa_, ka_, va_, causal=causal).float().square().mean().backward()
 torch.cuda.synchronize()
 print("DRIVE_OK")

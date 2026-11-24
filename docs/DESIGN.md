@@ -421,6 +421,18 @@ would need `setmaxnreg`, which ptxas ignores here because taking the address of 
 tensor map inserts a call (§4.1); the descriptors would have to live in global memory instead. Left
 for a GPU with power headroom, where it would show (RESULTS.md §1).
 
+**Ablation (v0.9): bigger warp tiles do not fit.** The obvious way to space each warp's OMMAs further
+apart without a second warp on the scheduler is a 64 × 64 warp tile (4 MMA warps, one per scheduler, 32
+independent MMAs per k-step instead of 16, a quarter less shared-memory traffic per MMA). Built with
+`NVFP4_NVCC_FLAGS=-DNVFP4_WARPS_N=2`: 128 fp32 accumulators + double-buffered fragments + the scales of a
+k-tile need more than the 255 registers a thread can have, ptxas spills 1.3–1.6 KB per thread, and the
+kernel runs at half speed (8192³ at locked clocks: 10.9 ms, or 8.8 ms with 128-deep k-tiles, vs 4.4 ms;
+236–294 vs 457 TFLOPS at real clocks). `setmaxnreg` cannot raise a thread above 255 registers either, so
+with `mma.sync` and fp32 accumulation the 64 × 32 warp tile is the largest that keeps its fragments
+double-buffered; what cuBLASLt gains at locked clocks comes from instruction scheduling, not from a
+larger tile. At real clocks the gap does not exist: the kernel is ahead of cuBLASLt on every
+benchmarked shape on the desktop RTX 5090 (RESULTS.md §6).
+
 ### 4.3 Split-K for small output grids
 
 A wgrad GEMM with a small M×N, such as the 768×768 attention projection at d=768 (36 CTA tiles on 82
@@ -483,7 +495,8 @@ zero-filled copies, and stores are guarded. `K` must be a multiple of 128 (256 f
 | Layer | `tests/test_linear.py` | CUDA == emulated recipe (same seeds); cosine with full precision > 0.97–0.98; SR noise averages out; only NVFP4 tensors saved for backward (exact byte count); no-grad / frozen-weight / no-input-grad paths; fused wgrad accumulation == autograd bit for bit |
 | Robustness | `tests/test_robustness_cuda.py` | NaN / ±inf anywhere → non-finite outputs (quantize, dual, fused producers, GEMM, layers, gradients); clear errors on misuse; any leading shape incl. empty; fp32/bf16/fp16 and non-contiguous inputs; bf16 weights; state dict ↔ `nn.Linear`; activation checkpointing bit-exact; `torch.compile` == eager; CUDA-graph replay == eager; concurrent streams with split-K; DDP |
 | Integration | `tests/test_integration_cuda.py` | GPU seed tensors == integer seeds bit for bit (all four quantizers); no host sync in a training step; `torch.compile(fullgraph=True)` with no graph breaks, bit-identical to eager; CUDA-graph capture of fwd+bwd (fresh seeds per replay, noise averages out) and of a full Adam step (loss falls); fused accumulation in place with hooks firing, and under `torch.autograd.grad`; outputs not views; **two-process DDP (plain and bucket views), FSDP1 (flat and `use_orig_params`) and FSDP2** over gloo, fused and unfused, bit-exact vs a single-process reference; deterministic mode + flash attention reproduces a block's gradients bit for bit |
-| Memory / race safety | `tools/sanitize.sh` | compute-sanitizer memcheck, racecheck, synccheck, initcheck over every kernel variant (ragged shapes, TMA and cp.async loops, persistent grids with more units than SMs, split-K, accumulate, the bias / residual epilogue, all producer ops, multi-part inputs, the norm backward, GPU-resident seeds, layer and v0.8 block forward + backward): 0 findings |
+| 8-bit attention (v0.9) | `tests/test_attention_cuda.py` | operand quantizer **bit-exact** vs `reference.int8_token_quantize` / `mxfp8_quantize` (both layouts, σ order, scale layout, mean subtraction, padding, strided inputs, Delta); forward vs `reference.attention_8bit` (< 3%) and exact attention (< 5%); gradients vs exact attention (< 7%) for causal / full, GQA, N = 1…2048, D = 64 / 128, bf16 / fp16; backward bitwise deterministic; gradient layouts; NaN propagation; SDPA fallback; `torch.compile(fullgraph=True)` |
+| Memory / race safety | `tools/sanitize.sh` | compute-sanitizer memcheck, racecheck, synccheck, initcheck over every kernel variant (ragged shapes, TMA and cp.async loops, persistent grids with more units than SMs, split-K, accumulate, the bias / residual epilogue, all producer ops, multi-part inputs, the norm backward, GPU-resident seeds, layer and v0.8 block forward + backward, 8-bit attention forward + backward): 0 findings |
 | Long-run stability | `tools/soak.py` | 8 minutes (v0.7): 18,401 fused + unfused training iterations, 3,682 bit-exact gradient replays, 92,005 GEMMs re-checked bit for bit; 5 minutes (v0.8, residual-fused blocks): 14,474 iterations, 2,896 replays, 72,370 GEMMs; no non-finite values, no hang |
 | Packaging | wheel built and installed into an isolated directory | imports and trains from outside the repository |
 | Hardware ISA | CI `cuda-compile` job | `OMMA.SF.16864...UE4M3.4X` present in SASS |
@@ -493,6 +506,8 @@ Every benchmark checks correctness against the reference before it times anythin
 
 ## 6. Known limitations and next steps
 
+Done in v0.9: 8-bit attention (§7; item 2 of v0.8), the warp-tile ablation of the locked-clock gap
+(§4.2, item 1).
 Done in v0.8: residual adds, biases and the q / k / v hand-off fused (§3.6, item 2 of v0.7),
 SwiGLU gate / up biases and norm-free MLPs for post-norm blocks (item 5), a persistent GEMM with early
 refills that recovers about half of the locked-clock gap (§4.2, item 1), stochastic rounding at half
@@ -515,11 +530,13 @@ accumulation.
 1. **Locked-clock GEMM efficiency.** At equal clocks the TMA loop keeps the tensor pipe 71% busy vs
    cuBLASLt's ~90% (v0.7: 64%); what remains is per-warp OMMA issue spacing with two MMA warps per
    scheduler (§4.2). In practice it does not show: on a desktop RTX 5090 at full power the kernel is
-   1.03–1.71× cuBLASLt on every benchmarked shape, 1.03 PFLOPS at 8192³ (RESULTS.md §6). Closing it
-   would need cuBLASLt's warpgroup layout and `setmaxnreg` (tensor maps in global memory).
-2. **Attention itself** is PyTorch's BF16 SDPA (flash attention). The q / k / v hand-off and the
-   residual adds around it are fused (§3.6); attention-score quantization (FP8 / FP4 attention) is out
-   of scope.
+   1.03–1.71× cuBLASLt on every benchmarked shape, 1.03 PFLOPS at 8192³ (RESULTS.md §6). The larger warp
+   tile that would space the OMMAs out does not fit in 255 registers (v0.9 ablation, §4.2).
+2. **Attention** (v0.9: 8-bit, §7) reaches ~45% of the 8-bit tensor peak (FlashAttention-2: ~75% of
+   BF16's): the softmax arithmetic is exposed at 8-bit MMA speed. Next steps would be FlashAttention-4's
+   polynomial exp2 on the FMA pipe for part of the elements, and a deterministic dQ without the two
+   recomputed GEMMs (ordered accumulation as in FlashAttention-3's deterministic mode). Masks other
+   than causal, dropout and head dims other than 64 / 128 fall back to SDPA.
 3. **Stochastic rounding is still software** (sm_120a has no `cvt.rs`): one 32-bit hash per element
    pair, +34–43% on the plain dual quantizer.
 4. **Weight cache limits.** In-place writes through `param.data` outside an optimizer step cannot be
@@ -538,5 +555,79 @@ accumulation.
 7. **Platform.** Linux, WSL2 and native Windows build and pass the tests on the RTX 5090 Laptop, and
    Linux on the desktop RTX 5090 (CUDA 12.8, PyTorch 2.11). The smaller RTX 50 parts (5080 / 5070 /
    5060) share the architecture but have fewer SMs; the tile / split-K heuristics were tuned on the
-   82- and 170-SM parts. On Windows, inductor needs Triton, which PyTorch's Windows wheels don't
-   include.
+   82- and 170-SM parts (a rental attempt on 2026-11-24 found no RTX 5070 Ti / 5060 Ti / 5070 capacity
+   and five RTX 5080 hosts whose containers never started). The attention kernels need nothing
+   SM-count specific: two forward CTAs per SM fit the 100 KB of shared memory every sm_120 SM has. On
+   Windows, inductor needs Triton, which PyTorch's Windows wheels don't include.
+
+## 7. 8-bit attention (`csrc/attention.cu`, `nvfp4/attention.py`, v0.9)
+
+With the linear layers in NVFP4, attention became the largest BF16 cost: in a fused NVFP4 Llama block
+(d = 2048) PyTorch's flash attention took 13% of the training step at 512 tokens and 51% at 8192, running
+at 31–88 TFLOPS. The tensor-core rates that bound what an attention kernel can do on this GPU (measured,
+`mma.sync` throughput with every SM busy):
+
+| Instruction (m16n8k·) | TFLOPS / TOPS | vs BF16 |
+|---|---|---|
+| BF16 / FP16, FP32 accumulate | 121 | 1× |
+| FP16 / E4M3, FP16 accumulate; E4M3 unscaled, FP32 accumulate | 240 | 2× |
+| **E4M3 block-scaled (`kind::mxf8f6f4`, UE8M0 per 32), FP32 accumulate** | **438** | 3.6× |
+| **INT8, INT32 accumulate** | **473** | 3.9× |
+| NVFP4 / MXFP4 block-scaled | 914 | 7.5× |
+
+Consumer Blackwell runs FP8 with FP32 accumulation at full rate only on the block-scaled path, and
+INT8 at full rate. Attention probabilities and score gradients span many binades, so FP4 is no option
+for them; the design uses the two 8-bit paths, each where its number format fits:
+
+- **Q K^T and dO V^T in INT8, one FP32 scale per token** (over the whole head dim). These products
+  produce the scores and dP, whose absolute errors go straight into the softmax / dS. With operands
+  scaled to their row maximum, INT8's 7 bits carry 4× less error than E4M3's 3-bit mantissa (emulated
+  on random and peaked inputs: 0.8–1.9% vs 3.4–8.0% relative error in the output, the largest of all
+  error sources). K is centred by its per-channel mean over the sequence first, as in SageAttention:
+  a per-row constant in the scores, so the output is unchanged (and dK; dQ changes by
+  Σ_j dS_ij · mean(K) = 0), while channel offsets typical of keys leave the quantization range.
+- **P V, P^T dO, dS K, dS^T Q in MXFP8** (E4M3, UE8M0 scale per 32 elements of the reduction dim). P is
+  quantized as e4m3(2^7 p) with p ≤ 2^1.5 relative to the running row maximum (a fixed scale, as in
+  FlashAttention-3's FP8 path: values too small to represent are negligible next to the row maximum);
+  dS with a per-(row, 32-block) scale from its amax across the quad.
+
+**Layouts.** Each operand is quantized once (`attn_quant_kernel`, one read of the BF16 tensor) into a
+row layout (INT8 [N, D] + per-token scale) and, where a product reduces over the sequence, a col layout
+(E4M3 [D, N] with UE8M0 scales per 32 tokens). The forward quantizes Q, K, V into the layouts both passes
+need and saves them for backward (as much memory as the BF16 q, k, v SDPA saves); backward quantizes
+dO and computes Delta = rowsum(dO ∘ O) in the same pass. P and dS never leave registers: the C fragment
+of an m16n8 MMA gives thread t columns {2t, 2t+1} of each 8-column tile, while the A fragment of the
+k32 8-bit MMA wants k-indices {4t..4t+3, 16+4t..16+4t+3}. The sequence order inside a 32-block is free as
+long as the other operand follows it, so the col layout stores at position k the token
+σ(k) = 16⌊k/16⌋ + 8⌊(k mod 4)/2⌋ + 2⌊(k mod 16)/4⌋ + (k mod 2) — the token whose value the thread holds
+there. The col scales of a 64-token tile are stored so that each lane's are contiguous, and the MMA's
+byte selector picks the right one (no per-MMA scale loads).
+
+**Kernels.** Forward: CTAs of 128 queries, 4 warps of 32 rows, two CTAs per SM; each B fragment loaded
+from shared memory feeds two MMAs (at 16 rows per warp the operand loads took about half the
+shared-memory bandwidth the 8-bit MMAs leave), and the two CTAs' independent barriers let one's softmax
+overlap the other's tensor work (8–20% over one 8-warp CTA). Online softmax in the log2 domain with a
+lazily updated maximum (O is rescaled only when a row maximum grows by more than 1.5). The per-token
+scales are applied in the FMA that already forms the exponent, and INT32 → FP32 uses the magic-number
+add (an integer add on the full-rate pipe; I2F runs at a quarter of the FMA rate). Backward: two
+kernels without atomics, so gradients are **bitwise deterministic**: one per 128 queries
+(S, dP, dS, dQ) and one per 128 keys (S^T, dP^T, dV, dK, looping over the query heads of a GQA group,
+so dK / dV of shared heads are summed in registers). That costs two GEMMs more than FlashAttention-2's
+atomic dQ (7 instead of 5).
+
+**Accuracy and convergence.** Against exact attention on random inputs: output 3.3%, gradients
+4.5–5% relative error (BF16 flash attention: 0.2–0.3%). GPT-124M on TinyStories (3000 steps, seed 0)
+ends at the same validation loss: 1.4892 with BF16 linears (BF16 attention: 1.4892), 1.5095 with NVFP4
+linears (BF16 attention: 1.5073, +0.14%; the seed-to-seed spread of the BF16 baseline is 0.003).
+
+**Speed** (RESULTS.md §7). Forward 1.6–2.2× SDPA from 4k tokens (D = 128), forward + backward 1.4–1.5×
+(D = 64: 1.1–1.2×): the softmax arithmetic, exponentials and conversions that BF16 MMAs hide behind their
+own latency are exposed at 3.6× the MMA rate, and the kernels reach ~45% of the 8-bit tensor peak where
+FlashAttention-2 reaches ~75% of BF16's. A fused NVFP4 Llama block at d = 2048 trains 1.22× faster at
+8192 tokens and 1.35× at 16384 with it (2.27× BF16). Short sequences gain little (the quantization pass
+is a fixed cost per token).
+
+**Coverage.** Causal or full attention, GQA / MQA, any sequence length (padded internally to 128),
+head dims 64 and 128, bf16 / fp16, any strides with a unit stride along the head dim (gradients are
+returned in the inputs' layout when it is dense), `torch.compile` (custom ops). Other head dims,
+attention masks, dropout and fp32 fall back to SDPA. NaN in an input row propagates to that row.

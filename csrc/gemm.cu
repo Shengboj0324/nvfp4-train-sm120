@@ -68,8 +68,7 @@ __device__ __forceinline__ void load_stage(const Args& p, uint8_t* smem, int sta
   const int64_t ldab = p.K / 2;
   const int64_t ldsf = p.K / 16;
 #pragma unroll
-  for (int i = 0; i < 2; ++i) {  // 512 16-byte chunks per operand tile, 2 per thread
-    const int c = tid + i * THREADS;
+  for (int c = tid; c < BM * BKB / 16; c += THREADS) {  // 512 16-byte chunks per operand tile
     const int row = c >> 2, chunk = c & 3;
     {
       const int gm = m0 + row;
@@ -84,15 +83,17 @@ __device__ __forceinline__ void load_stage(const Args& p, uint8_t* smem, int sta
       cp_async16(smem_u32(sb + swz(row, chunk)), src, ok);
     }
   }
-  if (tid < BM) {
-    const int gm = m0 + tid;
-    const bool ok = gm < p.M;
-    cp_async8(smem_u32(ssfa + tid * SFK), p.sfa + (ok ? gm : 0) * ldsf + kt * SFK, ok);
-  } else {
-    const int r = tid - BM;
-    const int gn = n0 + r;
-    const bool ok = gn < p.N;
-    cp_async8(smem_u32(ssfb + r * SFK), p.sfb + (ok ? gn : 0) * ldsf + kt * SFK, ok);
+  for (int i = tid; i < BM + BN; i += THREADS) {  // one 8-byte scale row per thread and operand row
+    if (i < BM) {
+      const int gm = m0 + i;
+      const bool ok = gm < p.M;
+      cp_async8(smem_u32(ssfa + i * SFK), p.sfa + (ok ? gm : 0) * ldsf + kt * SFK, ok);
+    } else {
+      const int r = i - BM;
+      const int gn = n0 + r;
+      const bool ok = gn < p.N;
+      cp_async8(smem_u32(ssfb + r * SFK), p.sfb + (ok ? gn : 0) * ldsf + kt * SFK, ok);
+    }
   }
 }
 

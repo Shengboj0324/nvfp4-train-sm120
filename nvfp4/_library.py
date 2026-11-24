@@ -172,6 +172,27 @@ def _gemm_out_impl(a: Tensor, sfa: Tensor, gdec_a: Tensor, b: Tensor, sfb: Tenso
     _C.gemm(a, sfa, gdec_a, b, sfb, gdec_b, out.dtype, out, accumulate, impl, splits)
 
 
+def _attn_quant_impl(x: Tensor, mean: Optional[Tensor], o: Optional[Tensor], want_row: bool,
+                     want_col: bool) -> List[Tensor]:
+    require(x)
+    return list(_C.attn_quant(x, mean, o, want_row, want_col))
+
+
+def _attn_fwd_impl(q: Tensor, qs: Tensor, k: Tensor, ks: Tensor, vt: Tensor, vts: Tensor, N: int, causal: bool,
+                   scale: float, dtype: torch.dtype) -> List[Tensor]:
+    require(q)
+    return list(_C.attn_fwd(q, qs, k, ks, vt, vts, N, causal, scale, dtype))
+
+
+def _attn_bwd_impl(q: Tensor, qs: Tensor, qt: Tensor, qts: Tensor, k: Tensor, ks: Tensor, kt: Tensor, kts: Tensor,
+                   v: Tensor, vs: Tensor, g: Tensor, gs: Tensor, gt: Tensor, gts: Tensor, lse: Tensor, delta: Tensor,
+                   N: int, causal: bool, scale: float, dtype: torch.dtype, dq_stride: List[int],
+                   dk_stride: List[int]) -> List[Tensor]:
+    require(q)
+    return list(_C.attn_bwd(q, qs, qt, qts, k, ks, kt, kts, v, vs, g, gs, gt, gts, lse, delta, N, causal, scale,
+                            dtype, dq_stride, dk_stride))
+
+
 # --- custom ops (torch.compile) ----------------------------------------------------------------------
 
 _quantize_dual_op = torch.library.custom_op("nvfp4::quantize_dual", _quantize_dual_impl, mutates_args=())
@@ -192,6 +213,9 @@ _swiglu_backward_quantize_dual_op = torch.library.custom_op("nvfp4::swiglu_backw
 _norm_backward_op = torch.library.custom_op("nvfp4::norm_backward", _norm_backward_impl, mutates_args=())
 _gemm_op = torch.library.custom_op("nvfp4::gemm", _gemm_impl, mutates_args=())
 _gemm_out_op = torch.library.custom_op("nvfp4::gemm_out", _gemm_out_impl, mutates_args=("out",))
+_attn_quant_op = torch.library.custom_op("nvfp4::attn_quant", _attn_quant_impl, mutates_args=())
+_attn_fwd_op = torch.library.custom_op("nvfp4::attn_fwd", _attn_fwd_impl, mutates_args=())
+_attn_bwd_op = torch.library.custom_op("nvfp4::attn_bwd", _attn_bwd_impl, mutates_args=())
 
 
 def _dual_fake(x: Tensor, do_row: bool, do_col: bool, col_pad: int) -> _DUAL:
@@ -283,6 +307,53 @@ def _(a, sfa, gdec_a, b, sfb, gdec_b, out, accumulate, impl, splits):
     return None
 
 
+def _pad128(n: int) -> int:
+    return (n + 127) // 128 * 128
+
+
+@_attn_quant_op.register_fake
+def _(x, mean, o, want_row, want_col):
+    B, H, N, D = x.shape
+    Np, u8 = _pad128(N), torch.uint8
+    e = x.new_empty((0,), dtype=u8)
+    return [x.new_empty((B, H, Np, D), dtype=u8) if want_row else e,
+            x.new_empty((B, H, Np) if want_row else (0,), dtype=torch.float32),
+            x.new_empty((B, H, D, Np), dtype=u8) if want_col else e,
+            x.new_empty((B, H, Np // 64, 2 * D), dtype=u8) if want_col else e,
+            x.new_empty((B, H, Np) if o is not None else (0,), dtype=torch.float32)]
+
+
+@_attn_fwd_op.register_fake
+def _(q, qs, k, ks, vt, vts, N, causal, scale, dtype):
+    B, H, Np, D = q.shape
+    return [q.new_empty((B, N, H, D), dtype=dtype), q.new_empty((B, H, Np), dtype=torch.float32)]
+
+
+def _dense_strides(size: List[int], stride: List[int]) -> bool:
+    """True if (size, stride) is a non-overlapping layout without gaps (any dim order), as C++'s
+    is_non_overlapping_and_dense (not exposed in Python)."""
+    expect = 1
+    for n, st in sorted(((n, st) for n, st in zip(size, stride) if n != 1), key=lambda x: x[1]):
+        if st != expect:
+            return False
+        expect *= n
+    return True
+
+
+def _attn_grad_fake(q: Tensor, B: int, H: int, N: int, D: int, stride: List[int], dtype: torch.dtype) -> Tensor:
+    if len(stride) == 4 and stride[3] == 1 and _dense_strides([B, H, N, D], stride):
+        return torch.empty_strided((B, H, N, D), stride, dtype=dtype, device=q.device)
+    return q.new_empty((B, N, H, D), dtype=dtype).transpose(1, 2)
+
+
+@_attn_bwd_op.register_fake
+def _(q, qs, qt, qts, k, ks, kt, kts, v, vs, g, gs, gt, gts, lse, delta, N, causal, scale, dtype, dq_stride, dk_stride):
+    B, H, Np, D = q.shape
+    Hk = k.shape[1]
+    return [_attn_grad_fake(q, B, H, N, D, dq_stride, dtype), _attn_grad_fake(q, B, Hk, N, D, dk_stride, dtype),
+            _attn_grad_fake(q, B, Hk, N, D, dk_stride, dtype)]
+
+
 # --- dispatch: plain call in eager, custom op while compiling -------------------------------------------
 
 def _pick(impl, op):
@@ -305,3 +376,6 @@ swiglu_quantize_dual = _pick(_swiglu_quantize_dual_impl, _swiglu_quantize_dual_o
 swiglu_backward_quantize_dual = _pick(_swiglu_backward_quantize_dual_impl, _swiglu_backward_quantize_dual_op)
 gemm = _pick(_gemm_impl, _gemm_op)
 gemm_out = _pick(_gemm_out_impl, _gemm_out_op)
+attn_quant = _pick(_attn_quant_impl, _attn_quant_op)
+attn_fwd = _pick(_attn_fwd_impl, _attn_fwd_op)
+attn_bwd = _pick(_attn_bwd_impl, _attn_bwd_op)

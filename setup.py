@@ -25,11 +25,12 @@ if os.environ.get("NVFP4_SKIP_CUDA") != "1":
         CUDAExtension(
             name="nvfp4._C",
             sources=["csrc/bindings.cpp", "csrc/quantize.cu", "csrc/quantize_dual.cu", "csrc/gemm.cu", "csrc/gemm_tma.cu",
-                     "csrc/norm.cu"],
+                     "csrc/norm.cu", "csrc/attention.cu"],
             extra_compile_args={
                 "cxx": cxx,
                 "nvcc": ["-O3", "-std=c++20", f"-gencode=arch=compute_{arch},code=sm_{arch}",
-                         "--expt-relaxed-constexpr", "-lineinfo", "-Xptxas=-v,-warn-spills"] + host,
+                         "--expt-relaxed-constexpr", "-lineinfo", "-Xptxas=-v,-warn-spills"] + host
+                        + os.environ.get("NVFP4_NVCC_FLAGS", "").split(),  # ablations, e.g. -DNVFP4_WARPS_N=2
             },
         )
     ]

@@ -22,6 +22,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
+from nvfp4.attention import attention as attention_8bit
 from nvfp4.fused import layernorm_linear, layernorm_mlp
 from nvfp4.linear import NVFP4Linear, convert_linears
 
@@ -38,11 +39,17 @@ class Block(nn.Module):
         self.fc2 = nn.Linear(4 * d, d, bias=False)
         self.fused = False  # set by fuse_producers(): LayerNorm / GELU run inside the NVFP4 quantizers
         self.fused_residual = False  # also q / k / v chunks and the residual adds (fuse_producers(residual=True))
+        self.attn_8bit = False  # nvfp4.attention (INT8 scores, MXFP8 probabilities) instead of BF16 SDPA
+
+    def sdpa(self, q, k, v):
+        if self.attn_8bit:
+            return attention_8bit(q, k, v, causal=True)
+        return F.scaled_dot_product_attention(q, k, v, is_causal=True)
 
     def attend(self, q, k, v):
         b, t, d = q.shape
         q, k, v = (z.view(b, t, self.h, d // self.h).transpose(1, 2) for z in (q, k, v))
-        return F.scaled_dot_product_attention(q, k, v, is_causal=True).transpose(1, 2).reshape(b, t, d)
+        return self.sdpa(q, k, v).transpose(1, 2).reshape(b, t, d)
 
     def forward(self, x):
         b, t, d = x.shape
@@ -55,7 +62,7 @@ class Block(nn.Module):
         else:
             q, k, v = self.qkv(self.ln1(x)).split(d, dim=2)
         q, k, v = (z.view(b, t, self.h, d // self.h).transpose(1, 2) for z in (q, k, v))
-        a = F.scaled_dot_product_attention(q, k, v, is_causal=True)
+        a = self.sdpa(q, k, v)
         x = x + self.proj(a.transpose(1, 2).reshape(b, t, d))
         if self.fused:
             return x + layernorm_mlp(x, self.ln2, self.fc1, self.fc2)
@@ -146,6 +153,8 @@ def main():
                     help="accumulate NVFP4 weight grads across micro-batches inside the wgrad GEMM")
     ap.add_argument("--fuse-producers", action="store_true",
                     help="run LayerNorm / GELU (and its backward) inside the NVFP4 quantizers")
+    ap.add_argument("--attn", choices=["sdpa", "8bit"], default="sdpa",
+                    help="attention: BF16 SDPA, or nvfp4.attention (8-bit) in the NVFP4 blocks (all blocks in BF16 mode)")
     ap.add_argument("--seed", type=int, default=0)
     ap.add_argument("--data", default=os.environ.get("NVFP4_DATA", os.path.expanduser("~/nvfp4_data")))
     ap.add_argument("--out", required=True)
@@ -174,6 +183,9 @@ def main():
                                     wgrad_rht=not a.no_rht, fuse_wgrad_accumulation=a.fuse_wgrad)
         if a.fuse_producers:
             fuse_producers(model.blocks)
+    if a.attn == "8bit":
+        for i, blk in enumerate(model.blocks):
+            blk.attn_8bit = a.precision == "bf16" or i < a.layers - a.hp_last
     n_params = sum(p.numel() for p in model.parameters())
     opt = torch.optim.AdamW(model.parameters(), lr=a.lr, betas=(0.9, 0.95), weight_decay=0.1, fused=True)
     fwd = model

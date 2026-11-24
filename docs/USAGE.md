@@ -119,7 +119,31 @@ the same NVFP4 ops; gradients differ only in rounding (the fused path quantizes 
 where the unfused one rounds them to bf16 first). `experiments/train_gpt.py --fuse-producers` shows a
 full GPT model; `bench/bench_llama_block.py` a Llama-style block.
 
-### 3.3 Low-level ops
+### 3.3 Attention in 8 bits (v0.9)
+
+```python
+from nvfp4.attention import attention
+o = attention(q, k, v, causal=True)   # instead of F.scaled_dot_product_attention(q, k, v, is_causal=True)
+```
+
+q is [B, H, N, D], k and v [B, Hkv, N, D] (H a multiple of Hkv: grouped-query attention without
+repeating k / v), bf16 or fp16, head dim 64 or 128, any strides with a unit stride along D (the views
+`chunks=3` returns work as they are). Q K^T and dO V^T run on INT8 tensor cores with per-token scales,
+the products with probabilities and score gradients on MXFP8; softmax statistics and accumulation stay
+FP32 (DESIGN.md §7). The output is a [B, H, N, D] view of [B, N, H, D] memory, so
+`o.transpose(1, 2).reshape(B, N, H * D)` is free; gradients come back in the inputs' layouts when those
+are dense, else as the same kind of view. The backward is bitwise deterministic (no atomics), without
+`torch.use_deterministic_algorithms`. Anything it doesn't cover (other head dims, fp32, attention
+masks, dropout, a non-positive scale) falls back to `F.scaled_dot_product_attention`
+(`nvfp4.attention.supported(q, k, v)` tells which path a call takes).
+
+When to use it: it pays off from about 2k tokens per sequence with head dim 128 (forward + backward
+1.35–1.5× flash attention, 1.6–2.2× for the forward alone; 1.1–1.2× at head dim 64), and costs nothing
+measurable in quality on GPT-124M (RESULTS.md §7). Its errors are those of 8-bit operands (outputs ~3%,
+gradients ~5% relative to exact attention on random data, vs ~0.2% for BF16 flash attention), so, as for
+the linear layers, validate on your own model.
+
+### 3.4 Low-level ops
 
 ```python
 from nvfp4 import quantize, quantize_dual, gemm, norm_backward
@@ -138,7 +162,7 @@ sync, and changes on every CUDA-graph replay. Both give bit-identical results fo
 
 - **Bit-exact quantization.** Every quantizer (including the fused LayerNorm / GELU variants) is
   bit-identical to `nvfp4.reference`, the executable spec; the GEMM matches an fp64 reference to ~1e-7.
-- **Determinism.** With the same seed (`torch.manual_seed`), forward and backward are bit-reproducible,
+- **Determinism.** (`nvfp4.attention`'s backward is deterministic by construction.) With the same seed (`torch.manual_seed`), forward and backward are bit-reproducible,
   including stochastic rounding and split-K. The layers draw their rounding seeds from the CUDA
   generator, on the GPU. PyTorch's own flash / memory-efficient attention backward is *not*
   bit-reproducible by default (it accumulates dQ with atomics). For bitwise reproducible runs, set
@@ -176,7 +200,8 @@ sync, and changes on every CUDA-graph replay. Both give bit-identical results fo
 | DDP / FSDP | DDP, FSDP1 and FSDP2 tested (see §4), including fused wgrad accumulation. Pass FSDP2 a mesh built from your process group (`DeviceMesh.from_group`) when it isn't NCCL. PyTorch 2.7's FSDP2 sums gradients over gloo where 2.14 averages them (same for `nn.Linear`). |
 | Memory | Saved activations are NVFP4 (~0.56 bytes per element) instead of BF16; peak memory of a block step is 7–14% below BF16. |
 | Shapes | `in_features` / `out_features` must be multiples of 128. Token counts are arbitrary (padded internally). Very small layers (< 128 wide) should stay BF16. |
-| Fused blocks | GPT / BERT / ViT style (LayerNorm, tanh or exact GELU) and Llama style (RMSNorm, SwiGLU), pre- or post-norm, biases anywhere, residual adds fused. Attention itself stays PyTorch's BF16 SDPA; its output is quantized by `o_proj` as usual. |
+| Fused blocks | GPT / BERT / ViT style (LayerNorm, tanh or exact GELU) and Llama style (RMSNorm, SwiGLU), pre- or post-norm, biases anywhere, residual adds fused. Attention between them is yours: PyTorch's SDPA, or `nvfp4.attention` (§3.3). |
+| Attention | `nvfp4.attention` saves 8-bit copies of q, k, v in two layouts (as much memory as the BF16 tensors SDPA saves) plus the output; deterministic backward; `torch.compile` traces it as custom ops. |
 | Version changes | v0.8 changed the stochastic-rounding generator (one hash per element pair) and quantizes fp32 output gradients without first rounding them to bf16: gradients are not bit-identical to v0.7's for the same seed (forward results are). |
 | Precision recipe | Keep embeddings, the LM head and the last 1–2 blocks in BF16. Measured quality gap at 124M / 507M parameters: +1.0–1.4% validation loss, constant over training; at 124M over three seeds +0.019 ± 0.002 nats (+1.28%) (RESULTS.md §4–5). Validate on your own model before relying on it. |
 | Throughput | Gains grow with width: GPT block fwd+bwd 1.8× BF16 at d=768, 2.7× at d=2048, 3.2× at d=4096 (3.5× for micro-batches after the first with the weight cache); Llama block 2.1–3.3× (3.6×) on an RTX 5090 Laptop GPU. |
