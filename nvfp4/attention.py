@@ -1,11 +1,10 @@
 """MXFP8 flash attention for sm_120 (forward and a deterministic backward), a drop-in for causal or full
 ``F.scaled_dot_product_attention`` in training.
 
-All five attention matrix products (Q K^T and P V forward; dO V^T, P^T dO, dS^T Q, dS K and the recomputed
-Q K^T backward) run on the block-scaled FP8 tensor-core path: E4M3 operands with one power-of-two scale per 32
-elements of the reduction dimension (MXFP8), FP32 accumulation. On an RTX 5090 that path has 3.6x the
-throughput of BF16 with FP32 accumulation. Softmax statistics, the online rescaling and every reduction stay
-in FP32. K is centred by its per-channel mean over the sequence before quantization (``smooth_k``), which
+Q K^T and dO V^T run on INT8 tensor cores with per-token scales; P V, P^T dO and dS^T Q on block-scaled FP8
+(E4M3 with one power-of-two scale per 32 elements, MXFP8); dQ = dS K, which cancels to a small difference of
+large terms, in BF16. All with FP32 accumulation; softmax statistics, the online rescaling and every reduction
+stay in FP32. K is centred by its per-channel mean over the sequence before quantization (``smooth_k``), which
 leaves the attention output unchanged (a per-row constant in the scores) and its gradients too, but takes the
 channel offsets typical of keys out of the quantization range.
 
@@ -48,23 +47,24 @@ class _AttentionFn(torch.autograd.Function):
         N = q.shape[2]
         grad = any(ctx.needs_input_grad[:3])
         kmean = k.mean(dim=2, dtype=torch.float32) if smooth_k else None
-        q8, qs, qt, qts, _ = _lib.attn_quant(q, None, None, True, grad)
-        k8, ks, kt, kts, _ = _lib.attn_quant(k, kmean, None, True, grad)
-        v8, vs, vt, vts, _ = _lib.attn_quant(v, None, None, grad, True)
+        q8, qs, qt, qts, _, _ = _lib.attn_quant(q, None, None, True, grad, False)
+        # K: INT8 rows, plus (for dQ = dS K, done in BF16) a BF16 copy, both centred by the mean
+        k8, ks, kt, kts, _, k16 = _lib.attn_quant(k, kmean, None, True, grad, grad)
+        v8, vs, vt, vts, _, _ = _lib.attn_quant(v, None, None, grad, True, False)
         o, lse = _lib.attn_fwd(q8, qs, k8, ks, vt, vts, N, causal, scale, q.dtype)
         o = o.transpose(1, 2)
         if grad:
-            ctx.save_for_backward(q8, qs, qt, qts, k8, ks, kt, kts, v8, vs, o, lse)
-        ctx.cfg = (N, causal, scale, list(q.stride()), list(k.stride()))
+            ctx.save_for_backward(q8, qs, qt, qts, k8, ks, kt, kts, k16, v8, vs, o, lse)
+        ctx.cfg = (N, causal, scale, list(q.stride()), list(k.stride()), q.dtype)
         return o
 
     @staticmethod
     def backward(ctx, do):
-        q8, qs, qt, qts, k8, ks, kt, kts, v8, vs, o, lse = ctx.saved_tensors
-        N, causal, scale, q_stride, k_stride = ctx.cfg
-        g8, gs, gt, gts, delta = _lib.attn_quant(do.to(o.dtype), None, o, True, True)
-        dq, dk, dv = _lib.attn_bwd(q8, qs, qt, qts, k8, ks, kt, kts, v8, vs, g8, gs, gt, gts, lse, delta, N, causal,
-                                   scale, o.dtype, q_stride, k_stride)
+        q8, qs, qt, qts, k8, ks, kt, kts, k16, v8, vs, o, lse = ctx.saved_tensors
+        N, causal, scale, q_stride, k_stride, dtype = ctx.cfg
+        g8, gs, gt, gts, delta, _ = _lib.attn_quant(do.to(dtype), None, o, True, True, False)
+        dq, dk, dv = _lib.attn_bwd(q8, qs, qt, qts, k8, ks, kt, kts, k16, v8, vs, g8, gs, gt, gts, lse, delta, N,
+                                   causal, scale, dtype, q_stride, k_stride)
         return dq, dk, dv, None, None, None
 
 

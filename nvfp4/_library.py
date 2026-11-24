@@ -173,9 +173,9 @@ def _gemm_out_impl(a: Tensor, sfa: Tensor, gdec_a: Tensor, b: Tensor, sfb: Tenso
 
 
 def _attn_quant_impl(x: Tensor, mean: Optional[Tensor], o: Optional[Tensor], want_row: bool,
-                     want_col: bool) -> List[Tensor]:
+                     want_col: bool, want_bf16: bool) -> List[Tensor]:
     require(x)
-    return list(_C.attn_quant(x, mean, o, want_row, want_col))
+    return list(_C.attn_quant(x, mean, o, want_row, want_col, want_bf16))
 
 
 def _attn_fwd_impl(q: Tensor, qs: Tensor, k: Tensor, ks: Tensor, vt: Tensor, vts: Tensor, N: int, causal: bool,
@@ -185,11 +185,11 @@ def _attn_fwd_impl(q: Tensor, qs: Tensor, k: Tensor, ks: Tensor, vt: Tensor, vts
 
 
 def _attn_bwd_impl(q: Tensor, qs: Tensor, qt: Tensor, qts: Tensor, k: Tensor, ks: Tensor, kt: Tensor, kts: Tensor,
-                   v: Tensor, vs: Tensor, g: Tensor, gs: Tensor, gt: Tensor, gts: Tensor, lse: Tensor, delta: Tensor,
-                   N: int, causal: bool, scale: float, dtype: torch.dtype, dq_stride: List[int],
+                   k16: Tensor, v: Tensor, vs: Tensor, g: Tensor, gs: Tensor, gt: Tensor, gts: Tensor, lse: Tensor,
+                   delta: Tensor, N: int, causal: bool, scale: float, dtype: torch.dtype, dq_stride: List[int],
                    dk_stride: List[int]) -> List[Tensor]:
     require(q)
-    return list(_C.attn_bwd(q, qs, qt, qts, k, ks, kt, kts, v, vs, g, gs, gt, gts, lse, delta, N, causal, scale,
+    return list(_C.attn_bwd(q, qs, qt, qts, k, ks, kt, kts, k16, v, vs, g, gs, gt, gts, lse, delta, N, causal, scale,
                             dtype, dq_stride, dk_stride))
 
 
@@ -312,7 +312,7 @@ def _pad128(n: int) -> int:
 
 
 @_attn_quant_op.register_fake
-def _(x, mean, o, want_row, want_col):
+def _(x, mean, o, want_row, want_col, want_bf16):
     B, H, N, D = x.shape
     Np, u8 = _pad128(N), torch.uint8
     e = x.new_empty((0,), dtype=u8)
@@ -320,7 +320,8 @@ def _(x, mean, o, want_row, want_col):
             x.new_empty((B, H, Np) if want_row else (0,), dtype=torch.float32),
             x.new_empty((B, H, D, Np), dtype=u8) if want_col else e,
             x.new_empty((B, H, Np // 64, 2 * D), dtype=u8) if want_col else e,
-            x.new_empty((B, H, Np) if o is not None else (0,), dtype=torch.float32)]
+            x.new_empty((B, H, Np) if o is not None else (0,), dtype=torch.float32),
+            x.new_empty((B, H, Np, D) if want_bf16 else (0,), dtype=torch.bfloat16)]
 
 
 @_attn_fwd_op.register_fake
@@ -347,7 +348,8 @@ def _attn_grad_fake(q: Tensor, B: int, H: int, N: int, D: int, stride: List[int]
 
 
 @_attn_bwd_op.register_fake
-def _(q, qs, qt, qts, k, ks, kt, kts, v, vs, g, gs, gt, gts, lse, delta, N, causal, scale, dtype, dq_stride, dk_stride):
+def _(q, qs, qt, qts, k, ks, kt, kts, k16, v, vs, g, gs, gt, gts, lse, delta, N, causal, scale, dtype, dq_stride,
+      dk_stride):
     B, H, Np, D = q.shape
     Hk = k.shape[1]
     return [_attn_grad_fake(q, B, H, N, D, dq_stride, dtype), _attn_grad_fake(q, B, Hk, N, D, dk_stride, dtype),

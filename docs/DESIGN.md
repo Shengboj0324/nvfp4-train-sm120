@@ -532,11 +532,14 @@ accumulation.
    scheduler (§4.2). In practice it does not show: on a desktop RTX 5090 at full power the kernel is
    1.03–1.71× cuBLASLt on every benchmarked shape, 1.03 PFLOPS at 8192³ (RESULTS.md §6). The larger warp
    tile that would space the OMMAs out does not fit in 255 registers (v0.9 ablation, §4.2).
-2. **Attention** (v0.9: 8-bit, §7) reaches ~45% of the 8-bit tensor peak (FlashAttention-2: ~75% of
-   BF16's): the softmax arithmetic is exposed at 8-bit MMA speed. Next steps would be FlashAttention-4's
-   polynomial exp2 on the FMA pipe for part of the elements, and a deterministic dQ without the two
-   recomputed GEMMs (ordered accumulation as in FlashAttention-3's deterministic mode). Masks other
-   than causal, dropout and head dims other than 64 / 128 fall back to SDPA.
+2. **Attention** (v0.9: 8-bit, §7). The forward is 1.6–2.2× flash attention; in training, forward +
+   backward gains only 1.14–1.18× at D = 128 once dQ is computed accurately, and at 4096 tokens the loss
+   is 0.5% higher than with BF16 attention. Ways forward: an 8-bit forward with an exact BF16 backward
+   (most of the speed of the forward, little of the error), V in INT8 per token (V in MXFP8 is the
+   largest forward error), FlashAttention-4's polynomial exp2 on the FMA pipe, and a deterministic dQ
+   without the recomputed products (ordered accumulation, as in FlashAttention-3's deterministic mode).
+   Masks other than causal, packed sequences, dropout and head dims other than 64 / 128 fall back to
+   SDPA.
 3. **Stochastic rounding is still software** (sm_120a has no `cvt.rs`): one 32-bit hash per element
    pair, +34–43% on the plain dual quantizer.
 4. **Weight cache limits.** In-place writes through `param.data` outside an optimizer step cannot be
@@ -586,16 +589,26 @@ for them; the design uses the two 8-bit paths, each where its number format fits
   error sources). K is centred by its per-channel mean over the sequence first, as in SageAttention:
   a per-row constant in the scores, so the output is unchanged (and dK; dQ changes by
   Σ_j dS_ij · mean(K) = 0), while channel offsets typical of keys leave the quantization range.
-- **P V, P^T dO, dS K, dS^T Q in MXFP8** (E4M3, UE8M0 scale per 32 elements of the reduction dim). P is
+- **P V, P^T dO, dS^T Q in MXFP8** (E4M3, UE8M0 scale per 32 elements of the reduction dim). P is
   quantized as e4m3(2^7 p) with p ≤ 2^1.5 relative to the running row maximum (a fixed scale, as in
   FlashAttention-3's FP8 path: values too small to represent are negligible next to the row maximum);
   dS with a per-(row, 32-block) scale from its amax across the quad.
+- **dQ = dS K in BF16** (v0.9.1), against a mean-centred BF16 copy of K. Every row of dS sums to zero
+  (softmax), so dQ is a small difference of large terms; dK = dS^T Q sums over queries, where no such
+  constraint holds. On activations of a trained model at 4096 tokens, dQ in MXFP8 had 7–24% relative
+  error (dS and K quantization each 5–18% alone, emulated), dK and dV 2–3%; in BF16 the product itself
+  adds 0.5–1.4%. A second effect: Delta = rowsum(dO ∘ O) uses the 8-bit forward's O (~2% off), so the
+  rows of dS = P (dP − Delta) sum to r_i ≠ 0, which dQ, a sum over all keys, amplified to another 4–14%.
+  The dQ kernel therefore also accumulates r_i and B_i = Σ_j P_ij K_j (one cheap MXFP8 product; r is small,
+  so B needs little precision) and returns dQ_i − r_i B_i, exactly the result of the consistent
+  Delta' = rowsum(P dP) without a second pass over the keys. dQ error on those activations: 0.5–1.5%.
 
 **Layouts.** Each operand is quantized once (`attn_quant_kernel`, one read of the BF16 tensor) into a
 row layout (INT8 [N, D] + per-token scale) and, where a product reduces over the sequence, a col layout
 (E4M3 [D, N] with UE8M0 scales per 32 tokens). The forward quantizes Q, K, V into the layouts both passes
 need and saves them for backward (as much memory as the BF16 q, k, v SDPA saves); backward quantizes
-dO and computes Delta = rowsum(dO ∘ O) in the same pass. P and dS never leave registers: the C fragment
+dO and computes Delta = rowsum(dO ∘ O) in the same pass; K also gets a mean-centred BF16 copy for the dQ
+product. P and dS never leave registers: the C fragment
 of an m16n8 MMA gives thread t columns {2t, 2t+1} of each 8-column tile, while the A fragment of the
 k32 8-bit MMA wants k-indices {4t..4t+3, 16+4t..16+4t+3}. The sequence order inside a 32-block is free as
 long as the other operand follows it, so the col layout stores at position k the token
@@ -611,21 +624,31 @@ lazily updated maximum (O is rescaled only when a row maximum grows by more than
 scales are applied in the FMA that already forms the exponent, and INT32 → FP32 uses the magic-number
 add (an integer add on the full-rate pipe; I2F runs at a quarter of the FMA rate). Backward: two
 kernels without atomics, so gradients are **bitwise deterministic**: one per 128 queries
-(S, dP, dS, dQ) and one per 128 keys (S^T, dP^T, dV, dK, looping over the query heads of a GQA group,
-so dK / dV of shared heads are summed in registers). That costs two GEMMs more than FlashAttention-2's
-atomic dQ (7 instead of 5).
+(S, dP, dS, dQ in BF16, P K) and one per 128 keys (S^T, dP^T, dV, dK, looping over the query heads of a
+GQA group, so dK / dV of shared heads are summed in registers). That costs three products more than
+FlashAttention-2's atomic dQ (8 instead of 5, one of them BF16).
 
 **Accuracy and convergence.** Against exact attention on random inputs: output 3.3%, gradients
-4.5–5% relative error (BF16 flash attention: 0.2–0.3%). GPT-124M on TinyStories (3000 steps, seed 0)
-ends at the same validation loss: 1.4892 with BF16 linears (BF16 attention: 1.4892), 1.5095 with NVFP4
-linears (BF16 attention: 1.5073, +0.14%; the seed-to-seed spread of the BF16 baseline is 0.003).
+4.5–5% relative error (BF16 flash attention: 0.2–0.3%); on a trained model's activations (GPT-124M, 4096
+tokens): output 1.1–2.5%, dQ 0.5–1.5%, dK 2.6–3.9%, dV 2.3–3.0%. GPT-124M on TinyStories, 3000 steps
+(RESULTS.md §7):
+- at 512 tokens per sequence (12 heads of 64, seed 0, before the dQ fix): the same validation loss as
+  BF16 attention (1.4892 vs 1.4892 with BF16 linears; 1.5095 vs 1.5073 with NVFP4 linears);
+- at 4096 tokens (6 heads of 128, NVFP4 linears, seeds 0 and 1): **+0.52%** (1.6088 / 1.6033 vs 1.6027 /
+  1.5928), down from +0.72% before the dQ fix. The rest is spread over the forward (V in MXFP8 is its
+  largest term) and dK / dV; no single source dominates any more.
 
-**Speed** (RESULTS.md §7). Forward 1.6–2.2× SDPA from 4k tokens (D = 128), forward + backward 1.4–1.5×
-(D = 64: 1.1–1.2×): the softmax arithmetic, exponentials and conversions that BF16 MMAs hide behind their
-own latency are exposed at 3.6× the MMA rate, and the kernels reach ~45% of the 8-bit tensor peak where
-FlashAttention-2 reaches ~75% of BF16's. A fused NVFP4 Llama block at d = 2048 trains 1.22× faster at
-8192 tokens and 1.35× at 16384 with it (2.27× BF16). Short sequences gain little (the quantization pass
-is a fixed cost per token).
+So at long context 8-bit attention is not free in quality: it adds about half the loss gap the NVFP4
+linears themselves cost (+1.3%, §2 / RESULTS.md §4.1). Use it where its speed matters and validate.
+
+**Speed** (RESULTS.md §7). Forward 1.6–2.2× SDPA from 4k tokens (D = 128; D = 64: 1.4–1.9×): the forward
+is where 8-bit attention pays (inference, evaluation). Forward + backward 1.14–1.18× (D = 128) and about
+even at D = 64: the BF16 dQ product and the correction cost the backward most of its 8-bit advantage
+(before the fix: 1.4–1.5×, with the accuracy problem above). The softmax arithmetic, exponentials and
+conversions that BF16 MMAs hide behind their own latency are exposed at 3.6× the MMA rate, and the 8-bit
+kernels reach ~45% of the 8-bit tensor peak where FlashAttention-2 reaches ~75% of BF16's. A fused NVFP4
+Llama block at d = 2048 trains 1.06× faster at 8192 tokens and 1.11× at 16384 with it (1.88× BF16);
+GPT-124M at 4096 tokens trains at the same speed.
 
 **Coverage.** Causal or full attention, GQA / MQA, any sequence length (padded internally to 128),
 head dims 64 and 128, bf16 / fp16, any strides with a unit stride along the head dim (gradients are

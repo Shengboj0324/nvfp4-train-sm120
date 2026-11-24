@@ -1,5 +1,20 @@
 # Changelog
 
+## 0.9.1 — accurate dQ in 8-bit attention, soak coverage (2026-11-24)
+
+- **Fix: dQ of `nvfp4.attention`** was 7–24% off on a trained model's activations at 4096 tokens (dK, dV:
+  2–3%), costing +0.72% validation loss on GPT-124M at that context. Two causes, both from cancellation
+  (every row of dS sums to zero, so dQ is a small difference of large terms): the MXFP8 product dS K, and
+  Delta = rowsum(dO O) taken from the 8-bit forward's O. dQ is now computed in BF16 against a mean-centred
+  BF16 copy of K, with a correction (dQ − r B, B = P K in MXFP8, r the row sums of dS) that equals the
+  consistent Delta' = rowsum(P dP): dQ error 0.5–1.5%, loss gap at 4096 tokens +0.52% (2 seeds). Forward
+  unchanged (1.6–2.2× flash attention); forward + backward now 1.14–1.18× (was 1.4–1.5×). The docs now
+  say where 8-bit attention pays and where it costs quality (DESIGN.md §7, RESULTS.md §7, USAGE.md §3.3).
+- `tools/soak.py` covers 8-bit attention (a block with it, a GQA head-dim-128 replay check, the
+  CUDA-graph block). Long-context convergence scripts `experiments/run_attn8_long*.sh`.
+- The attention kernels' host launchers are plain templates (MSVC crashed on the nvcc stub of the 0.9.0
+  version's generic lambdas; the Windows CI build of 0.9.0 is fixed by this).
+
 ## 0.9.0 — 8-bit flash attention (2026-11-24)
 
 - **`nvfp4.attention`**: forward and backward attention kernels for sm_120 (DESIGN.md §7). Q K^T and

@@ -137,11 +137,13 @@ are dense, else as the same kind of view. The backward is bitwise deterministic 
 masks, dropout, a non-positive scale) falls back to `F.scaled_dot_product_attention`
 (`nvfp4.attention.supported(q, k, v)` tells which path a call takes).
 
-When to use it: it pays off from about 2k tokens per sequence with head dim 128 (forward + backward
-1.35–1.5× flash attention, 1.6–2.2× for the forward alone; 1.1–1.2× at head dim 64), and costs nothing
-measurable in quality on GPT-124M (RESULTS.md §7). Its errors are those of 8-bit operands (outputs ~3%,
-gradients ~5% relative to exact attention on random data, vs ~0.2% for BF16 flash attention), so, as for
-the linear layers, validate on your own model.
+When to use it: the forward is 1.6–2.2× flash attention from 4k tokens (inference, evaluation, or any
+forward-heavy use). In training, forward + backward is 1.14–1.18× at head dim 128 and about even at 64,
+and the quality cost grows with the context: none measurable on GPT-124M at 512 tokens, +0.5% validation
+loss at 4096 (RESULTS.md §7). Its errors are those of 8-bit operands (outputs ~2–3%, gradients 1–4%
+relative to exact attention, vs ~0.2% for BF16 flash attention). For long-context training, keep BF16
+attention unless the measured speed gain matters to you and you have validated the quality cost on your
+model.
 
 ### 3.4 Low-level ops
 

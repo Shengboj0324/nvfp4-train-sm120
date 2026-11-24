@@ -7,9 +7,13 @@
 //       mma.sync.aligned.m16n8k32.row.col.s32.s8.s8.s32
 //     4x smaller errors than E4M3 at the same speed (E4M3's 3-bit mantissa vs INT8's 7 bits on data
 //     scaled to its row maximum; K is centred by its mean over the sequence first);
-//   - the products with probabilities / score gradients, P V, P^T dO, dS K, dS^T Q, in MXFP8 (E4M3 with one
+//   - the products with probabilities / score gradients, P V, P^T dO, dS^T Q, in MXFP8 (E4M3 with one
 //     power-of-two UE8M0 scale per 32 elements of the reduction dim; P and dS span many binades):
 //       mma.sync.aligned.kind::mxf8f6f4.block_scale.scale_vec::1X.m16n8k32.row.col.f32.e4m3.e4m3.f32.ue8m0
+//   - dQ = dS K in BF16 (m16n8k16, FP32 accumulation), against a mean-centred BF16 copy of K: every row of dS
+//     sums to zero, so dQ is a small difference of large terms and the 8-bit errors of dS and K survived the
+//     cancellation (12-24% relative error in dQ on trained-model activations at 4096 tokens, 0.5-1.4% in BF16;
+//     docs/DESIGN.md §7). dK = dS^T Q sums over queries, where no such constraint holds, and stays 8-bit.
 //
 // Operands are quantized once by attn_quant_kernel, in two layouts per tensor:
 //   row   X8 [BH, Np, D] int8, scales [BH, Np] fp32          per token (QK^T, dO V^T operands)
@@ -33,10 +37,18 @@
 // FlashAttention-3's FP8 path).
 // Backward: two kernels and no atomics (bitwise deterministic), FlashAttention-2's math with dQ split off
 // (two GEMMs more than with atomics, the price of determinism):
-//   attn_dq_kernel    per 128 queries:  S = Q K^T, dP = dO V^T, dS = P (dP - Delta), dQ += dS K
+//   attn_dq_kernel    per 128 queries:  S = Q K^T, dP = dO V^T, dS = P (dP - Delta), dQ += dS K (BF16),
+//                                       B += P K (MXFP8), r += rowsum(dS); dQ - r B at the end (below)
 //   attn_dkdv_kernel  per 128 keys:     S^T = K Q^T, dP^T = V dO^T, dV += P^T dO, dK += dS^T Q
 //                                       (looping over the query heads of a GQA group as well)
 // dS is quantized with a per-(row, 32-block) UE8M0 scale computed from its amax across the quad.
+// Delta = rowsum(dO O) comes from the 8-bit forward's O (~2% off), so it is not quite the row sum of P dP as
+// the backward computes them, and every row of dS = P (dP - Delta) then sums to r_i != 0 instead of zero. In
+// dQ = dS K, a sum over all keys, that offset turned into 4-14% error at 4096 tokens on trained-model
+// activations. The dQ kernel therefore also accumulates r_i and B_i = sum_j P_ij K_j and returns
+// dQ_i - r_i B_i, which is exactly what the consistent Delta' = rowsum(P dP) = Delta + r_i gives. r is small,
+// so B needs little precision: one MXFP8 product (P e4m3, K col layout) instead of a second pass over S and dP
+// (dQ error ~1%; docs/DESIGN.md §7). dK and dV use Delta as is (2-3%).
 
 #include <ATen/cuda/CUDAContext.h>
 #include <c10/cuda/CUDAGuard.h>
@@ -148,6 +160,8 @@ template <int RB>
 __device__ __forceinline__ uint32_t swz(int r, int c) {
   if constexpr (RB == 128) {
     return r * 128 + ((c ^ (r & 7)) << 4);
+  } else if constexpr (RB == 256) {
+    return r * 256 + ((c ^ (r & 7)) << 4);
   } else if constexpr (RB == 64) {
     return r * 64 + ((c ^ ((r >> 1) & 3)) << 4);
   } else {
@@ -195,6 +209,21 @@ __device__ __forceinline__ void mma_s8(int (&d)[4], const uint32_t (&a)[4], uint
       "mma.sync.aligned.m16n8k32.row.col.s32.s8.s8.s32 {%0,%1,%2,%3}, {%4,%5,%6,%7}, {%8,%9}, {%0,%1,%2,%3};\n"
       : "+r"(d[0]), "+r"(d[1]), "+r"(d[2]), "+r"(d[3])
       : "r"(a[0]), "r"(a[1]), "r"(a[2]), "r"(a[3]), "r"(b0), "r"(b1));
+}
+__device__ __forceinline__ void mma_bf16(float (&d)[4], const uint32_t (&a)[4], uint32_t b0, uint32_t b1) {
+  asm volatile(
+      "mma.sync.aligned.m16n8k16.row.col.f32.bf16.bf16.f32 {%0,%1,%2,%3}, {%4,%5,%6,%7}, {%8,%9}, {%0,%1,%2,%3};\n"
+      : "+f"(d[0]), "+f"(d[1]), "+f"(d[2]), "+f"(d[3])
+      : "r"(a[0]), "r"(a[1]), "r"(a[2]), "r"(a[3]), "r"(b0), "r"(b1));
+}
+__device__ __forceinline__ void ldsm4t(uint32_t addr, uint32_t& r0, uint32_t& r1, uint32_t& r2, uint32_t& r3) {
+  asm volatile("ldmatrix.sync.aligned.m8n8.x4.trans.shared.b16 {%0,%1,%2,%3}, [%4];\n"
+               : "=r"(r0), "=r"(r1), "=r"(r2), "=r"(r3)
+               : "r"(addr));
+}
+__device__ __forceinline__ uint32_t pack_bf16(float lo, float hi) {
+  const __nv_bfloat162 v = __floats2bfloat162_rn(lo, hi);
+  return *reinterpret_cast<const uint32_t*>(&v);
 }
 __device__ __forceinline__ float2 lds_f32x2(uint32_t addr) {
   float2 v;
@@ -369,6 +398,7 @@ struct QuantArgs {
   u8 *row, *col, *col_s;
   float* row_s;  // [B * Hx, Np] per-token scales of the int8 row layout
   float* delta;  // [B * Hx, Np] if o
+  __nv_bfloat16* raw;  // optional [B * Hx, Np, D]: BF16 of the (mean-subtracted) input, zero padding
   int Hx, N, Np;
 };
 
@@ -417,6 +447,11 @@ __global__ void __launch_bounds__(THREADS) attn_quant_kernel(QuantArgs a) {
     }
 #pragma unroll
     for (int k = 0; k < 8; ++k) tile[r][c + k] = v[k];
+    if (a.raw != nullptr) {
+      uint4 w;
+      w.x = pack_bf16(v[0], v[1]), w.y = pack_bf16(v[2], v[3]), w.z = pack_bf16(v[4], v[5]), w.w = pack_bf16(v[6], v[7]);
+      *reinterpret_cast<uint4*>(a.raw + (static_cast<int64_t>(bh) * a.Np + n) * D + c) = w;
+    }
     // the V threads of a row are consecutive lanes
     if (a.delta != nullptr) {
 #pragma unroll
@@ -701,10 +736,12 @@ __global__ void __launch_bounds__(32 * WARPS, 8 / WARPS) attn_fwd_kernel(FwdArgs
 
 struct BwdArgs {
   const u8 *q, *qt, *qts;           // Q, row + col layouts [B * H]
-  const u8 *k, *kt, *kts;           // K (mean-subtracted) [B * Hk]
+  const u8* k;                      // K (mean-subtracted) [B * Hk], int8 row layout
+  const __nv_bfloat16* k16;         // the same in BF16 [B * Hk, Np, D] (dQ = dS K)
   const u8* v;                      // V row layout [B * Hk]
   const u8 *g, *gt, *gts;           // dO, row + col layouts [B * H]
   const float *qs, *ks, *vs, *gs;   // per-token scales of the row layouts
+  const u8 *kt, *kts;               // K, col layout (B = P K in the dQ kernel)
   const float *lse, *delta;         // [B * H, Np]
   void *dq, *dk, *dv;               // [B, H(k), N, D] with element strides below
   int64_t dq_sb, dq_sh, dq_sn, dk_sb, dk_sh, dk_sn;  // dv has dk's strides
@@ -720,8 +757,8 @@ struct DqCfg {
   static constexpr int NTH = 32 * W, BQ = 16 * W;  // queries per CTA
   // (the value scales are read from global memory / L1: with them in shared memory the W = 4 kernel would need
   // 512 bytes more than two CTAs per SM can have)
-  static constexpr int K = 0, KSC = K + 64 * D, V = KSC + 256, KT = V + 64 * D, KTS = KT + D * 64,
-                       STAGE = KTS + 2 * D;
+  static constexpr int K = 0, KSC = K + 64 * D, V = KSC + 256, K16 = V + 64 * D, KT = K16 + 64 * D * 2,
+                       KTS = KT + D * 64, STAGE = KTS + 2 * D;
   static constexpr bool kStaged = 2 * BQ * D <= STAGE;
   static constexpr int STAGE0 = kStaged ? 0 : 2 * BQ * D;
   static constexpr int QOFF = kStaged ? STAGE : 0;  // query tile, then dO tile
@@ -742,6 +779,7 @@ __global__ void __launch_bounds__(32 * W, 8 / W) attn_dq_kernel(BwdArgs p) {
   const float* ksg = p.ks + static_cast<int64_t>(bhk) * p.Np;
   const u8* vg = p.v + static_cast<int64_t>(bhk) * p.Np * D;
   const float* vsg = p.vs + static_cast<int64_t>(bhk) * p.Np;
+  const u8* k16g = reinterpret_cast<const u8*>(p.k16 + static_cast<int64_t>(bhk) * p.Np * D);
   const u8* ktg = p.kt + static_cast<int64_t>(bhk) * D * p.Np;
   const u8* ktsg = p.kts + static_cast<int64_t>(bhk) * (p.Np / 64) * (2 * D);
   const int nkeys = p.causal ? min(p.N, q0 + C::BQ) : p.N;
@@ -752,6 +790,7 @@ __global__ void __launch_bounds__(32 * W, 8 / W) attn_dq_kernel(BwdArgs p) {
     load_tile<D, 64, NTH>(st + C::K, kg + static_cast<int64_t>(j) * 64 * D, D);
     load_raw<256, NTH>(st + C::KSC, reinterpret_cast<const u8*>(ksg + j * 64));
     load_tile<D, 64, NTH>(st + C::V, vg + static_cast<int64_t>(j) * 64 * D, D);
+    load_tile<2 * D, 64, NTH>(st + C::K16, k16g + static_cast<int64_t>(j) * 64 * D * 2, 2 * D);
     load_tile<64, D, NTH>(st + C::KT, ktg + j * 64, p.Np);
     load_raw<2 * D, NTH>(st + C::KTS, ktsg + static_cast<int64_t>(j) * 2 * D);
   };
@@ -774,9 +813,12 @@ __global__ void __launch_bounds__(32 * W, 8 / W) attn_dq_kernel(BwdArgs p) {
   const float gc[2] = {p.gs[rbase + row0], p.gs[rbase + row1]};
   const float nlse[2] = {-p.lse[rbase + row0], -p.lse[rbase + row1]};
   const float nd[2] = {-p.delta[rbase + row0], -p.delta[rbase + row1]};
-  float dq[ND][4];
+  float rsum[2] = {0.0f, 0.0f};  // row sums of dS
+  float dq[ND][4], bq[ND][4];    // dS K and P K
 #pragma unroll
-  for (int j = 0; j < ND; ++j) dq[j][0] = dq[j][1] = dq[j][2] = dq[j][3] = 0.0f;
+  for (int j = 0; j < ND; ++j)
+#pragma unroll
+    for (int e = 0; e < 4; ++e) dq[j][e] = bq[j][e] = 0.0f;
 
   for (int j = 0; j < ntiles; ++j) {
     if (j > 0) {  // tile j landed and every warp is done with tile j - 1: refill its stage with tile j + 1
@@ -802,17 +844,48 @@ __global__ void __launch_bounds__(32 * W, 8 / W) attn_dq_kernel(BwdArgs p) {
         float pr = ex2(fmaf(s[n][e], qc[h2], nlse[h2]));
         if (mask && (key >= p.N || (p.causal && key > row))) pr = 0.0f;
         s[n][e] = pr * fmaf(dp[n][e], gc[h2], nd[h2]);  // dS = P (dP - Delta)
+        dp[n][e] = pr * 256.0f;                         // P with its fixed e4m3 factor (its A scale is 2^-8)
       }
-    ColScales<D> ksc;
-    load_col_scales<D>(ksc, st + C::KTS, lane);
+    {
+      const float2 rs = row_sum<NT>(s);
+      rsum[0] += rs.x;
+      rsum[1] += rs.y;
+    }
+    {  // B += P K (MXFP8)
+      ColScales<D> ksc;
+      load_col_scales<D>(ksc, st + C::KTS, lane);
 #pragma unroll
-    for (int kk = 0; kk < 2; ++kk) {
+      for (int kk = 0; kk < 2; ++kk) {
+        uint32_t a[4];
+        acc_to_a<NT>(a, dp, kk, 1.0f, 1.0f);
+        pv_product<D, 64>(bq, a, 0x77777777u, st + C::KT, ksc, kk, kk, lane);
+      }
+    }
+    // dQ += dS K in BF16: the C fragments of n-tiles 2 kk, 2 kk + 1 are the A fragment of k16-step kk (no
+    // reordering); K's B fragments come from the row-major BF16 tile through ldmatrix.trans
+#pragma unroll
+    for (int kk = 0; kk < 4; ++kk) {
       uint32_t a[4];
-      const uint32_t sfa = acc_to_a_scaled<NT>(a, s, kk, lane);
-      pv_product<D, 64>(dq, a, sfa, st + C::KT, ksc, kk, kk, lane);
+      a[0] = pack_bf16(s[2 * kk][0], s[2 * kk][1]);
+      a[1] = pack_bf16(s[2 * kk][2], s[2 * kk][3]);
+      a[2] = pack_bf16(s[2 * kk + 1][0], s[2 * kk + 1][1]);
+      a[3] = pack_bf16(s[2 * kk + 1][2], s[2 * kk + 1][3]);
+#pragma unroll
+      for (int n = 0; n < ND; n += 2) {
+        uint32_t b0, b1, b2, b3;
+        ldsm4t(st + C::K16 + swz<2 * D>(16 * kk + (lane & 7) + ((lane >> 3) & 1) * 8, n + (lane >> 4)), b0, b1, b2, b3);
+        mma_bf16(dq[n], a, b0, b1);
+        mma_bf16(dq[n + 1], a, b2, b3);
+      }
     }
   }
   cp_wait<0>();
+  const float r0 = quad_sum(rsum[0]), r1 = quad_sum(rsum[1]);
+#pragma unroll
+  for (int j = 0; j < ND; ++j) {  // dQ - r B: the dQ of the consistent Delta' = Delta + r
+    dq[j][0] = fmaf(-r0, bq[j][0], dq[j][0]), dq[j][1] = fmaf(-r0, bq[j][1], dq[j][1]);
+    dq[j][2] = fmaf(-r1, bq[j][2], dq[j][2]), dq[j][3] = fmaf(-r1, bq[j][3], dq[j][3]);
+  }
   T* out = static_cast<T*>(p.dq) + b * p.dq_sb + h * p.dq_sh;
   store_rows<T, D>(out, p.dq_sn, dq, row0, p.N, p.scale, p.scale, lane);
 }
@@ -989,7 +1062,7 @@ using namespace nvfp4::attn;
 
 // x [B, Hx, N, D] -> {row, row_scales, col, col_scales, delta} (unused outputs are empty tensors).
 std::vector<torch::Tensor> nvfp4_attn_quant(torch::Tensor x, const OptTensor& mean, const OptTensor& o, bool want_row,
-                                            bool want_col) {
+                                            bool want_col, bool want_bf16) {
   TORCH_CHECK(x.is_cuda() && x.dim() == 4, "x must be a 4-D [B, H, N, D] CUDA tensor");
   const c10::cuda::CUDAGuard guard(x.device());
   const int64_t B = x.size(0), Hx = x.size(1), N = x.size(2), D = x.size(3), Np = padded(N);
@@ -1014,7 +1087,9 @@ std::vector<torch::Tensor> nvfp4_attn_quant(torch::Tensor x, const OptTensor& me
   torch::Tensor col_s = want_col ? torch::empty({B, Hx, Np / 64, 2 * D}, u8o) : torch::empty({0}, u8o);
   torch::Tensor delta = oo.defined() ? torch::empty({B, Hx, Np}, x.options().dtype(at::kFloat))
                                      : torch::empty({0}, x.options().dtype(at::kFloat));
-  if (B * Hx == 0) return {row, row_s, col, col_s, delta};
+  torch::Tensor raw = want_bf16 ? torch::empty({B, Hx, Np, D}, x.options().dtype(at::kBFloat16))
+                                : torch::empty({0}, x.options().dtype(at::kBFloat16));
+  if (B * Hx == 0) return {row, row_s, col, col_s, delta, raw};
   TORCH_CHECK(B * Hx < 65536, "batch * heads must be < 65536");
   QuantArgs a{};
   a.x = x.data_ptr();
@@ -1029,6 +1104,7 @@ std::vector<torch::Tensor> nvfp4_attn_quant(torch::Tensor x, const OptTensor& me
   a.row_s = want_row ? row_s.data_ptr<float>() : nullptr;
   a.col = want_col ? col.data_ptr<uint8_t>() : nullptr;
   a.col_s = want_col ? col_s.data_ptr<uint8_t>() : nullptr;
+  a.raw = want_bf16 ? reinterpret_cast<__nv_bfloat16*>(raw.data_ptr()) : nullptr;
   a.Hx = static_cast<int>(Hx), a.N = static_cast<int>(N), a.Np = static_cast<int>(Np);
   auto stream = at::cuda::getCurrentCUDAStream();
   switch (variant(x.scalar_type(), D)) {
@@ -1038,7 +1114,7 @@ std::vector<torch::Tensor> nvfp4_attn_quant(torch::Tensor x, const OptTensor& me
     default: launch_quant<__half, 128>(a, Np, B * Hx, stream); break;
   }
   C10_CUDA_KERNEL_LAUNCH_CHECK();
-  return {row, row_s, col, col_s, delta};
+  return {row, row_s, col, col_s, delta, raw};
 }
 
 static void check_s32(const torch::Tensor& t, int64_t B, int64_t H, int64_t Np, const char* name) {
@@ -1093,10 +1169,11 @@ std::vector<torch::Tensor> nvfp4_attn_fwd(torch::Tensor q, torch::Tensor qs, tor
 // Returns {dq [B, N, H, D], dk [B, N, Hk, D], dv [B, N, Hk, D]} (dtype).
 std::vector<torch::Tensor> nvfp4_attn_bwd(torch::Tensor q, torch::Tensor qs, torch::Tensor qt, torch::Tensor qts,
                                           torch::Tensor k, torch::Tensor ks, torch::Tensor kt, torch::Tensor kts,
-                                          torch::Tensor v, torch::Tensor vs, torch::Tensor g, torch::Tensor gs,
-                                          torch::Tensor gt, torch::Tensor gts, torch::Tensor lse, torch::Tensor delta,
-                                          int64_t N, bool causal, double scale, c10::ScalarType dtype,
-                                          const std::vector<int64_t>& dq_stride, const std::vector<int64_t>& dk_stride) {
+                                          torch::Tensor k16, torch::Tensor v, torch::Tensor vs, torch::Tensor g,
+                                          torch::Tensor gs, torch::Tensor gt, torch::Tensor gts, torch::Tensor lse,
+                                          torch::Tensor delta, int64_t N, bool causal, double scale,
+                                          c10::ScalarType dtype, const std::vector<int64_t>& dq_stride,
+                                          const std::vector<int64_t>& dk_stride) {
   const c10::cuda::CUDAGuard guard(q.device());
   const int64_t B = q.size(0), H = q.size(1), Np = q.size(2), D = q.size(3), Hk = k.size(1);
   TORCH_CHECK(Np == padded(N) && N > 0, "N does not match the quantized tensors");
@@ -1107,8 +1184,9 @@ std::vector<torch::Tensor> nvfp4_attn_bwd(torch::Tensor q, torch::Tensor qs, tor
   check_q8(qts, B, H, Np / 64, 2 * D, "q (col) scales");
   check_q8(k, B, Hk, Np, D, "k");
   check_s32(ks, B, Hk, Np, "k scales");
-  check_q8(kt, B, Hk, D, Np, "k (col)");
-  check_q8(kts, B, Hk, Np / 64, 2 * D, "k (col) scales");
+  TORCH_CHECK(k16.is_cuda() && k16.scalar_type() == at::kBFloat16 && k16.is_contiguous() && k16.dim() == 4 &&
+                  k16.size(0) == B && k16.size(1) == Hk && k16.size(2) == Np && k16.size(3) == D,
+              "k (bf16): expected a contiguous bf16 [B, Hk, Np, D] tensor");
   check_q8(v, B, Hk, Np, D, "v");
   check_s32(vs, B, Hk, Np, "v scales");
   check_q8(g, B, H, Np, D, "dO");
@@ -1118,6 +1196,8 @@ std::vector<torch::Tensor> nvfp4_attn_bwd(torch::Tensor q, torch::Tensor qs, tor
   for (auto* t : {&lse, &delta})
     TORCH_CHECK(t->scalar_type() == at::kFloat && t->is_contiguous() && t->numel() == B * H * Np,
                 "lse / delta must be contiguous fp32 [B, H, Np]");
+  check_q8(kt, B, Hk, D, Np, "k (col)");
+  check_q8(kts, B, Hk, Np / 64, 2 * D, "k (col) scales");
   TORCH_CHECK(B * H < 65536, "batch * heads must be < 65536");
   // dq ([B, H, N, D]) and dk, dv ([B, Hk, N, D]) with the given strides (the inputs' layouts: their gradients
   // then need no copy) if those describe a dense layout with a unit stride along D, else [B, N, H(k), D] memory
@@ -1136,12 +1216,13 @@ std::vector<torch::Tensor> nvfp4_attn_bwd(torch::Tensor q, torch::Tensor qs, tor
   BwdArgs p{};
   p.q = q.data_ptr<uint8_t>(), p.qs = qs.data_ptr<float>(), p.qt = qt.data_ptr<uint8_t>(),
   p.qts = qts.data_ptr<uint8_t>();
-  p.k = k.data_ptr<uint8_t>(), p.ks = ks.data_ptr<float>(), p.kt = kt.data_ptr<uint8_t>(),
-  p.kts = kts.data_ptr<uint8_t>();
+  p.k = k.data_ptr<uint8_t>(), p.ks = ks.data_ptr<float>();
+  p.k16 = reinterpret_cast<const __nv_bfloat16*>(k16.data_ptr());
   p.v = v.data_ptr<uint8_t>(), p.vs = vs.data_ptr<float>();
   p.g = g.data_ptr<uint8_t>(), p.gs = gs.data_ptr<float>(), p.gt = gt.data_ptr<uint8_t>(),
   p.gts = gts.data_ptr<uint8_t>();
   p.lse = lse.data_ptr<float>(), p.delta = delta.data_ptr<float>();
+  p.kt = kt.data_ptr<uint8_t>(), p.kts = kts.data_ptr<uint8_t>();
   p.dq = dq.data_ptr(), p.dk = dk.data_ptr(), p.dv = dv.data_ptr();
   p.dq_sb = dq.stride(0), p.dq_sh = dq.stride(1), p.dq_sn = dq.stride(2);
   p.dk_sb = dk.stride(0), p.dk_sh = dk.stride(1), p.dk_sn = dk.stride(2);

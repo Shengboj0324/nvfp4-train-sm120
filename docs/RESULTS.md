@@ -369,7 +369,7 @@ gradients), and plain BF16 DDP on the same machine is just as slow (55k vs 145k 
 `pass2/`). Data-parallel scaling on consumer cards needs a host with P2P or fast PCIe between them, or
 gradients communicated in lower precision.
 
-## 7. 8-bit attention (v0.9, `bench/results/attention.json`, `long_context.json`, `experiments/results/v0.9/`)
+## 7. 8-bit attention (v0.9.1, `bench/results/attention.json`, `long_context.json`, `experiments/results/v0.9*/`)
 
 **Kernel speed** (`bench/bench_attention.py`): 16 heads, 16384 tokens per call (batch = 16384 / length),
 TFLOPS counting causal attention as half (FlashAttention's convention, fwd+bwd = 3.5× the forward's
@@ -377,30 +377,30 @@ FLOPs), autograd path including the quantization passes; PyTorch 2.14 SDPA (flas
 
 | head dim | tokens / seq | mask | fwd: SDPA | fwd: 8-bit | | fwd+bwd: SDPA | fwd+bwd: 8-bit | |
 |---|---|---|---|---|---|---|---|---|
-| 128 | 512 | causal | 60 | **41** | 0.67× | 33 | **40** | 1.19× |
-| 128 | 512 | full | 78 | **70** | 0.89× | 51 | **56** | 1.10× |
-| 128 | 1024 | causal | 65 | **67** | 1.02× | 47 | **61** | 1.28× |
-| 128 | 1024 | full | 83 | **103** | 1.24× | 59 | **84** | 1.41× |
-| 128 | 2048 | causal | 76 | **100** | 1.33× | 59 | **80** | 1.35× |
-| 128 | 2048 | full | 86 | **134** | 1.55× | 71 | **103** | 1.46× |
-| 128 | 4096 | causal | 81 | **131** | 1.61× | 70 | **99** | 1.43× |
-| 128 | 4096 | full | 87 | **163** | 1.88× | 78 | **117** | 1.50× |
-| 128 | 8192 | causal | 84 | **159** | 1.90× | 78 | **115** | 1.48× |
-| 128 | 8192 | full | 87 | **189** | 2.18× | 81 | **125** | 1.54× |
-| 64 | 512 | causal | 53 | **29** | 0.54× | 27 | **29** | 1.07× |
-| 64 | 512 | full | 85 | **52** | 0.61× | 46 | **51** | 1.11× |
-| 64 | 1024 | causal | 67 | **56** | 0.84× | 46 | **49** | 1.07× |
-| 64 | 1024 | full | 83 | **87** | 1.06× | 63 | **69** | 1.11× |
-| 64 | 2048 | causal | 75 | **85** | 1.13× | 60 | **66** | 1.10× |
-| 64 | 2048 | full | 86 | **118** | 1.37× | 73 | **84** | 1.15× |
-| 64 | 4096 | causal | 79 | **120** | 1.53× | 70 | **80** | 1.14× |
-| 64 | 4096 | full | 86 | **147** | 1.70× | 80 | **93** | 1.16× |
-| 64 | 8192 | causal | 84 | **133** | 1.59× | 77 | **91** | 1.18× |
-| 64 | 8192 | full | 87 | **156** | 1.78× | 83 | **99** | 1.18× |
+| 128 | 512 | causal | 60 | **37** | 0.61× | 33 | **34** | 1.02× |
+| 128 | 512 | full | 79 | **62** | 0.78× | 51 | **50** | 0.99× |
+| 128 | 1024 | causal | 67 | **61** | 0.92× | 47 | **50** | 1.07× |
+| 128 | 1024 | full | 78 | **96** | 1.24× | 61 | **68** | 1.13× |
+| 128 | 2048 | causal | 75 | **93** | 1.24× | 59 | **65** | 1.09× |
+| 128 | 2048 | full | 84 | **128** | 1.53× | 71 | **83** | 1.16× |
+| 128 | 4096 | causal | 81 | **127** | 1.57× | 70 | **79** | 1.14× |
+| 128 | 4096 | full | 85 | **161** | 1.89× | 78 | **92** | 1.18× |
+| 128 | 8192 | causal | 82 | **155** | 1.89× | 77 | **89** | 1.15× |
+| 128 | 8192 | full | 85 | **185** | 2.19× | 81 | **95** | 1.17× |
+| 64 | 512 | causal | 48 | **35** | 0.72× | 32 | **32** | 1.01× |
+| 64 | 512 | full | 81 | **60** | 0.74× | 52 | **49** | 0.96× |
+| 64 | 1024 | causal | 61 | **52** | 0.84× | 46 | **45** | 0.98× |
+| 64 | 1024 | full | 83 | **83** | 1.00× | 64 | **64** | 1.01× |
+| 64 | 2048 | causal | 74 | **80** | 1.08× | 60 | **60** | 0.99× |
+| 64 | 2048 | full | 87 | **113** | 1.29× | 75 | **75** | 1.00× |
+| 64 | 4096 | causal | 78 | **113** | 1.44× | 71 | **73** | 1.02× |
+| 64 | 4096 | full | 87 | **138** | 1.59× | 81 | **84** | 1.04× |
+| 64 | 8192 | causal | 82 | **133** | 1.63× | 79 | **81** | 1.04× |
+| 64 | 8192 | full | 86 | **159** | 1.86× | 82 | **86** | 1.05× |
 
-The 8-bit kernels gain with the sequence length (the quantization pass is a per-token cost) and with
-the head dim (the softmax work per score is the same at D = 64, the MMA work half). Below ~1k tokens the
-forward alone is slower than flash attention; forward + backward is never slower.
+The forward gains with the sequence length (the quantization pass is a per-token cost) and the head dim.
+The backward computes dQ in BF16 with a consistency correction (DESIGN.md §7); before that fix
+forward + backward was 1.4–1.5× at D = 128 from 4k tokens, with 7–24% error in dQ on real activations.
 
 **Training step of a Llama block** (`bench/bench_long_context.py`): d = 2048, 16 heads of 128, SwiGLU,
 16384 tokens per step, BF16 vs NVFP4 linears with every fusion and the weight cache, with BF16 or
@@ -408,25 +408,31 @@ forward alone is slower than flash attention; forward + backward is never slower
 
 | tokens / seq | BF16 | NVFP4, BF16 attention | **NVFP4 + 8-bit attention** | gain from attention |
 |---|---|---|---|---|
-| 512 | 75.8 ms | 25.3 ms (3.00×) | **25.1 ms (3.02×)** | 1.01× |
-| 1024 | 76.6 ms | 27.4 ms (2.80×) | **26.7 ms (2.87×)** | 1.02× |
-| 2048 | 78.5 ms | 30.3 ms (2.59×) | **28.5 ms (2.76×)** | 1.06× |
-| 4096 | 84.8 ms | 35.8 ms (2.37×) | **34.0 ms (2.49×)** | 1.05× |
-| 8192 | 93.2 ms | 47.3 ms (1.97×) | **38.9 ms (2.40×)** | 1.22× |
-| 16384 | 119.3 ms | 71.2 ms (1.67×) | **52.6 ms (2.27×)** | 1.35× |
+| 512 | 75.6 ms | 25.3 ms (2.99×) | **25.6 ms (2.95×)** | 0.99× |
+| 1024 | 76.4 ms | 28.2 ms (2.71×) | **27.6 ms (2.77×)** | 1.02× |
+| 2048 | 77.9 ms | 31.9 ms (2.44×) | **30.5 ms (2.55×)** | 1.05× |
+| 4096 | 84.5 ms | 35.5 ms (2.38×) | **34.5 ms (2.45×)** | 1.03× |
+| 8192 | 92.5 ms | 47.0 ms (1.97×) | **44.5 ms (2.08×)** | 1.06× |
+| 16384 | 118.1 ms | 70.1 ms (1.69×) | **63.0 ms (1.87×)** | 1.11× |
 
-**Quality** (GPT-124M, TinyStories, 3000 steps, seed 0, `experiments/run_attn8.sh`; 8-bit attention in
-every block that has NVFP4 linears, in all blocks for the BF16 run):
+**Quality.** GPT-124M on TinyStories, 3000 steps, NVFP4 linears unless noted, 8-bit attention in every
+block with NVFP4 linears (all blocks in the BF16 run):
 
-| Linears | Attention | Final val loss | tokens/s |
-|---|---|---|---|
-| BF16 | BF16 (SDPA) | 1.4892 | 63k |
-| BF16 | **8-bit** | **1.4892** | 62k |
-| NVFP4 (fused) | BF16 (SDPA) | 1.5073 | 82k |
-| NVFP4 (fused) | **8-bit** | **1.5095** (+0.14%) | 81k |
+| Context, heads | Linears | Attention | Seed 0 | Seed 1 | vs BF16 attention | tokens/s |
+|---|---|---|---|---|---|---|
+| 512, 12 × 64 | BF16 | BF16 (SDPA) | 1.4892 | | | 63k |
+| 512, 12 × 64 | BF16 | 8-bit (v0.9.0) | 1.4892 | | +0.00% | 62k |
+| 512, 12 × 64 | NVFP4 | BF16 (SDPA) | 1.5073 | | | 82k |
+| 512, 12 × 64 | NVFP4 | 8-bit (v0.9.0) | 1.5095 | | +0.14% | 81k |
+| 4096, 6 × 128 | NVFP4 | BF16 (SDPA) | 1.6027 | 1.5928 | | 66k |
+| 4096, 6 × 128 | NVFP4 | 8-bit (v0.9.0) | 1.6150 | 1.6035 | +0.72% | 70k |
+| 4096, 6 × 128 | NVFP4 | **8-bit (v0.9.1)** | **1.6088** | **1.6033** | **+0.52%** | 67k |
 
-The BF16 baseline's seed-to-seed spread is 0.003 (§4.1). At 512 tokens and head dim 64 attention is a
-small part of this model's step, so throughput is unchanged; the speed gains are at long context (above).
+At 512 tokens 8-bit attention costs nothing measurable; at 4096 tokens it costs 0.5% (both seeds above
+their BF16-attention runs; the BF16 baseline's seed-to-seed spread is 0.003). The v0.9.0 backward's dQ
+error (above) accounted for about a third of the gap at 4096. Per-layer errors on the activations of a
+model trained at 4096 tokens (`bench/attention_real_errors.py`, layers 0–9): output 1.1–2.5%, dQ 0.5–1.5%
+(v0.9.0: 0.4–24%), dK 2.6–3.9%, dV 2.3–3.0%.
 
 ## Reproduce
 

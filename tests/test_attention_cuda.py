@@ -42,13 +42,14 @@ def _exact(q, k, v, causal, scale):
 def test_quantizer_is_exact(D, N, with_mean):
     x = torch.randn(2, 3, N, D, device=DEV, dtype=torch.bfloat16) * 3
     mean = x.mean(dim=2, dtype=torch.float32) if with_mean else None
-    row, rs, col, cs, _ = lib.attn_quant(x, mean, None, True, True)
+    row, rs, col, cs, _, raw = lib.attn_quant(x, mean, None, True, True, True)
     xs = x.float() - mean.unsqueeze(2) if with_mean else x.float()
     codes, sc = ref.int8_token_quantize(xs)
     Np = row.shape[2]
     assert Np % 128 == 0 and Np >= N
     assert torch.equal(row[:, :, :N].view(torch.int8), codes) and torch.equal(rs[:, :, :N], sc)
     assert not row[:, :, N:].any() and not rs[:, :, N:].any()  # zero padding
+    assert torch.equal(raw[:, :, :N], xs.bfloat16()) and not raw[:, :, N:].any()
     xp = ref._pad_seq(xs)
     sig = torch.tensor(ref.ATTN_SIGMA, device=DEV)
     perm = (torch.arange(Np // 32, device=DEV)[:, None] * 32 + sig[None]).reshape(-1)
@@ -61,8 +62,8 @@ def test_quantizer_delta_and_strides():
     # dO as a transposed view (the layout autograd hands over), delta = rowsum(dO * O)
     g = torch.randn(2, 300, 4, 64, device=DEV, dtype=torch.bfloat16).transpose(1, 2)
     o = torch.randn(2, 300, 4, 64, device=DEV, dtype=torch.bfloat16).transpose(1, 2)
-    row, rs, col, cs, delta = lib.attn_quant(g, None, o, True, True)
-    row2, rs2, col2, cs2, _ = lib.attn_quant(g.contiguous(), None, None, True, True)
+    row, rs, col, cs, delta, _ = lib.attn_quant(g, None, o, True, True, False)
+    row2, rs2, col2, cs2, _, _ = lib.attn_quant(g.contiguous(), None, None, True, True, False)
     assert torch.equal(row, row2) and torch.equal(rs, rs2) and torch.equal(col, col2) and torch.equal(cs, cs2)
     want = (g.float() * o.float()).sum(-1)
     torch.testing.assert_close(delta[:, :, :300], want, rtol=1e-5, atol=1e-4)
