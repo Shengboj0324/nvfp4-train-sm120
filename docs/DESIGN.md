@@ -536,11 +536,14 @@ accumulation.
    it now matches BF16 attention's loss at 4096 tokens, but gains only 1.07–1.12× per attention call at
    D = 128 (1.04–1.07× at D = 64): the backward runs at BF16 speed, and the two-term P V the exact
    backward needs costs the forward a quarter of its speedup (1.2–1.6× instead of 1.5–2.1×). The
-   0.9 8-bit backward (`backward="8bit"`) is 1.12–1.18× but +0.5% loss at 4096 tokens. Remaining ways
-   forward: skipping the residual P V product for key blocks whose probabilities are all negligible
-   (data dependent: peaked attention would skip most blocks, the uniform-ish random-input benchmark
-   none), V in INT8 per token, FlashAttention-4's polynomial exp2 on the FMA pipe. Masks other than
-   causal, packed sequences, dropout and head dims other than 64 / 128 fall back to SDPA.
+   0.9 8-bit backward (`backward="8bit"`) is 1.12–1.18× but +0.5% loss at 4096 tokens. Tried and
+   rejected: skipping the residual P V product on (16-row, 32-key) MMA tiles whose probabilities are all
+   negligible. On a GPT-124M's activations at 4096 tokens (`bench/attention_skip_probe.py`) no tile
+   qualifies even at a threshold of 2^-5 of the running row maximum (where in most layers under 1% of the
+   individual probabilities fall below 2^-7 and at most 26% below 2^-5): attention there is too diffuse,
+   and the kernel's running maximum makes early tiles look larger still. Remaining ways forward: V in
+   INT8 per token, FlashAttention-4's polynomial exp2 on the FMA pipe. Masks other than causal, packed
+   sequences, dropout and head dims other than 64 / 128 fall back to SDPA.
 3. **Stochastic rounding is still software** (sm_120a has no `cvt.rs`): one 32-bit hash per element
    pair, +34–43% on the plain dual quantizer.
 4. **Weight cache limits.** In-place writes through `param.data` outside an optimizer step cannot be
