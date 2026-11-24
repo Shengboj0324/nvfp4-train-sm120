@@ -9,7 +9,7 @@
 #   env     GPUs, driver, topology, CUDA toolkit (installs CUDA 13.0 / 12.8 if no nvcc >= 12.8), PyTorch
 #   build   the extension for sm_120a
 #   tests   the full suite (incl. the two-GPU NCCL tests), then sanitizers + 5-minute soak
-#   bench   GEMM, quantizer, GPT-block and Llama-block benchmarks on this GPU model
+#   bench   GEMM, quantizer, GPT-block, Llama-block, attention and long-context benchmarks on this GPU model
 #   gpt     GPT-124M, 3000 steps: BF16 and NVFP4 on one GPU, NVFP4 with DDP over all GPUs (NCCL)
 # Everything ends up in $OUT (default /workspace/nvfp4_results) and $OUT.tar.gz.
 # Every GPU job runs under tools/guard.py (temperature / memory limits, over all GPUs).
@@ -130,6 +130,13 @@ do_bench() {
   python tools/guard.py --log "$OUT/bench_llama.csv" -- python bench/bench_llama_block.py --out "$OUT/llama_block.json" \
     > "$OUT/bench_llama.log" 2>&1 || st=1
   tail -6 "$OUT/bench_llama.log"
+  python tools/guard.py --log "$OUT/bench_attention.csv" -- python bench/bench_attention.py --out "$OUT/attention.json"     > "$OUT/bench_attention.log" 2>&1 || st=1
+  tail -20 "$OUT/bench_attention.log"
+  # 16k tokens per step need ~10 GB at d = 2048; GPUs with less memory run 8k
+  local tok=16384
+  [ "$(nvidia-smi --query-gpu=memory.total --format=csv,noheader,nounits -i 0)" -lt 14000 ] && tok=8192
+  python tools/guard.py --log "$OUT/bench_long.csv" -- python bench/bench_long_context.py --tokens $tok     --out "$OUT/long_context.json" > "$OUT/bench_long.log" 2>&1 || st=1
+  tail -6 "$OUT/bench_long.log"
   return $st
 }
 
