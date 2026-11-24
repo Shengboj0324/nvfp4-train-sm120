@@ -935,24 +935,42 @@ __global__ void __launch_bounds__(32 * W, 8 / W) attn_dkdv_kernel(BwdArgs p) {
 
 // --- host -------------------------------------------------------------------------------------------------
 
-// Each kernel instantiation records per device that it may use `bytes` of dynamic shared memory.
-template <auto Kernel>
-void set_smem(int bytes) {
-  static std::atomic<uint64_t> done{0};  // one per kernel instantiation (Kernel is a template argument)
-  C10_CUDA_CHECK(nvfp4::gemm::ensure_smem_attr(Kernel, bytes, done));
+// Launchers, one function template per kernel family. (Plain templates with an explicit dispatch below: MSVC's
+// host compiler crashed on the stub nvcc generates for kernels launched from generic lambdas.) Each launcher
+// instantiation records per device that its kernel may use the dynamic shared memory it needs.
+template <typename T, int D>
+void launch_quant(const QuantArgs& a, int64_t Np, int64_t BH, cudaStream_t stream) {
+  attn_quant_kernel<T, D><<<dim3(static_cast<unsigned>(Np / 64), static_cast<unsigned>(BH)), THREADS, 0, stream>>>(a);
 }
 
-template <typename F>
-void dispatch(c10::ScalarType dt, int D, F&& f) {
+template <typename T, int D>
+void launch_fwd(const FwdArgs& p, int64_t Np, int64_t BH, cudaStream_t stream) {
+  using C = FwdCfg<D, 2, 4>;  // 32 query rows per warp, 4 warps per CTA, two CTAs per SM
+  static std::atomic<uint64_t> done{0};
+  C10_CUDA_CHECK(nvfp4::gemm::ensure_smem_attr(attn_fwd_kernel<T, D, 2, 4>, C::BYTES, done));
+  attn_fwd_kernel<T, D, 2, 4><<<dim3(static_cast<unsigned>(Np / C::BQ), static_cast<unsigned>(BH)), C::NTH, C::BYTES,
+                                stream>>>(p);
+}
+
+template <typename T, int D>
+void launch_bwd(const BwdArgs& p, int64_t Np, int64_t BH, int64_t BHk, cudaStream_t stream) {
+  constexpr int W = 8;  // 8 warps per CTA (measured slightly ahead of two 4-warp CTAs per SM for both kernels)
+  using CQ = DqCfg<D, W>;
+  using CK = DkvCfg<D, W>;
+  static std::atomic<uint64_t> done_q{0}, done_k{0};
+  C10_CUDA_CHECK(nvfp4::gemm::ensure_smem_attr(attn_dq_kernel<T, D, W>, CQ::BYTES, done_q));
+  attn_dq_kernel<T, D, W><<<dim3(static_cast<unsigned>(Np / CQ::BQ), static_cast<unsigned>(BH)), CQ::NTH, CQ::BYTES,
+                            stream>>>(p);
+  C10_CUDA_CHECK(nvfp4::gemm::ensure_smem_attr(attn_dkdv_kernel<T, D, W>, CK::BYTES, done_k));
+  attn_dkdv_kernel<T, D, W><<<dim3(static_cast<unsigned>(Np / CK::BK), static_cast<unsigned>(BHk)), CK::NTH,
+                              CK::BYTES, stream>>>(p);
+}
+
+// Index of the (dtype, head dim) instantiation: 0 bf16/64, 1 bf16/128, 2 fp16/64, 3 fp16/128.
+int variant(c10::ScalarType dt, int64_t D) {
   TORCH_CHECK(D == 64 || D == 128, "nvfp4 attention supports head dims 64 and 128, got ", D);
   TORCH_CHECK(dt == at::kBFloat16 || dt == at::kHalf, "nvfp4 attention needs bf16 or fp16 inputs");
-  if (dt == at::kBFloat16) {
-    if (D == 64) f(__nv_bfloat16{}, std::integral_constant<int, 64>{});
-    else f(__nv_bfloat16{}, std::integral_constant<int, 128>{});
-  } else {
-    if (D == 64) f(__half{}, std::integral_constant<int, 64>{});
-    else f(__half{}, std::integral_constant<int, 128>{});
-  }
+  return (dt == at::kHalf ? 2 : 0) + (D == 128 ? 1 : 0);
 }
 
 int64_t padded(int64_t n) { return (n + PAD - 1) / PAD * PAD; }
@@ -1013,11 +1031,12 @@ std::vector<torch::Tensor> nvfp4_attn_quant(torch::Tensor x, const OptTensor& me
   a.col_s = want_col ? col_s.data_ptr<uint8_t>() : nullptr;
   a.Hx = static_cast<int>(Hx), a.N = static_cast<int>(N), a.Np = static_cast<int>(Np);
   auto stream = at::cuda::getCurrentCUDAStream();
-  dispatch(x.scalar_type(), static_cast<int>(D), [&](auto tt, auto dd) {
-    using T = decltype(tt);
-    constexpr int DD = decltype(dd)::value;
-    attn_quant_kernel<T, DD><<<dim3(Np / 64, B * Hx), THREADS, 0, stream>>>(a);
-  });
+  switch (variant(x.scalar_type(), D)) {
+    case 0: launch_quant<__nv_bfloat16, 64>(a, Np, B * Hx, stream); break;
+    case 1: launch_quant<__nv_bfloat16, 128>(a, Np, B * Hx, stream); break;
+    case 2: launch_quant<__half, 64>(a, Np, B * Hx, stream); break;
+    default: launch_quant<__half, 128>(a, Np, B * Hx, stream); break;
+  }
   C10_CUDA_KERNEL_LAUNCH_CHECK();
   return {row, row_s, col, col_s, delta};
 }
@@ -1061,14 +1080,12 @@ std::vector<torch::Tensor> nvfp4_attn_fwd(torch::Tensor q, torch::Tensor qs, tor
   p.causal = causal ? 1 : 0;
   p.scale_log2 = static_cast<float>(scale * 1.4426950408889634);
   auto stream = at::cuda::getCurrentCUDAStream();
-  dispatch(dtype, static_cast<int>(D), [&](auto tt, auto dd) {
-    using T = decltype(tt);
-    constexpr int DD = decltype(dd)::value;
-    // 32 query rows per warp, 4 warps per CTA, two CTAs per SM
-    using C = FwdCfg<DD, 2, 4>;
-    set_smem<attn_fwd_kernel<T, DD, 2, 4>>(C::BYTES);
-    attn_fwd_kernel<T, DD, 2, 4><<<dim3(Np / C::BQ, B * H), C::NTH, C::BYTES, stream>>>(p);
-  });
+  switch (variant(dtype, D)) {
+    case 0: launch_fwd<__nv_bfloat16, 64>(p, Np, B * H, stream); break;
+    case 1: launch_fwd<__nv_bfloat16, 128>(p, Np, B * H, stream); break;
+    case 2: launch_fwd<__half, 64>(p, Np, B * H, stream); break;
+    default: launch_fwd<__half, 128>(p, Np, B * H, stream); break;
+  }
   C10_CUDA_KERNEL_LAUNCH_CHECK();
   return {o, lse};
 }
@@ -1134,18 +1151,12 @@ std::vector<torch::Tensor> nvfp4_attn_bwd(torch::Tensor q, torch::Tensor qs, tor
   p.scale = static_cast<float>(scale);
   p.scale_log2 = static_cast<float>(scale * 1.4426950408889634);
   auto stream = at::cuda::getCurrentCUDAStream();
-  dispatch(dtype, static_cast<int>(D), [&](auto tt, auto dd) {
-    using T = decltype(tt);
-    constexpr int DD = decltype(dd)::value;
-    // 8 warps per CTA (measured slightly ahead of two 4-warp CTAs per SM for both kernels)
-    constexpr int W = 8;
-    using CQ = DqCfg<DD, W>;
-    using CK = DkvCfg<DD, W>;
-    set_smem<attn_dq_kernel<T, DD, W>>(CQ::BYTES);
-    attn_dq_kernel<T, DD, W><<<dim3(Np / CQ::BQ, B * H), CQ::NTH, CQ::BYTES, stream>>>(p);
-    set_smem<attn_dkdv_kernel<T, DD, W>>(CK::BYTES);
-    attn_dkdv_kernel<T, DD, W><<<dim3(Np / CK::BK, B * Hk), CK::NTH, CK::BYTES, stream>>>(p);
-  });
+  switch (variant(dtype, D)) {
+    case 0: launch_bwd<__nv_bfloat16, 64>(p, Np, B * H, B * Hk, stream); break;
+    case 1: launch_bwd<__nv_bfloat16, 128>(p, Np, B * H, B * Hk, stream); break;
+    case 2: launch_bwd<__half, 64>(p, Np, B * H, B * Hk, stream); break;
+    default: launch_bwd<__half, 128>(p, Np, B * H, B * Hk, stream); break;
+  }
   C10_CUDA_KERNEL_LAUNCH_CHECK();
   return {dq, dk, dv};
 }
