@@ -56,10 +56,10 @@ torch::Tensor nvfp4_gemm(torch::Tensor a, torch::Tensor sfa, torch::Tensor gdec_
                          c10::optional<torch::Tensor> residual, bool bias_round);
 
 std::vector<torch::Tensor> nvfp4_attn_quant(torch::Tensor x, const OptTensor& mean, const OptTensor& o, bool want_row,
-                                            bool want_col, bool want_bf16);
+                                            bool want_col, bool want_bf16, bool want_deq);
 std::vector<torch::Tensor> nvfp4_attn_fwd(torch::Tensor q, torch::Tensor qs, torch::Tensor k, torch::Tensor ks,
                                           torch::Tensor vt, torch::Tensor vts, int64_t N, bool causal, double scale,
-                                          c10::ScalarType dtype);
+                                          c10::ScalarType dtype, bool p2);
 std::vector<torch::Tensor> nvfp4_attn_bwd(torch::Tensor q, torch::Tensor qs, torch::Tensor qt, torch::Tensor qts,
                                           torch::Tensor k, torch::Tensor ks, torch::Tensor kt, torch::Tensor kts,
                                           torch::Tensor k16, torch::Tensor v, torch::Tensor vs, torch::Tensor g,
@@ -134,10 +134,10 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
   m.def("attn_quant", &nvfp4_attn_quant,
         "Attention operand quantization: x [B, H, N, D] -> int8 row / MXFP8 col (transposed, permuted) layouts (+ delta)",
         py::arg("x"), py::arg("mean") = py::none(), py::arg("o") = py::none(), py::arg("want_row") = true,
-        py::arg("want_col") = true, py::arg("want_bf16") = false);
+        py::arg("want_col") = true, py::arg("want_bf16") = false, py::arg("want_deq") = false);
   m.def("attn_fwd", &nvfp4_attn_fwd, "8-bit flash attention forward -> (o [B, N, H, D], lse)", py::arg("q"),
         py::arg("qs"), py::arg("k"), py::arg("ks"), py::arg("vt"), py::arg("vts"), py::arg("N"), py::arg("causal"),
-        py::arg("scale"), py::arg("dtype"));
+        py::arg("scale"), py::arg("dtype"), py::arg("p2") = false);
   m.def("attn_bwd", &nvfp4_attn_bwd, "8-bit flash attention backward -> (dq, dk, dv), [B, H(k), N, D] with the given strides",
         py::arg("q"), py::arg("qs"), py::arg("qt"), py::arg("qts"), py::arg("k"), py::arg("ks"), py::arg("kt"), py::arg("kts"), py::arg("k16"),
         py::arg("v"), py::arg("vs"), py::arg("g"), py::arg("gs"), py::arg("gt"), py::arg("gts"),

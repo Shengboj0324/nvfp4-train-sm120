@@ -132,17 +132,22 @@ repeating k / v), bf16 or fp16, head dim 64 or 128, any strides with a unit stri
 the products with probabilities and score gradients on MXFP8; softmax statistics and accumulation stay
 FP32 (DESIGN.md §7). The output is a [B, H, N, D] view of [B, N, H, D] memory, so
 `o.transpose(1, 2).reshape(B, N, H * D)` is free; gradients come back in the inputs' layouts when those
-are dense, else as the same kind of view. The backward is bitwise deterministic (no atomics), without
-`torch.use_deterministic_algorithms`. Anything it doesn't cover (other head dims, fp32, attention
+are dense, else as the same kind of view. Anything it doesn't cover (other head dims, fp32, attention
 masks, dropout, a non-positive scale) falls back to `F.scaled_dot_product_attention`
 (`nvfp4.attention.supported(q, k, v)` tells which path a call takes).
 
-When to use it: the forward is 1.6–2.2× flash attention from 4k tokens (inference, evaluation, or any
-forward-heavy use). In training, forward + backward is 1.14–1.18× at head dim 128 and about even at 64,
-and the quality cost grows with the context: none measurable on GPT-124M at 512 tokens, +0.5% validation
-loss at 4096 (RESULTS.md §7). Its errors are those of 8-bit operands (outputs ~2–3%, gradients 1–4%
-relative to exact attention, vs ~0.2% for BF16 flash attention). For long-context training, keep BF16
-attention unless the measured speed gain matters to you and you have validated the quality cost on your
+Two backwards (DESIGN.md §7.1):
+
+| `backward=` | what | fwd / fwd+bwd vs flash attention (D = 128, 4k–8k tokens) | quality (GPT-124M, 4096 tokens) | deterministic |
+|---|---|---|---|---|
+| `"bf16"` (default) | PyTorch's flash backward of the 8-bit forward (on the dequantized operands; P V in two e4m3 terms) | 1.2–1.6× / 1.07–1.12× | same loss as BF16 attention | under `torch.use_deterministic_algorithms`, like SDPA |
+| `"8bit"` | this package's INT8 / MXFP8 backward (one-term P V) | 1.5–2.1× / 1.12–1.18× | +0.5% loss | always (no atomics) |
+
+When to use it: for forward-only work (inference, evaluation) pass `backward="8bit"` for the faster
+forward (no backward runs anyway). For training, the default costs no measurable quality at 512 or 4096
+tokens on GPT-124M and gains 7–12% per attention call at head dim 128 (4–7% at 64), so its value
+grows with the share of attention in the step (long context). Errors are those of 8-bit operands in the
+forward (output ~1–3% relative to exact attention, vs ~0.2% for BF16 flash attention); validate on your
 model.
 
 ### 3.4 Low-level ops
@@ -164,7 +169,8 @@ sync, and changes on every CUDA-graph replay. Both give bit-identical results fo
 
 - **Bit-exact quantization.** Every quantizer (including the fused LayerNorm / GELU variants) is
   bit-identical to `nvfp4.reference`, the executable spec; the GEMM matches an fp64 reference to ~1e-7.
-- **Determinism.** (`nvfp4.attention`'s backward is deterministic by construction.) With the same seed (`torch.manual_seed`), forward and backward are bit-reproducible,
+- **Determinism.** (`nvfp4.attention(backward="8bit")` is deterministic by construction; the default
+  backward is PyTorch's flash backward and follows the deterministic-mode switch below.) With the same seed (`torch.manual_seed`), forward and backward are bit-reproducible,
   including stochastic rounding and split-K. The layers draw their rounding seeds from the CUDA
   generator, on the GPU. PyTorch's own flash / memory-efficient attention backward is *not*
   bit-reproducible by default (it accumulates dQ with atomics). For bitwise reproducible runs, set
@@ -203,7 +209,7 @@ sync, and changes on every CUDA-graph replay. Both give bit-identical results fo
 | Memory | Saved activations are NVFP4 (~0.56 bytes per element) instead of BF16; peak memory of a block step is 7–14% below BF16. |
 | Shapes | `in_features` / `out_features` must be multiples of 128. Token counts are arbitrary (padded internally). Very small layers (< 128 wide) should stay BF16. |
 | Fused blocks | GPT / BERT / ViT style (LayerNorm, tanh or exact GELU) and Llama style (RMSNorm, SwiGLU), pre- or post-norm, biases anywhere, residual adds fused. Attention between them is yours: PyTorch's SDPA, or `nvfp4.attention` (§3.3). |
-| Attention | `nvfp4.attention` saves 8-bit copies of q, k, v in two layouts (as much memory as the BF16 tensors SDPA saves) plus the output; deterministic backward; `torch.compile` traces it as custom ops. |
+| Attention | `nvfp4.attention` saves the dequantized q, k, v (default backward) or 8-bit copies in two layouts (`backward="8bit"`), as much memory as the BF16 tensors SDPA saves, plus the output; `torch.compile` traces it as custom ops. |
 | Version changes | v0.8 changed the stochastic-rounding generator (one hash per element pair) and quantizes fp32 output gradients without first rounding them to bf16: gradients are not bit-identical to v0.7's for the same seed (forward results are). |
 | Precision recipe | Keep embeddings, the LM head and the last 1–2 blocks in BF16. Measured quality gap at 124M / 507M parameters: +1.0–1.4% validation loss, constant over training; at 124M over three seeds +0.019 ± 0.002 nats (+1.28%) (RESULTS.md §4–5). Validate on your own model before relying on it. |
 | Throughput | Gains grow with width: GPT block fwd+bwd 1.8× BF16 at d=768, 2.7× at d=2048, 3.2× at d=4096 (3.5× for micro-batches after the first with the weight cache); Llama block 2.1–3.3× (3.6×) on an RTX 5090 Laptop GPU. |

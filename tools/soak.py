@@ -70,10 +70,10 @@ def main() -> int:
     aq = torch.randn(2, 8, 2048, 128, device="cuda", dtype=torch.bfloat16, requires_grad=True)
     akv = [torch.randn(2, 2, 2048, 128, device="cuda", dtype=torch.bfloat16, requires_grad=True) for _ in range(2)]
 
-    def attn_grads(do):
+    def attn_grads(do, backward):
         for t in (aq, *akv):
             t.grad = None
-        out = attention(aq, akv[0], akv[1], causal=True)
+        out = attention(aq, akv[0], akv[1], causal=True, backward=backward)
         out.backward(do)
         return out.detach(), [t.grad.clone() for t in (aq, *akv)]
     opts = {k: torch.optim.AdamW(b.parameters(), lr=1e-4) for k, b in blocks.items()}
@@ -131,17 +131,18 @@ def main() -> int:
                     return 1
                 checks += 1
             opts[name].step()
-        if it % 10 == 0:  # 8-bit attention at long context: finite, and its backward replays bit for bit
+        if it % 10 == 0:  # 8-bit attention at long context: finite, and its backwards replay bit for bit
             do = torch.randn_like(aq)
-            out, g1 = attn_grads(do)
-            _, g2 = attn_grads(do)
-            if not torch.isfinite(out).all() or not all(torch.isfinite(g).all() for g in g1):
-                print(f"FAIL non-finite 8-bit attention at iter {it}", flush=True)
-                return 1
-            if not all(torch.equal(g, h) for g, h in zip(g1, g2)):
-                print(f"FAIL 8-bit attention replay mismatch at iter {it}", flush=True)
-                return 1
-            checks += 1
+            for bwd in ("bf16", "8bit"):
+                out, g1 = attn_grads(do, bwd)
+                _, g2 = attn_grads(do, bwd)
+                if not torch.isfinite(out).all() or not all(torch.isfinite(g).all() for g in g1):
+                    print(f"FAIL non-finite 8-bit attention ({bwd} backward) at iter {it}", flush=True)
+                    return 1
+                if not all(torch.equal(g, h) for g, h in zip(g1, g2)):
+                    print(f"FAIL 8-bit attention ({bwd} backward) replay mismatch at iter {it}", flush=True)
+                    return 1
+                checks += 1
         for qa, qb, ref in gemms:
             out = ops.gemm(qa, qb, torch.float32)
             if it % 10 == 0 and not torch.equal(out, ref):

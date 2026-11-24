@@ -1,5 +1,30 @@
 # Changelog
 
+## 0.10.0 — exact backward for 8-bit attention (2026-11-24)
+
+- **`nvfp4.attention(..., backward="bf16")`, the new default**: the 8-bit forward with PyTorch's
+  flash-attention backward run on the dequantized operands the forward multiplied (new `want_deq` output
+  of `attn_quant`), with the forward's log-sum-exp and output. The forward computes P V in two e4m3 terms
+  (P and its rounding residual, one more MXFP8 MMA) so that Delta = rowsum(dO O) is consistent with the
+  exact backward (`attn_fwd(..., p2=True)`). Gradients are the exact gradients at the quantized operands
+  (straight-through). On a trained GPT-124M's activations at 4096 tokens: dV error 0.2–2.1% (was
+  2.5–3.1%), dK about halved, dQ 0.4–2.0%. GPT-124M at 4096 tokens, 2 seeds: validation loss **1.5979 /
+  1.5949 vs BF16 attention's 1.6027 / 1.5928** (0.9.1: 1.6088 / 1.6033, +0.52%), same tokens/s. Per
+  attention call: forward + backward 1.07–1.12× flash attention at head dim 128 (0.9.1: 1.12–1.18×),
+  forward 1.2–1.6× (0.9.1: 1.5–2.1×). Bitwise deterministic only under
+  `torch.use_deterministic_algorithms`, like SDPA (DESIGN.md §7.1).
+- `backward="8bit"` keeps 0.9.1's deterministic 8-bit backward and one-term forward (faster forward for
+  inference). `experiments/train_gpt.py --attn-backward`, `experiments/run_attn8_bf16bwd.sh`,
+  `bench/attention_qbwd_probe.py` (gradient errors of each variant, with emulations that isolate the
+  log-sum-exp and Delta effects); `bench/bench_attention.py` times both backwards.
+- `attn_quant` returns a seventh tensor (the dequantized values) and `attn_fwd` takes `p2`; callers that
+  unpack six results need updating.
+- Tests: the dequantized values bit-exact against the reference, the two-term forward against exact
+  attention of the quantized operands, the default backward against fp32 autograd at those operands;
+  gradients, layouts and compile for both backwards. Soak and sanitizer drives cover both. 720 tests (38
+  new). Llama block (d = 2048, fused NVFP4) at 16384 tokens: 1.09x from 8-bit attention with the default
+  backward (1.12x with `backward="8bit"`); `bench/bench_long_context.py` times both.
+
 ## 0.9.1 — accurate dQ in 8-bit attention, soak coverage (2026-11-24)
 
 - **Fix: dQ of `nvfp4.attention`** was 7–24% off on a trained model's activations at 4096 tokens (dK, dV:

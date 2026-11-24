@@ -532,18 +532,15 @@ accumulation.
    scheduler (§4.2). In practice it does not show: on a desktop RTX 5090 at full power the kernel is
    1.03–1.71× cuBLASLt on every benchmarked shape, 1.03 PFLOPS at 8192³ (RESULTS.md §6). The larger warp
    tile that would space the OMMAs out does not fit in 255 registers (v0.9 ablation, §4.2).
-2. **Attention** (v0.9: 8-bit, §7). The forward is 1.6–2.2× flash attention; in training, forward +
-   backward gains only 1.14–1.18× at D = 128 once dQ is computed accurately, and at 4096 tokens the loss
-   is 0.5% higher than with BF16 attention. Tried and rejected: an 8-bit forward with PyTorch's exact
-   flash-attention backward. The backward recomputes P = exp(S − lse) from BF16 scores, and the 8-bit
-   forward's lse is off by up to 0.2 nats on random data (more on peaked real attention), so P stops
-   summing to one: 6% gradient error on random inputs, over 100% on trained activations. A BF16 Q K^T in
-   the forward would fix lse but cost most of the forward speedup, and flash's Delta = rowsum(dO ∘ O) from
-   an approximate O brings back the dQ cancellation above, in a kernel this package cannot change.
-   Remaining ways forward: V in INT8 per token (V in MXFP8 is the largest forward error), FlashAttention-4's polynomial exp2 on the FMA pipe, and a deterministic dQ
-   without the recomputed products (ordered accumulation, as in FlashAttention-3's deterministic mode).
-   Masks other than causal, packed sequences, dropout and head dims other than 64 / 128 fall back to
-   SDPA.
+2. **Attention** (v0.9: 8-bit, §7; v0.10: exact backward of the 8-bit forward, §7.1). Training with
+   it now matches BF16 attention's loss at 4096 tokens, but gains only 1.07–1.12× per attention call at
+   D = 128 (1.04–1.07× at D = 64): the backward runs at BF16 speed, and the two-term P V the exact
+   backward needs costs the forward a quarter of its speedup (1.2–1.6× instead of 1.5–2.1×). The
+   0.9 8-bit backward (`backward="8bit"`) is 1.12–1.18× but +0.5% loss at 4096 tokens. Remaining ways
+   forward: skipping the residual P V product for key blocks whose probabilities are all negligible
+   (data dependent: peaked attention would skip most blocks, the uniform-ish random-input benchmark
+   none), V in INT8 per token, FlashAttention-4's polynomial exp2 on the FMA pipe. Masks other than
+   causal, packed sequences, dropout and head dims other than 64 / 128 fall back to SDPA.
 3. **Stochastic rounding is still software** (sm_120a has no `cvt.rs`): one 32-bit hash per element
    pair, +34–43% on the plain dual quantizer.
 4. **Weight cache limits.** In-place writes through `param.data` outside an optimizer step cannot be
@@ -658,3 +655,42 @@ GPT-124M at 4096 tokens trains at the same speed.
 head dims 64 and 128, bf16 / fp16, any strides with a unit stride along the head dim (gradients are
 returned in the inputs' layout when it is dense), `torch.compile` (custom ops). Other head dims,
 attention masks, dropout and fp32 fall back to SDPA. NaN in an input row propagates to that row.
+
+### 7.1 The exact backward of the 8-bit forward (v0.10, the default)
+
+The 8-bit backward above leaves 2–4% error in dK / dV and costs +0.5% loss at 4096 tokens; it is also no
+faster than flash attention's BF16 backward (≈80 TFLOPS both, at D = 128 from 4k tokens: the 8-bit
+kernels are bound by element-wise work and shared-memory traffic, not the tensor pipe). So the default
+backward is now PyTorch's flash-attention backward, in the input precision, *of the function the 8-bit
+forward computes*:
+
+- **Same operands.** The quantizer also writes the dequantized operands (`attn_quant(..., want_deq)`):
+  int8 code × per-token scale for q and centred k, e4m3 × UE8M0 scale for v, rounded to BF16 / FP16
+  (exact for v; 2^-9 for q, k). Flash attention's backward runs on these, so its recomputed scores are the
+  forward's scores up to BF16 rounding and the forward's log-sum-exp matches them (max difference 0.005
+  nats on random inputs, ≤ 0.14 on the most peaked trained layers). The first attempt passed the original
+  q, k, v instead, and the 8-bit scores' lse differed by up to 0.2 nats (P no longer summed to one: 6%
+  gradient error on random inputs, over 100% on trained activations).
+- **Consistent Delta.** Flash attention takes Delta = rowsum(dO ∘ O) from the O it is given, and the
+  exact backward needs Delta = rowsum(P ∘ dP) of its own exact P: an O computed with P rounded to e4m3
+  (relative error up to 2^-4) left rows of dS summing to r_i ≠ 0, which dQ amplified to 6–8% on the
+  peaked layers 8–9 of a trained GPT-124M at 4096 tokens (`bench/attention_qbwd_probe.py`). The forward
+  therefore computes P V as e4m3(P) V + e4m3(16 (P − e4m3(P))) V / 16: the residual comes from the
+  f16x2 difference of P and its e4m3 value (exact), one more MXFP8 MMA per P V k-step with A scale
+  2^-4, P carried to ~2^-8. dQ error on those layers: 1.2–2.0%.
+- **Straight-through.** The gradients are the exact gradients of attention at the quantized operands,
+  used as the gradients of the unquantized ones (the tests check them against fp32 autograd at the
+  dequantized inputs: within 1.2%, BF16 flash attention's level).
+
+Errors against exact attention on a trained model's activations at 4096 tokens (layers 0–9; 8-bit
+backward in brackets): output 0.6–1.8% (0.7–2.3%), dQ 0.4–2.0% (0.3–0.6%), dK 1.2–6.9% (2.8–7.1%; about
+half on most layers), dV 0.2–2.1% (2.5–3.1%). GPT-124M at 4096 tokens, 2 seeds: validation loss 1.5979 /
+1.5949 against BF16 attention's 1.6027 / 1.5928 (−0.09% on average: the gap is gone) and the 8-bit
+backward's 1.6088 / 1.6033, at the same training speed (66.9k tokens/s vs 66.2k for SDPA).
+
+The cost is in the forward: the extra MMA (not the residual arithmetic: issuing it with the residual
+replaced by the main term runs as slow) takes the forward from 1.5–2.1× flash attention to 1.2–1.6×
+(D = 128, 4k–8k tokens), and forward + backward is 1.07–1.12× (D = 64: 1.04–1.07×). Determinism is that
+of PyTorch's flash backward: bitwise reproducible under `torch.use_deterministic_algorithms`, else not
+(dQ accumulated with atomics); `backward="8bit"` keeps the deterministic kernels and the one-term
+forward. Memory: the dequantized q, k, v (input dtype) plus O and lse, as SDPA saves.

@@ -1,5 +1,10 @@
 // 8-bit flash attention (forward + deterministic backward) for consumer Blackwell (sm_120a).
 //
+// (v0.10: nvfp4.attention's default backward is PyTorch's flash backward of this forward instead, on the
+// dequantized operands attn_quant_kernel also writes (QuantArgs::deq), with the forward's P V in two e4m3
+// terms (attn_fwd_kernel's P2) so that Delta = rowsum(dO O) stays consistent; docs/DESIGN.md §7.1. The
+// backward kernels below serve backward="8bit".)
+//
 // Every attention GEMM runs on an 8-bit tensor-core path with FP32 (or exact INT32) accumulation, at 3.6-3.9x
 // the rate of BF16 mma with FP32 accumulation on the RTX 5090 (docs/DESIGN.md §7):
 //   - the score-type products Q K^T and dO V^T (whose errors reach the softmax / dS directly) in INT8 with
@@ -138,6 +143,26 @@ __device__ __forceinline__ uint32_t pack4(float a, float b, float c, float d) {
   asm("cvt.rn.satfinite.e4m3x2.f32 %0, %1, %2;\n" : "=h"(lo) : "f"(b), "f"(a));
   asm("cvt.rn.satfinite.e4m3x2.f32 %0, %1, %2;\n" : "=h"(hi) : "f"(d), "f"(c));
   return static_cast<uint32_t>(lo) | (static_cast<uint32_t>(hi) << 16);
+}
+
+// Two e4m3 values (low byte first) -> f16x2, exactly.
+__device__ __forceinline__ __half2 e4m3x2_to_h2(uint16_t x) {
+  uint32_t r;
+  asm("cvt.rn.f16x2.e4m3x2 %0, %1;\n" : "=r"(r) : "h"(x));
+  return *reinterpret_cast<const __half2*>(&r);
+}
+
+// The rounding residuals of a pack4 word hi of (a, b, c, d), times 16, as e4m3 (same order): x ~ hi + lo / 16
+// to ~2^-8 relative. Computed in f16x2 (x <= 2^8.5 here; the subtraction is exact and the f16 rounding of x,
+// 2^-11, is below what the e4m3 residual keeps).
+__device__ __forceinline__ uint32_t resid4(uint32_t hi, float a, float b, float c, float d) {
+  const __half2 k16 = __float2half2_rn(16.0f);
+  const __half2 r0 = __hmul2(__hsub2(__floats2half2_rn(a, b), e4m3x2_to_h2(static_cast<uint16_t>(hi))), k16);
+  const __half2 r1 = __hmul2(__hsub2(__floats2half2_rn(c, d), e4m3x2_to_h2(static_cast<uint16_t>(hi >> 16))), k16);
+  uint16_t lo0, lo1;
+  asm("cvt.rn.satfinite.e4m3x2.f16x2 %0, %1;\n" : "=h"(lo0) : "r"(*reinterpret_cast<const uint32_t*>(&r0)));
+  asm("cvt.rn.satfinite.e4m3x2.f16x2 %0, %1;\n" : "=h"(lo1) : "r"(*reinterpret_cast<const uint32_t*>(&r1)));
+  return static_cast<uint32_t>(lo0) | (static_cast<uint32_t>(lo1) << 16);
 }
 
 // UE8M0 scale of a block with absolute maximum amax: the biased exponent of the smallest power of two 2^E with
@@ -315,6 +340,16 @@ __device__ __forceinline__ void acc_to_a(uint32_t (&a)[4], const float (&x)[NT][
   a[3] = pack4(x[j + 2][2] * m1, x[j + 2][3] * m1, x[j + 3][2] * m1, x[j + 3][3] * m1);
 }
 
+// The e4m3 residuals (resid4) of acc_to_a's fragment a of x (multipliers 1).
+template <int NT>
+__device__ __forceinline__ void acc_resid(uint32_t (&lo)[4], const uint32_t (&a)[4], const float (&x)[NT][4], int kk) {
+  const int j = 4 * kk;
+  lo[0] = resid4(a[0], x[j][0], x[j][1], x[j + 1][0], x[j + 1][1]);
+  lo[1] = resid4(a[1], x[j][2], x[j][3], x[j + 1][2], x[j + 1][3]);
+  lo[2] = resid4(a[2], x[j + 2][0], x[j + 2][1], x[j + 3][0], x[j + 3][1]);
+  lo[3] = resid4(a[3], x[j + 2][2], x[j + 2][3], x[j + 3][2], x[j + 3][3]);
+}
+
 // Quantize k-step kk of x (as acc_to_a) with a per-(row, 32-column) scale from the quad's amax; returns the
 // matching A scale register (byte 0).
 template <int NT>
@@ -399,8 +434,21 @@ struct QuantArgs {
   float* row_s;  // [B * Hx, Np] per-token scales of the int8 row layout
   float* delta;  // [B * Hx, Np] if o
   __nv_bfloat16* raw;  // optional [B * Hx, Np, D]: BF16 of the (mean-subtracted) input, zero padding
+  // optional [B * Hx, Np, D] in the input dtype: the quantized values (of the row layout if requested, else of
+  // the col layout), i.e. the inputs the 8-bit GEMMs actually see, for an exact backward of the 8-bit forward
+  void* deq;
   int Hx, N, Np;
 };
+
+template <typename T>
+__device__ __forceinline__ uint32_t pack2(float lo, float hi) {
+  if constexpr (std::is_same_v<T, __nv_bfloat16>) {
+    return pack_bf16(lo, hi);
+  } else {
+    const __half2 v = __floats2half2_rn(lo, hi);
+    return *reinterpret_cast<const uint32_t*>(&v);
+  }
+}
 
 template <typename T>
 __device__ __forceinline__ void load8(const T* p, float (&v)[8]) {
@@ -473,15 +521,21 @@ __global__ void __launch_bounds__(THREADS) attn_quant_kernel(QuantArgs a) {
         nan |= __shfl_xor_sync(0xffffffffu, nan, off);
       }
       const float inv = am > 0.0f ? 127.0f / am : 0.0f;
+      const float sc = nan ? __int_as_float(0x7fffffff) : am / 127.0f;
       uint32_t w[2] = {0u, 0u};
+      float dq[8];
 #pragma unroll
       for (int k = 0; k < 8; ++k) {
         const int qv = min(127, max(-127, __float2int_rn(v[k] * inv)));
         w[k >> 2] |= (static_cast<uint32_t>(qv) & 0xffu) << (8 * (k & 3));
+        dq[k] = static_cast<float>(qv) * sc;
       }
       const int64_t row = static_cast<int64_t>(bh) * a.Np + t0 + r;
       *reinterpret_cast<uint2*>(a.row + row * D + c) = make_uint2(w[0], w[1]);
-      if (i % V == 0) a.row_s[row] = nan ? __int_as_float(0x7fffffff) : am / 127.0f;
+      if (i % V == 0) a.row_s[row] = sc;
+      if (a.deq != nullptr)
+        *reinterpret_cast<uint4*>(static_cast<T*>(a.deq) + row * D + c) =
+            make_uint4(pack2<T>(dq[0], dq[1]), pack2<T>(dq[2], dq[3]), pack2<T>(dq[4], dq[5]), pack2<T>(dq[6], dq[7]));
     }
   }
   __syncthreads();
@@ -504,6 +558,24 @@ __global__ void __launch_bounds__(THREADS) attn_quant_kernel(QuantArgs a) {
       dst[1] = make_uint4(w[4], w[5], w[6], w[7]);
       a.col_s[(static_cast<int64_t>(bh) * (a.Np / 64) + t0 / 64) * (2 * D) + ((d & 7) * (D / 8) + (d >> 3)) * 2 + blk] =
           static_cast<u8>(e);
+      if (a.deq != nullptr && a.row == nullptr) {  // consecutive lanes: consecutive channels of one token
+        const float sc = __uint_as_float(e << 23);  // 2^(e - 127)
+        T* dst = static_cast<T*>(a.deq) + (static_cast<int64_t>(bh) * a.Np + t0 + 32 * blk) * D + d;
+#pragma unroll
+        for (int q = 0; q < 8; ++q)
+#pragma unroll
+          for (int hh = 0; hh < 2; ++hh) {
+            const float2 f = __half22float2(e4m3x2_to_h2(static_cast<uint16_t>(w[q] >> (16 * hh))));
+            const int k = 4 * q + 2 * hh;
+            if constexpr (std::is_same_v<T, __nv_bfloat16>) {
+              dst[sigma(k) * D] = __float2bfloat16_rn(f.x * sc);
+              dst[sigma(k + 1) * D] = __float2bfloat16_rn(f.y * sc);
+            } else {
+              dst[sigma(k) * D] = __float2half_rn(f.x * sc);
+              dst[sigma(k + 1) * D] = __float2half_rn(f.y * sc);
+            }
+          }
+      }
     }
   }
 }
@@ -538,7 +610,9 @@ struct FwdCfg {
   static_assert(WARPS != 4 || BYTES <= kSmem2, "two CTAs per SM");
 };
 
-template <typename T, int D, int MT, int WARPS>
+// P2: P V as e4m3(P) V + e4m3(residual) V (one more MXFP8 MMA): O to ~2^-8 in P instead of 2^-4, for an exact
+// backward that takes Delta = rowsum(dO O) from this O (attention.py's backward="bf16").
+template <typename T, int D, int MT, int WARPS, bool P2>
 __global__ void __launch_bounds__(32 * WARPS, 8 / WARPS) attn_fwd_kernel(FwdArgs p) {
   using C = FwdCfg<D, MT, WARPS>;
   constexpr int KS = D / 32, ND = D / 8, NTH = C::NTH, WR = 16 * MT;
@@ -686,7 +760,7 @@ __global__ void __launch_bounds__(32 * WARPS, 8 / WARPS) attn_fwd_kernel(FwdArgs
           }
         }
       }
-      uint32_t pa[MT][4];
+      uint32_t pa[MT][4], pl[MT][4];
 #pragma unroll
       for (int mt = 0; mt < MT; ++mt) {
         const float ms0 = (m[mt][0] == -kInf ? 0.0f : m[mt][0]) - kPOff;
@@ -702,6 +776,7 @@ __global__ void __launch_bounds__(32 * WARPS, 8 / WARPS) attn_fwd_kernel(FwdArgs
         l[mt][0] += ls.x;
         l[mt][1] += ls.y;
         acc_to_a<4>(pa[mt], s[mt], 0, 1.0f, 1.0f);
+        if constexpr (P2) acc_resid<4>(pl[mt], pa[mt], s[mt], 0);
       }
       // O += P V (k-step hf of the tile): every V fragment feeds MT MMAs
 #pragma unroll
@@ -713,6 +788,10 @@ __global__ void __launch_bounds__(32 * WARPS, 8 / WARPS) attn_fwd_kernel(FwdArgs
         for (int mt = 0; mt < MT; ++mt) {
           mma8(o[mt][n], pa[mt], b0, b1, 0x7f7f7f7fu, vsc.w[i0 >> 2], 0, i0 & 3);
           mma8(o[mt][n + 1], pa[mt], b2, b3, 0x7f7f7f7fu, vsc.w[i1 >> 2], 0, i1 & 3);
+          if constexpr (P2) {  // the residuals carry 16x: A scale 2^-4
+            mma8(o[mt][n], pl[mt], b0, b1, 0x7b7b7b7bu, vsc.w[i0 >> 2], 0, i0 & 3);
+            mma8(o[mt][n + 1], pl[mt], b2, b3, 0x7b7b7b7bu, vsc.w[i1 >> 2], 0, i1 & 3);
+          }
         }
       }
     }
@@ -1016,13 +1095,13 @@ void launch_quant(const QuantArgs& a, int64_t Np, int64_t BH, cudaStream_t strea
   attn_quant_kernel<T, D><<<dim3(static_cast<unsigned>(Np / 64), static_cast<unsigned>(BH)), THREADS, 0, stream>>>(a);
 }
 
-template <typename T, int D>
+template <typename T, int D, bool P2>
 void launch_fwd(const FwdArgs& p, int64_t Np, int64_t BH, cudaStream_t stream) {
   using C = FwdCfg<D, 2, 4>;  // 32 query rows per warp, 4 warps per CTA, two CTAs per SM
   static std::atomic<uint64_t> done{0};
-  C10_CUDA_CHECK(nvfp4::gemm::ensure_smem_attr(attn_fwd_kernel<T, D, 2, 4>, C::BYTES, done));
-  attn_fwd_kernel<T, D, 2, 4><<<dim3(static_cast<unsigned>(Np / C::BQ), static_cast<unsigned>(BH)), C::NTH, C::BYTES,
-                                stream>>>(p);
+  C10_CUDA_CHECK(nvfp4::gemm::ensure_smem_attr(attn_fwd_kernel<T, D, 2, 4, P2>, C::BYTES, done));
+  attn_fwd_kernel<T, D, 2, 4, P2><<<dim3(static_cast<unsigned>(Np / C::BQ), static_cast<unsigned>(BH)), C::NTH,
+                                    C::BYTES, stream>>>(p);
 }
 
 template <typename T, int D>
@@ -1060,9 +1139,10 @@ bool vec_ok(const torch::Tensor& x) {
 using OptTensor = c10::optional<torch::Tensor>;
 using namespace nvfp4::attn;
 
-// x [B, Hx, N, D] -> {row, row_scales, col, col_scales, delta} (unused outputs are empty tensors).
+// x [B, Hx, N, D] -> {row, row_scales, col, col_scales, delta, raw (bf16), deq (x's dtype)} (unused outputs are
+// empty tensors).
 std::vector<torch::Tensor> nvfp4_attn_quant(torch::Tensor x, const OptTensor& mean, const OptTensor& o, bool want_row,
-                                            bool want_col, bool want_bf16) {
+                                            bool want_col, bool want_bf16, bool want_deq) {
   TORCH_CHECK(x.is_cuda() && x.dim() == 4, "x must be a 4-D [B, H, N, D] CUDA tensor");
   const c10::cuda::CUDAGuard guard(x.device());
   const int64_t B = x.size(0), Hx = x.size(1), N = x.size(2), D = x.size(3), Np = padded(N);
@@ -1089,7 +1169,9 @@ std::vector<torch::Tensor> nvfp4_attn_quant(torch::Tensor x, const OptTensor& me
                                      : torch::empty({0}, x.options().dtype(at::kFloat));
   torch::Tensor raw = want_bf16 ? torch::empty({B, Hx, Np, D}, x.options().dtype(at::kBFloat16))
                                 : torch::empty({0}, x.options().dtype(at::kBFloat16));
-  if (B * Hx == 0) return {row, row_s, col, col_s, delta, raw};
+  TORCH_CHECK(!want_deq || want_row || want_col, "want_deq needs the row or the col layout");
+  torch::Tensor deq = want_deq ? torch::empty({B, Hx, Np, D}, x.options()) : torch::empty({0}, x.options());
+  if (B * Hx == 0) return {row, row_s, col, col_s, delta, raw, deq};
   TORCH_CHECK(B * Hx < 65536, "batch * heads must be < 65536");
   QuantArgs a{};
   a.x = x.data_ptr();
@@ -1105,6 +1187,7 @@ std::vector<torch::Tensor> nvfp4_attn_quant(torch::Tensor x, const OptTensor& me
   a.col = want_col ? col.data_ptr<uint8_t>() : nullptr;
   a.col_s = want_col ? col_s.data_ptr<uint8_t>() : nullptr;
   a.raw = want_bf16 ? reinterpret_cast<__nv_bfloat16*>(raw.data_ptr()) : nullptr;
+  a.deq = want_deq ? deq.data_ptr() : nullptr;
   a.Hx = static_cast<int>(Hx), a.N = static_cast<int>(N), a.Np = static_cast<int>(Np);
   auto stream = at::cuda::getCurrentCUDAStream();
   switch (variant(x.scalar_type(), D)) {
@@ -1114,7 +1197,7 @@ std::vector<torch::Tensor> nvfp4_attn_quant(torch::Tensor x, const OptTensor& me
     default: launch_quant<__half, 128>(a, Np, B * Hx, stream); break;
   }
   C10_CUDA_KERNEL_LAUNCH_CHECK();
-  return {row, row_s, col, col_s, delta, raw};
+  return {row, row_s, col, col_s, delta, raw, deq};
 }
 
 static void check_s32(const torch::Tensor& t, int64_t B, int64_t H, int64_t Np, const char* name) {
@@ -1132,7 +1215,7 @@ static void check_q8(const torch::Tensor& t, int64_t B, int64_t H, int64_t a, in
 // Returns {o [B, N, H, D] (dtype), lse [B, H, Np] (log2 domain)}.
 std::vector<torch::Tensor> nvfp4_attn_fwd(torch::Tensor q, torch::Tensor qs, torch::Tensor k, torch::Tensor ks,
                                           torch::Tensor vt, torch::Tensor vts, int64_t N, bool causal, double scale,
-                                          c10::ScalarType dtype) {
+                                          c10::ScalarType dtype, bool p2) {
   const c10::cuda::CUDAGuard guard(q.device());
   const int64_t B = q.size(0), H = q.size(1), Np = q.size(2), D = q.size(3), Hk = k.size(1);
   TORCH_CHECK(Np == padded(N) && N > 0, "N does not match the quantized tensors");
@@ -1156,11 +1239,15 @@ std::vector<torch::Tensor> nvfp4_attn_fwd(torch::Tensor q, torch::Tensor qs, tor
   p.causal = causal ? 1 : 0;
   p.scale_log2 = static_cast<float>(scale * 1.4426950408889634);
   auto stream = at::cuda::getCurrentCUDAStream();
-  switch (variant(dtype, D)) {
-    case 0: launch_fwd<__nv_bfloat16, 64>(p, Np, B * H, stream); break;
-    case 1: launch_fwd<__nv_bfloat16, 128>(p, Np, B * H, stream); break;
-    case 2: launch_fwd<__half, 64>(p, Np, B * H, stream); break;
-    default: launch_fwd<__half, 128>(p, Np, B * H, stream); break;
+  switch (variant(dtype, D) + (p2 ? 4 : 0)) {
+    case 0: launch_fwd<__nv_bfloat16, 64, false>(p, Np, B * H, stream); break;
+    case 1: launch_fwd<__nv_bfloat16, 128, false>(p, Np, B * H, stream); break;
+    case 2: launch_fwd<__half, 64, false>(p, Np, B * H, stream); break;
+    case 3: launch_fwd<__half, 128, false>(p, Np, B * H, stream); break;
+    case 4: launch_fwd<__nv_bfloat16, 64, true>(p, Np, B * H, stream); break;
+    case 5: launch_fwd<__nv_bfloat16, 128, true>(p, Np, B * H, stream); break;
+    case 6: launch_fwd<__half, 64, true>(p, Np, B * H, stream); break;
+    default: launch_fwd<__half, 128, true>(p, Np, B * H, stream); break;
   }
   C10_CUDA_KERNEL_LAUNCH_CHECK();
   return {o, lse};

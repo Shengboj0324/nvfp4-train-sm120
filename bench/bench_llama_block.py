@@ -39,10 +39,11 @@ class LlamaBlock(torch.nn.Module):
         self.fused = False
         self.fused_res = False
         self.attn8 = False  # nvfp4.attention instead of BF16 SDPA (bench_long_context.py)
+        self.attn_backward = "bf16"  # its backward (nvfp4.attention(backward=...))
 
     def sdpa(self, q, k, v):
         if self.attn8:
-            return attention_8bit(q, k, v, causal=True)
+            return attention_8bit(q, k, v, causal=True, backward=self.attn_backward)
         return F.scaled_dot_product_attention(q, k, v, is_causal=True)
 
     def attn(self, qkv):

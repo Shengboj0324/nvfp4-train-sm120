@@ -40,10 +40,11 @@ class Block(nn.Module):
         self.fused = False  # set by fuse_producers(): LayerNorm / GELU run inside the NVFP4 quantizers
         self.fused_residual = False  # also q / k / v chunks and the residual adds (fuse_producers(residual=True))
         self.attn_8bit = False  # nvfp4.attention (INT8 scores, MXFP8 probabilities) instead of BF16 SDPA
+        self.attn_backward = "bf16"  # its backward: "bf16" (exact flash backward of the 8-bit forward) or "8bit"
 
     def sdpa(self, q, k, v):
         if self.attn_8bit:
-            return attention_8bit(q, k, v, causal=True)
+            return attention_8bit(q, k, v, causal=True, backward=self.attn_backward)
         return F.scaled_dot_product_attention(q, k, v, is_causal=True)
 
     def attend(self, q, k, v):
@@ -155,6 +156,8 @@ def main():
                     help="run LayerNorm / GELU (and its backward) inside the NVFP4 quantizers")
     ap.add_argument("--attn", choices=["sdpa", "8bit"], default="sdpa",
                     help="attention: BF16 SDPA, or nvfp4.attention (8-bit) in the NVFP4 blocks (all blocks in BF16 mode)")
+    ap.add_argument("--attn-backward", choices=["bf16", "8bit"], default="bf16",
+                    help="backward of the 8-bit attention: exact flash backward of the 8-bit forward, or 8-bit GEMMs")
     ap.add_argument("--seed", type=int, default=0)
     ap.add_argument("--data", default=os.environ.get("NVFP4_DATA", os.path.expanduser("~/nvfp4_data")))
     ap.add_argument("--out", required=True)
@@ -186,6 +189,7 @@ def main():
     if a.attn == "8bit":
         for i, blk in enumerate(model.blocks):
             blk.attn_8bit = a.precision == "bf16" or i < a.layers - a.hp_last
+            blk.attn_backward = a.attn_backward
     n_params = sum(p.numel() for p in model.parameters())
     opt = torch.optim.AdamW(model.parameters(), lr=a.lr, betas=(0.9, 0.95), weight_decay=0.1, fused=True)
     fwd = model

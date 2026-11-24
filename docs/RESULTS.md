@@ -369,51 +369,52 @@ gradients), and plain BF16 DDP on the same machine is just as slow (55k vs 145k 
 `pass2/`). Data-parallel scaling on consumer cards needs a host with P2P or fast PCIe between them, or
 gradients communicated in lower precision.
 
-## 7. 8-bit attention (v0.9.1, `bench/results/attention.json`, `long_context.json`, `experiments/results/v0.9*/`)
+## 7. 8-bit attention (v0.10, `bench/results/attention.json`, `long_context.json`, `experiments/results/v0.9*/`)
 
 **Kernel speed** (`bench/bench_attention.py`): 16 heads, 16384 tokens per call (batch = 16384 / length),
 TFLOPS counting causal attention as half (FlashAttention's convention, fwd+bwd = 3.5× the forward's
-FLOPs), autograd path including the quantization passes; PyTorch 2.14 SDPA (flash attention, BF16).
+FLOPs), autograd path including the quantization passes; PyTorch 2.14 SDPA (flash attention, BF16). The
+default backward (exact flash backward of the 8-bit forward) needs the forward's P V in two e4m3 terms
+(DESIGN.md §7.1); `backward="8bit"` runs the one-term forward and the 8-bit backward.
 
-| head dim | tokens / seq | mask | fwd: SDPA | fwd: 8-bit | | fwd+bwd: SDPA | fwd+bwd: 8-bit | |
+| head dim | tokens / seq | mask | fwd: SDPA | 8-bit, 1-term P | 2-term P (default) | fwd+bwd: SDPA | `backward="8bit"` | **default** |
 |---|---|---|---|---|---|---|---|---|
-| 128 | 512 | causal | 60 | **37** | 0.61× | 33 | **34** | 1.02× |
-| 128 | 512 | full | 79 | **62** | 0.78× | 51 | **50** | 0.99× |
-| 128 | 1024 | causal | 67 | **61** | 0.92× | 47 | **50** | 1.07× |
-| 128 | 1024 | full | 78 | **96** | 1.24× | 61 | **68** | 1.13× |
-| 128 | 2048 | causal | 75 | **93** | 1.24× | 59 | **65** | 1.09× |
-| 128 | 2048 | full | 84 | **128** | 1.53× | 71 | **83** | 1.16× |
-| 128 | 4096 | causal | 81 | **127** | 1.57× | 70 | **79** | 1.14× |
-| 128 | 4096 | full | 85 | **161** | 1.89× | 78 | **92** | 1.18× |
-| 128 | 8192 | causal | 82 | **155** | 1.89× | 77 | **89** | 1.15× |
-| 128 | 8192 | full | 85 | **185** | 2.19× | 81 | **95** | 1.17× |
-| 64 | 512 | causal | 48 | **35** | 0.72× | 32 | **32** | 1.01× |
-| 64 | 512 | full | 81 | **60** | 0.74× | 52 | **49** | 0.96× |
-| 64 | 1024 | causal | 61 | **52** | 0.84× | 46 | **45** | 0.98× |
-| 64 | 1024 | full | 83 | **83** | 1.00× | 64 | **64** | 1.01× |
-| 64 | 2048 | causal | 74 | **80** | 1.08× | 60 | **60** | 0.99× |
-| 64 | 2048 | full | 87 | **113** | 1.29× | 75 | **75** | 1.00× |
-| 64 | 4096 | causal | 78 | **113** | 1.44× | 71 | **73** | 1.02× |
-| 64 | 4096 | full | 87 | **138** | 1.59× | 81 | **84** | 1.04× |
-| 64 | 8192 | causal | 82 | **133** | 1.63× | 79 | **81** | 1.04× |
-| 64 | 8192 | full | 86 | **159** | 1.86× | 82 | **86** | 1.05× |
+| 128 | 512 | causal | 62 | 37 (0.60×) | 33 (0.54×) | 34 | 34 (1.01×) | **31 (0.93×)** |
+| 128 | 512 | full | 81 | 63 (0.78×) | 55 (0.68×) | 50 | 52 (1.03×) | **48 (0.95×)** |
+| 128 | 1024 | causal | 69 | 61 (0.89×) | 53 (0.77×) | 48 | 49 (1.02×) | **46 (0.96×)** |
+| 128 | 1024 | full | 84 | 96 (1.14×) | 82 (0.97×) | 61 | 68 (1.12×) | **64 (1.05×)** |
+| 128 | 2048 | causal | 76 | 94 (1.25×) | 79 (1.05×) | 60 | 66 (1.09×) | **62 (1.03×)** |
+| 128 | 2048 | full | 86 | 127 (1.48×) | 107 (1.25×) | 73 | 84 (1.15×) | **78 (1.07×)** |
+| 128 | 4096 | causal | 84 | 126 (1.50×) | 103 (1.23×) | 71 | 80 (1.13×) | **76 (1.07×)** |
+| 128 | 4096 | full | 88 | 163 (1.85×) | 128 (1.45×) | 79 | 93 (1.17×) | **87 (1.10×)** |
+| 128 | 8192 | causal | 86 | 158 (1.84×) | 124 (1.45×) | 79 | 90 (1.15×) | **86 (1.10×)** |
+| 128 | 8192 | full | 88 | 187 (2.13×) | 141 (1.61×) | 83 | 98 (1.18×) | **93 (1.12×)** |
+| 64 | 512 | causal | 55 | 35 (0.63×) | 30 (0.55×) | 32 | 32 (1.00×) | **30 (0.91×)** |
+| 64 | 512 | full | 83 | 60 (0.72×) | 45 (0.55×) | 52 | 49 (0.95×) | **45 (0.86×)** |
+| 64 | 1024 | causal | 70 | 52 (0.74×) | 45 (0.64×) | 46 | 46 (1.00×) | **43 (0.94×)** |
+| 64 | 1024 | full | 90 | 82 (0.92×) | 69 (0.77×) | 65 | 62 (0.96×) | **63 (0.97×)** |
+| 64 | 2048 | causal | 77 | 81 (1.05×) | 67 (0.87×) | 61 | 61 (1.00×) | **59 (0.97×)** |
+| 64 | 2048 | full | 89 | 114 (1.29×) | 91 (1.03×) | 75 | 75 (0.99×) | **77 (1.02×)** |
+| 64 | 4096 | causal | 83 | 111 (1.34×) | 90 (1.09×) | 71 | 73 (1.02×) | **75 (1.04×)** |
+| 64 | 4096 | full | 90 | 141 (1.58×) | 109 (1.22×) | 81 | 84 (1.04×) | **86 (1.06×)** |
+| 64 | 8192 | causal | 84 | 134 (1.60×) | 107 (1.28×) | 78 | 82 (1.05×) | **84 (1.07×)** |
+| 64 | 8192 | full | 91 | 157 (1.72×) | 121 (1.33×) | 85 | 89 (1.04×) | **91 (1.07×)** |
 
-The forward gains with the sequence length (the quantization pass is a per-token cost) and the head dim.
-The backward computes dQ in BF16 with a consistency correction (DESIGN.md §7); before that fix
-forward + backward was 1.4–1.5× at D = 128 from 4k tokens, with 7–24% error in dQ on real activations.
+The forward gains with the sequence length (the quantization pass is a per-token cost) and the head dim;
+the default backward runs at flash attention's BF16 speed, so in training the gain is the forward's.
 
 **Training step of a Llama block** (`bench/bench_long_context.py`): d = 2048, 16 heads of 128, SwiGLU,
 16384 tokens per step, BF16 vs NVFP4 linears with every fusion and the weight cache, with BF16 or
-8-bit attention:
+8-bit attention (gain: over the NVFP4 block with BF16 attention):
 
-| tokens / seq | BF16 | NVFP4, BF16 attention | **NVFP4 + 8-bit attention** | gain from attention |
-|---|---|---|---|---|
-| 512 | 75.6 ms | 25.3 ms (2.99×) | **25.6 ms (2.95×)** | 0.99× |
-| 1024 | 76.4 ms | 28.2 ms (2.71×) | **27.6 ms (2.77×)** | 1.02× |
-| 2048 | 77.9 ms | 31.9 ms (2.44×) | **30.5 ms (2.55×)** | 1.05× |
-| 4096 | 84.5 ms | 35.5 ms (2.38×) | **34.5 ms (2.45×)** | 1.03× |
-| 8192 | 92.5 ms | 47.0 ms (1.97×) | **44.5 ms (2.08×)** | 1.06× |
-| 16384 | 118.1 ms | 70.1 ms (1.69×) | **63.0 ms (1.87×)** | 1.11× |
+| tokens / seq | BF16 | NVFP4, BF16 attention | **NVFP4 + 8-bit attention** | gain | NVFP4 + 8-bit, `backward="8bit"` | gain |
+|---|---|---|---|---|---|---|
+| 512 | 75.4 ms | 24.8 ms (3.04×) | **25.8 ms (2.92×)** | 0.96× | 25.2 ms (3.00×) | 0.99× |
+| 1024 | 76.0 ms | 27.0 ms (2.82×) | **28.2 ms (2.70×)** | 0.96× | 27.3 ms (2.78×) | 0.99× |
+| 2048 | 77.9 ms | 29.7 ms (2.62×) | **30.5 ms (2.56×)** | 0.98× | 29.6 ms (2.63×) | 1.01× |
+| 4096 | 84.4 ms | 35.3 ms (2.39×) | **35.3 ms (2.39×)** | 1.00× | 34.3 ms (2.46×) | 1.03× |
+| 8192 | 91.9 ms | 46.5 ms (1.98×) | **45.0 ms (2.04×)** | 1.03× | 43.7 ms (2.11×) | 1.07× |
+| 16384 | 117.6 ms | 69.7 ms (1.69×) | **64.3 ms (1.83×)** | 1.08× | 62.4 ms (1.88×) | 1.12× |
 
 **Quality.** GPT-124M on TinyStories, 3000 steps, NVFP4 linears unless noted, 8-bit attention in every
 block with NVFP4 linears (all blocks in the BF16 run):
@@ -426,13 +427,16 @@ block with NVFP4 linears (all blocks in the BF16 run):
 | 512, 12 × 64 | NVFP4 | 8-bit (v0.9.0) | 1.5095 | | +0.14% | 81k |
 | 4096, 6 × 128 | NVFP4 | BF16 (SDPA) | 1.6027 | 1.5928 | | 66k |
 | 4096, 6 × 128 | NVFP4 | 8-bit (v0.9.0) | 1.6150 | 1.6035 | +0.72% | 70k |
-| 4096, 6 × 128 | NVFP4 | **8-bit (v0.9.1)** | **1.6088** | **1.6033** | **+0.52%** | 67k |
+| 4096, 6 × 128 | NVFP4 | 8-bit, `backward="8bit"` (v0.9.1) | 1.6088 | 1.6033 | +0.52% | 67k |
+| 4096, 6 × 128 | NVFP4 | **8-bit, default backward (v0.10)** | **1.5979** | **1.5949** | **−0.09%** | 67k |
 
-At 512 tokens 8-bit attention costs nothing measurable; at 4096 tokens it costs 0.5% (both seeds above
-their BF16-attention runs; the BF16 baseline's seed-to-seed spread is 0.003). The v0.9.0 backward's dQ
-error (above) accounted for about a third of the gap at 4096. Per-layer errors on the activations of a
-model trained at 4096 tokens (`bench/attention_real_errors.py`, layers 0–9): output 1.1–2.5%, dQ 0.5–1.5%
-(v0.9.0: 0.4–24%), dK 2.6–3.9%, dV 2.3–3.0%.
+At 512 tokens 8-bit attention costs nothing measurable. At 4096 tokens the 8-bit backward cost 0.5% (both
+seeds above their BF16-attention runs; the BF16 baseline's seed-to-seed spread is 0.003), and the exact
+backward of the 8-bit forward removes the gap (one seed below, one above the BF16 run). Per-layer errors
+on the activations of a model trained at 4096 tokens (`bench/attention_real_errors.py`,
+`bench/attention_qbwd_probe.py`, layers 0–9), default backward [`backward="8bit"`]: output 0.6–1.8%
+[0.7–2.3%], dQ 0.4–2.0% [0.3–0.6%; v0.9.0: 0.4–24%], dK 1.2–6.9% [2.8–7.1%], dV 0.2–2.1% [2.5–3.1%].
+GPT-124M (attention a small share of the step) trains at the same speed with either.
 
 ## Reproduce
 

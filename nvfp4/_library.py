@@ -173,15 +173,15 @@ def _gemm_out_impl(a: Tensor, sfa: Tensor, gdec_a: Tensor, b: Tensor, sfb: Tenso
 
 
 def _attn_quant_impl(x: Tensor, mean: Optional[Tensor], o: Optional[Tensor], want_row: bool,
-                     want_col: bool, want_bf16: bool) -> List[Tensor]:
+                     want_col: bool, want_bf16: bool, want_deq: bool = False) -> List[Tensor]:
     require(x)
-    return list(_C.attn_quant(x, mean, o, want_row, want_col, want_bf16))
+    return list(_C.attn_quant(x, mean, o, want_row, want_col, want_bf16, want_deq))
 
 
 def _attn_fwd_impl(q: Tensor, qs: Tensor, k: Tensor, ks: Tensor, vt: Tensor, vts: Tensor, N: int, causal: bool,
-                   scale: float, dtype: torch.dtype) -> List[Tensor]:
+                   scale: float, dtype: torch.dtype, p2: bool = False) -> List[Tensor]:
     require(q)
-    return list(_C.attn_fwd(q, qs, k, ks, vt, vts, N, causal, scale, dtype))
+    return list(_C.attn_fwd(q, qs, k, ks, vt, vts, N, causal, scale, dtype, p2))
 
 
 def _attn_bwd_impl(q: Tensor, qs: Tensor, qt: Tensor, qts: Tensor, k: Tensor, ks: Tensor, kt: Tensor, kts: Tensor,
@@ -312,7 +312,7 @@ def _pad128(n: int) -> int:
 
 
 @_attn_quant_op.register_fake
-def _(x, mean, o, want_row, want_col, want_bf16):
+def _(x, mean, o, want_row, want_col, want_bf16, want_deq=False):
     B, H, N, D = x.shape
     Np, u8 = _pad128(N), torch.uint8
     e = x.new_empty((0,), dtype=u8)
@@ -321,11 +321,12 @@ def _(x, mean, o, want_row, want_col, want_bf16):
             x.new_empty((B, H, D, Np), dtype=u8) if want_col else e,
             x.new_empty((B, H, Np // 64, 2 * D), dtype=u8) if want_col else e,
             x.new_empty((B, H, Np) if o is not None else (0,), dtype=torch.float32),
-            x.new_empty((B, H, Np, D) if want_bf16 else (0,), dtype=torch.bfloat16)]
+            x.new_empty((B, H, Np, D) if want_bf16 else (0,), dtype=torch.bfloat16),
+            x.new_empty((B, H, Np, D) if want_deq else (0,))]
 
 
 @_attn_fwd_op.register_fake
-def _(q, qs, k, ks, vt, vts, N, causal, scale, dtype):
+def _(q, qs, k, ks, vt, vts, N, causal, scale, dtype, p2=False):
     B, H, Np, D = q.shape
     return [q.new_empty((B, N, H, D), dtype=dtype), q.new_empty((B, H, Np), dtype=torch.float32)]
 

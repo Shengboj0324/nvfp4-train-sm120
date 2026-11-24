@@ -1,5 +1,6 @@
 """Speed of nvfp4.attention (INT8 scores + MXFP8 probabilities) vs PyTorch SDPA (flash attention, BF16):
-forward, and forward + backward through autograd (quantization included), causal and full.
+forward, and forward + backward through autograd (quantization included), causal and full, for both
+backwards: "bf16" (default: exact flash backward of the 8-bit forward, two-term P in the forward) and "8bit".
 
     python bench/bench_attention.py [--out bench/results/attention.json]
 """
@@ -25,7 +26,8 @@ def run(b, h, t, d, causal):
     flops = 4 * b * h * t * t * d * (0.5 if causal else 1.0)
     r = {"b": b, "h": h, "t": t, "d": d, "causal": causal}
     for name, fn in (("sdpa", lambda: F.scaled_dot_product_attention(q, k, v, is_causal=causal)),
-                     ("int8_fp8", lambda: attention(q, k, v, causal=causal))):
+                     ("int8_fp8", lambda: attention(q, k, v, causal=causal, backward="8bit")),
+                     ("bf16bwd", lambda: attention(q, k, v, causal=causal, backward="bf16"))):
         with torch.no_grad():
             tf = timeit(fn, iters=10, warmup=3, trials=5)
 
@@ -36,6 +38,8 @@ def run(b, h, t, d, causal):
         r[f"{name}_fwd_tflops"], r[f"{name}_fwdbwd_tflops"] = flops / tf / 1e12, 3.5 * flops / tfb / 1e12
     r["speedup_fwd"] = r["sdpa_fwd_ms"] / r["int8_fp8_fwd_ms"]
     r["speedup_fwdbwd"] = r["sdpa_fwdbwd_ms"] / r["int8_fp8_fwdbwd_ms"]
+    r["speedup_fwd_bf16bwd"] = r["sdpa_fwd_ms"] / r["bf16bwd_fwd_ms"]
+    r["speedup_fwdbwd_bf16bwd"] = r["sdpa_fwdbwd_ms"] / r["bf16bwd_fwdbwd_ms"]
     return r
 
 
@@ -50,7 +54,9 @@ def main():
             for causal in (True, False):
                 r = run(a.tokens // t, h, t, d, causal)
                 rows.append(r)
-                print(json.dumps({k: round(v, 2) if isinstance(v, float) else v for k, v in r.items()}), flush=True)
+                print(f"d{d} t{t:5d} causal={causal!s:5}: fwd 8bit {r['speedup_fwd']:.2f}x bf16bwd "
+                      f"{r['speedup_fwd_bf16bwd']:.2f}x | fwd+bwd 8bit {r['speedup_fwdbwd']:.2f}x bf16bwd "
+                      f"{r['speedup_fwdbwd_bf16bwd']:.2f}x (sdpa {r['sdpa_fwdbwd_tflops']:.1f} TF)", flush=True)
                 torch.cuda.empty_cache()
     os.makedirs(os.path.dirname(os.path.abspath(a.out)), exist_ok=True)
     json.dump(rows, open(a.out, "w"), indent=1)

@@ -1,19 +1,23 @@
-"""MXFP8 flash attention for sm_120 (forward and a deterministic backward), a drop-in for causal or full
-``F.scaled_dot_product_attention`` in training.
+"""8-bit flash attention for sm_120, a drop-in for causal or full ``F.scaled_dot_product_attention`` in
+training.
 
-Q K^T and dO V^T run on INT8 tensor cores with per-token scales; P V, P^T dO and dS^T Q on block-scaled FP8
-(E4M3 with one power-of-two scale per 32 elements, MXFP8); dQ = dS K, which cancels to a small difference of
-large terms, in BF16. All with FP32 accumulation; softmax statistics, the online rescaling and every reduction
-stay in FP32. K is centred by its per-channel mean over the sequence before quantization (``smooth_k``), which
-leaves the attention output unchanged (a per-row constant in the scores) and its gradients too, but takes the
-channel offsets typical of keys out of the quantization range.
+The forward runs Q K^T on INT8 tensor cores with per-token scales and P V on block-scaled FP8 (E4M3 with one
+power-of-two scale per 32 elements, MXFP8), with FP32 accumulation, softmax statistics and online rescaling.
+The default backward (``backward="bf16"``) is PyTorch's flash-attention backward of exactly that forward: it
+runs on the dequantized 8-bit operands with the forward's log-sum-exp, and the forward then computes P V with P
+in two e4m3 terms so that its output gives a consistent Delta (docs/DESIGN.md §7.1). ``backward="8bit"`` is
+this package's deterministic backward: dO V^T in INT8, P^T dO and dS^T Q in MXFP8, dQ = dS K (a small
+difference of large terms) in BF16. K is centred by its per-channel mean over the sequence before
+quantization (``smooth_k``), which leaves the attention output unchanged (a per-row constant in the scores)
+and its gradients too, but takes the channel offsets typical of keys out of the quantization range.
 
     from nvfp4.attention import attention
     o = attention(q, k, v, causal=True)      # q [B, H, N, D], k / v [B, Hkv, N, D], D in {64, 128}
 
 Inputs that the kernels don't cover (other head dims, fp32, attention masks, dropout) fall back to PyTorch's
 scaled_dot_product_attention. The returned tensor is a [B, H, N, D] view of [B, N, H, D] memory, so the usual
-``o.transpose(1, 2).reshape(B, N, H * D)`` is free, and the input gradients come back the same way.
+``o.transpose(1, 2).reshape(B, N, H * D)`` is free (``backward="8bit"`` also returns the input gradients that
+way).
 """
 from __future__ import annotations
 
@@ -47,10 +51,10 @@ class _AttentionFn(torch.autograd.Function):
         N = q.shape[2]
         grad = any(ctx.needs_input_grad[:3])
         kmean = k.mean(dim=2, dtype=torch.float32) if smooth_k else None
-        q8, qs, qt, qts, _, _ = _lib.attn_quant(q, None, None, True, grad, False)
+        q8, qs, qt, qts, _, _, _ = _lib.attn_quant(q, None, None, True, grad, False)
         # K: INT8 rows, plus (for dQ = dS K, done in BF16) a BF16 copy, both centred by the mean
-        k8, ks, kt, kts, _, k16 = _lib.attn_quant(k, kmean, None, True, grad, grad)
-        v8, vs, vt, vts, _, _ = _lib.attn_quant(v, None, None, grad, True, False)
+        k8, ks, kt, kts, _, k16, _ = _lib.attn_quant(k, kmean, None, True, grad, grad)
+        v8, vs, vt, vts, _, _, _ = _lib.attn_quant(v, None, None, grad, True, False)
         o, lse = _lib.attn_fwd(q8, qs, k8, ks, vt, vts, N, causal, scale, q.dtype)
         o = o.transpose(1, 2)
         if grad:
@@ -62,18 +66,68 @@ class _AttentionFn(torch.autograd.Function):
     def backward(ctx, do):
         q8, qs, qt, qts, k8, ks, kt, kts, k16, v8, vs, o, lse = ctx.saved_tensors
         N, causal, scale, q_stride, k_stride, dtype = ctx.cfg
-        g8, gs, gt, gts, delta, _ = _lib.attn_quant(do.to(dtype), None, o, True, True, False)
+        g8, gs, gt, gts, delta, _, _ = _lib.attn_quant(do.to(dtype), None, o, True, True, False)
         dq, dk, dv = _lib.attn_bwd(q8, qs, qt, qts, k8, ks, kt, kts, k16, v8, vs, g8, gs, gt, gts, lse, delta, N,
                                    causal, scale, dtype, q_stride, k_stride)
         return dq, dk, dv, None, None, None
 
 
+_LN2 = 0.6931471805599453
+
+
+class _AttentionBf16BwdFn(torch.autograd.Function):
+    """8-bit forward, exact backward of it: PyTorch's flash-attention backward (input precision) run on the
+    dequantized 8-bit operands (int8 q / centred k, MXFP8 v), which are exactly what the forward multiplied, with
+    the forward's log-sum-exp and output. The backward's recomputed scores then agree with the forward's
+    softmax statistics, and P V with P carried to ~2^-8 (two e4m3 terms) keeps Delta = rowsum(dO O)
+    consistent. The gradients are those of the quantized forward (straight-through for the quantizers)."""
+
+    @staticmethod
+    def forward(ctx, q, k, v, causal: bool, scale: float, smooth_k: bool):
+        N = q.shape[2]
+        grad = any(ctx.needs_input_grad[:3])
+        kmean = k.mean(dim=2, dtype=torch.float32) if smooth_k else None
+        q8, qs, _, _, _, _, qd = _lib.attn_quant(q, None, None, True, False, False, grad)
+        k8, ks, _, _, _, _, kd = _lib.attn_quant(k, kmean, None, True, False, False, grad)
+        _, _, vt, vts, _, _, vd = _lib.attn_quant(v, None, None, False, True, False, grad)
+        o, lse = _lib.attn_fwd(q8, qs, k8, ks, vt, vts, N, causal, scale, q.dtype, True)
+        o = o.transpose(1, 2)
+        if grad:
+            lse_nat = (lse[:, :, :N] * _LN2).contiguous()  # log2 domain -> natural log, as flash attention keeps it
+            ctx.save_for_backward(qd[:, :, :N], kd[:, :, :N], vd[:, :, :N], o, lse_nat)
+        ctx.cfg = (causal, scale)
+        return o
+
+    @staticmethod
+    def backward(ctx, do):
+        qd, kd, vd, o, lse = ctx.saved_tensors
+        causal, scale = ctx.cfg
+        rep = qd.shape[1] // kd.shape[1]
+        ke, ve = (kd.repeat_interleave(rep, 1), vd.repeat_interleave(rep, 1)) if rep > 1 else (kd, vd)
+        zero = torch.zeros((), dtype=torch.uint64, device=qd.device)
+        dq, dk, dv = torch.ops.aten._scaled_dot_product_flash_attention_backward(
+            do.to(qd.dtype), qd, ke, ve, o, lse, None, None, qd.shape[2], kd.shape[2], 0.0, causal,
+            torch.zeros(2, dtype=torch.uint64, device=qd.device), zero, scale=scale)
+        if rep > 1:
+            B, Hk, N, D = kd.shape
+            dk = dk.view(B, Hk, rep, N, D).sum(2)
+            dv = dv.view(B, Hk, rep, N, D).sum(2)
+        return dq, dk, dv, None, None, None
+
+
 def attention(q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, *, causal: bool = False,
-              scale: float | None = None, smooth_k: bool = True) -> torch.Tensor:
-    """softmax(scale * q k^T [+ causal mask]) v with MXFP8 tensor-core GEMMs (see the module docstring).
+              scale: float | None = None, smooth_k: bool = True, backward: str = "bf16") -> torch.Tensor:
+    """softmax(scale * q k^T [+ causal mask]) v with 8-bit tensor-core GEMMs (see the module docstring).
 
     q: [B, H, N, D]; k, v: [B, Hkv, N, D] with H a multiple of Hkv (grouped-query attention); bf16 or fp16;
-    D in {64, 128}; any strides with a contiguous last dim. scale defaults to D ** -0.5."""
+    D in {64, 128}; any strides with a contiguous last dim. scale defaults to D ** -0.5.
+
+    backward="bf16" (default): the exact gradient of the 8-bit forward, from PyTorch's flash-attention backward
+    in the input precision (as fast as BF16 attention's backward; not bitwise deterministic unless
+    torch.use_deterministic_algorithms is on). backward="8bit": this package's 8-bit backward (deterministic,
+    2-4x larger dK / dV errors) with a slightly faster forward (P V in one e4m3 term)."""
+    if backward not in ("bf16", "8bit"):
+        raise ValueError(f"backward must be 'bf16' or '8bit', got {backward!r}")
     if scale is None:
         scale = q.shape[-1] ** -0.5
     if not (supported(q, k, v) and scale > 0):
@@ -81,4 +135,6 @@ def attention(q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, *, causal: bool
         if rep > 1:
             k, v = k.repeat_interleave(rep, 1), v.repeat_interleave(rep, 1)
         return F.scaled_dot_product_attention(q, k, v, is_causal=causal, scale=scale)
+    if backward == "bf16":
+        return _AttentionBf16BwdFn.apply(q, k, v, causal, float(scale), smooth_k)
     return _AttentionFn.apply(q, k, v, causal, float(scale), smooth_k)

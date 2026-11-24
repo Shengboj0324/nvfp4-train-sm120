@@ -1,9 +1,11 @@
 """nvfp4.attention: 8-bit flash attention (INT8 scores, MXFP8 probabilities / gradients) for sm_120.
 
-The operand quantizer is checked bit-exactly against nvfp4.reference (both layouts, mean subtraction, NaN);
-the forward against the reference emulation of the same quantization (which differs only in where the
-probabilities are rounded) and against exact attention; the gradients against exact attention, at the error
-levels 8-bit operands imply; plus determinism, gradient layouts, GQA, ragged lengths, fallback and compile."""
+The operand quantizer is checked bit-exactly against nvfp4.reference (both layouts, the dequantized values,
+mean subtraction, NaN); the forward against the reference emulation of the same quantization (which differs
+only in where the probabilities are rounded) and against exact attention, and its two-term-P variant against
+exact attention of the quantized inputs; the gradients of both backwards against exact attention at the
+error levels 8-bit operands imply, and those of backward="bf16" against the exact gradient of the quantized
+forward; plus determinism, gradient layouts, GQA, ragged lengths, fallback and compile."""
 import math
 
 import pytest
@@ -42,7 +44,7 @@ def _exact(q, k, v, causal, scale):
 def test_quantizer_is_exact(D, N, with_mean):
     x = torch.randn(2, 3, N, D, device=DEV, dtype=torch.bfloat16) * 3
     mean = x.mean(dim=2, dtype=torch.float32) if with_mean else None
-    row, rs, col, cs, _, raw = lib.attn_quant(x, mean, None, True, True, True)
+    row, rs, col, cs, _, raw, _ = lib.attn_quant(x, mean, None, True, True, True)
     xs = x.float() - mean.unsqueeze(2) if with_mean else x.float()
     codes, sc = ref.int8_token_quantize(xs)
     Np = row.shape[2]
@@ -56,14 +58,20 @@ def test_quantizer_is_exact(D, N, with_mean):
     ccodes, ce = ref.mxfp8_quantize(xp[:, :, perm], dim=-2)
     ce = ce.reshape(2, 3, D // 8, 8, Np // 64, 2).permute(0, 1, 4, 3, 2, 5).reshape(cs.shape)
     assert torch.equal(col.view(torch.uint8), ccodes.view(torch.uint8)) and torch.equal(cs.int(), ce)
+    # dequantized values (backward="bf16"): of the row layout when it is requested, else of the col layout
+    deq_row = lib.attn_quant(x, mean, None, True, False, False, True)[6]
+    assert deq_row.dtype == x.dtype and deq_row.shape == row.shape
+    assert torch.equal(deq_row[:, :, :N], ref.int8_token_fake(xs).to(x.dtype))
+    deq_col = lib.attn_quant(x, mean, None, False, True, False, True)[6]
+    assert torch.equal(deq_col, ref.mxfp8_fake(xp, dim=-2).to(x.dtype))
 
 
 def test_quantizer_delta_and_strides():
     # dO as a transposed view (the layout autograd hands over), delta = rowsum(dO * O)
     g = torch.randn(2, 300, 4, 64, device=DEV, dtype=torch.bfloat16).transpose(1, 2)
     o = torch.randn(2, 300, 4, 64, device=DEV, dtype=torch.bfloat16).transpose(1, 2)
-    row, rs, col, cs, delta, _ = lib.attn_quant(g, None, o, True, True, False)
-    row2, rs2, col2, cs2, _, _ = lib.attn_quant(g.contiguous(), None, None, True, True, False)
+    row, rs, col, cs, delta, _, _ = lib.attn_quant(g, None, o, True, True, False)
+    row2, rs2, col2, cs2, _, _, _ = lib.attn_quant(g.contiguous(), None, None, True, True, False)
     assert torch.equal(row, row2) and torch.equal(rs, rs2) and torch.equal(col, col2) and torch.equal(cs, cs2)
     want = (g.float() * o.float()).sum(-1)
     torch.testing.assert_close(delta[:, :, :300], want, rtol=1e-5, atol=1e-4)
@@ -101,14 +109,58 @@ def test_forward_matches_emulation_and_exact(B, H, Hk, N, D, causal):
     assert _rel(o, exact) < 0.05  # 8-bit error level (BF16 flash attention: ~0.002)
 
 
+def _quantized_inputs(q, k, v):
+    """The operands as the 8-bit kernels see them (fp32): int8 q / centred k per token, MXFP8 v."""
+    N = q.shape[2]
+    return (ref.int8_token_fake(q.float()), ref.int8_token_fake(k.float() - k.float().mean(2, keepdim=True)),
+            ref.mxfp8_fake(ref._pad_seq(v.float()), dim=-2)[..., :N, :])
+
+
+@pytest.mark.parametrize("B,H,Hk,N,D,causal", CASES)
+def test_two_term_forward_is_exact_attention_of_quantized_inputs(B, H, Hk, N, D, causal):
+    # backward="bf16" runs the forward with P V = e4m3(P) V + e4m3(residual) V: the output is then exact
+    # attention of the quantized operands up to ~2^-8 in P (BF16 flash attention's own level), which keeps
+    # Delta = rowsum(dO O) consistent with the exact backward
+    q, k, v = _qkv(B, H, Hk, N, D)
+    want = _exact(*(t.to(q.dtype) for t in _quantized_inputs(q, k, v)), causal, None)
+    with torch.no_grad():
+        o2 = attention(q, k, v, causal=causal, backward="bf16")
+        o1 = attention(q, k, v, causal=causal, backward="8bit")
+    assert _rel(o2, want) < 0.006
+    if N > 1:
+        assert _rel(o2, want) < 0.5 * _rel(o1, want)
+
+
 @pytest.mark.parametrize("B,H,Hk,N,D,causal", CASES)
 @pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
-def test_gradients(B, H, Hk, N, D, causal, dtype):
+def test_bf16_backward_is_exact_gradient_of_quantized_forward(B, H, Hk, N, D, causal, dtype):
     q, k, v = _qkv(B, H, Hk, N, D, dtype=dtype)
     q, k, v = (t.requires_grad_() for t in (q, k, v))
     torch.manual_seed(1)
     do = torch.randn_like(q)
-    attention(q, k, v, causal=causal).backward(do)
+    attention(q, k, v, causal=causal, backward="bf16").backward(do)
+    got = [t.grad for t in (q, k, v)]
+    # straight-through: the gradient of exact attention at the quantized operands (k's mean shift changes no
+    # gradient)
+    qq, kq, vq = (t.detach().to(dtype).float().requires_grad_() for t in _quantized_inputs(q, k, v))
+    _exact(qq, kq, vq, causal, D ** -0.5).backward(do.float())
+    for name, a, b in zip("qkv", got, (qq.grad, kq.grad, vq.grad)):
+        assert a.dtype == dtype and a.shape == b.shape and a.isfinite().all()
+        if N == 1 and name != "v":
+            assert a.float().norm() < 0.01 * do.float().norm(), name  # zero analytically (a single key)
+            continue
+        assert _rel(a, b) < 0.012, name  # BF16 flash attention level (exact inputs: ~0.003)
+
+
+@pytest.mark.parametrize("B,H,Hk,N,D,causal", CASES)
+@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
+@pytest.mark.parametrize("backward", ["bf16", "8bit"])
+def test_gradients(B, H, Hk, N, D, causal, dtype, backward):
+    q, k, v = _qkv(B, H, Hk, N, D, dtype=dtype)
+    q, k, v = (t.requires_grad_() for t in (q, k, v))
+    torch.manual_seed(1)
+    do = torch.randn_like(q)
+    attention(q, k, v, causal=causal, backward=backward).backward(do)
     got = [t.grad for t in (q, k, v)]
     for t in (q, k, v):
         t.grad = None
@@ -124,35 +176,40 @@ def test_gradients(B, H, Hk, N, D, causal, dtype):
 
 
 def test_backward_is_deterministic():
+    # the 8-bit backward has no atomics; backward="bf16" is PyTorch's flash backward (deterministic only under
+    # torch.use_deterministic_algorithms, as for SDPA)
     q, k, v = (t.requires_grad_() for t in _qkv(2, 4, 2, 1000, 128))
     do = torch.randn_like(q)
     runs = []
     for _ in range(2):
-        attention(q, k, v, causal=True).backward(do)
+        attention(q, k, v, causal=True, backward="8bit").backward(do)
         runs.append([t.grad.clone() for t in (q, k, v)])
         for t in (q, k, v):
             t.grad = None
     assert all(torch.equal(a, b) for a, b in zip(*runs))
 
 
-def test_gradient_layouts_follow_inputs():
+@pytest.mark.parametrize("backward", ["bf16", "8bit"])
+def test_gradient_layouts_follow_inputs(backward):
     # q / k / v as views of a fused projection output [B, N, 3, H, D] (the usual case): no copies needed
     B, N, H, D = 2, 256, 4, 64
     x = torch.randn(B, N, 3, H, D, device=DEV, dtype=torch.bfloat16, requires_grad=True)
     q, k, v = x.unbind(2)
     q, k, v = (t.transpose(1, 2) for t in (q, k, v))
-    o = attention(q, k, v, causal=True)
+    o = attention(q, k, v, causal=True, backward=backward)
     assert o.transpose(1, 2).is_contiguous()  # [B, N, H, D] memory: the head merge is free
     # (q is not dense - it skips k and v - so its gradient comes as [B, N, H, D] memory, which the view
     # backward scatters into x's gradient)
     gq = torch.autograd.grad(o, q, torch.ones_like(o), retain_graph=True)[0]
-    assert gq.transpose(1, 2).is_contiguous()
+    if backward == "8bit":  # (flash attention's backward picks its own layout)
+        assert gq.transpose(1, 2).is_contiguous()
     o.sum().backward()
     assert x.grad.shape == x.shape and torch.isfinite(x.grad).all()
-    # contiguous [B, H, N, D] inputs get contiguous gradients
     q2, k2, v2 = (t.detach().contiguous().requires_grad_() for t in (q, k, v))
-    attention(q2, k2, v2).sum().backward()
-    assert q2.grad.is_contiguous() and k2.grad.is_contiguous() and v2.grad.is_contiguous()
+    attention(q2, k2, v2, backward=backward).sum().backward()
+    assert q2.grad.shape == q2.shape and k2.grad.shape == k2.shape and v2.grad.shape == v2.shape
+    if backward == "8bit":  # contiguous [B, H, N, D] inputs get contiguous gradients
+        assert q2.grad.is_contiguous() and k2.grad.is_contiguous() and v2.grad.is_contiguous()
 
 
 def test_smooth_k_changes_nothing_exactly_in_exact_arithmetic():
@@ -174,11 +231,12 @@ def test_fallback_to_sdpa():
     assert not supported(q32, q32, q32)
 
 
-def test_torch_compile_fullgraph():
+@pytest.mark.parametrize("backward", ["bf16", "8bit"])
+def test_torch_compile_fullgraph(backward):
     q, k, v = (t.requires_grad_() for t in _qkv(1, 4, 2, 256, 64))
 
     def f(q, k, v):
-        return attention(q, k, v, causal=True).float().square().mean()
+        return attention(q, k, v, causal=True, backward=backward).float().square().mean()
 
     eager = f(q, k, v)
     eager.backward()
@@ -192,6 +250,12 @@ def test_torch_compile_fullgraph():
     # the kernels are the same; the surrounding reductions (the loss here, K's mean) may be reordered by inductor
     torch.testing.assert_close(out, eager, rtol=1e-4, atol=0)
     assert all(_rel(t.grad, g) < 1e-2 for t, g in zip((q, k, v), ge))
+
+
+def test_backward_argument():
+    q, k, v = _qkv(1, 2, 2, 64, 64)
+    with pytest.raises(ValueError):
+        attention(q, k, v, backward="fp8")
 
 
 def test_scale_and_no_grad():
