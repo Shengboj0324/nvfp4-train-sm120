@@ -9,8 +9,9 @@ Routing: softmax over the router logits (fp32), top-k experts per token, weights
 choices. The (token, expert) pairs are sorted by expert (stable). Dropless by default; with
 ``capacity_factor`` each expert keeps its first C = ceil(capacity_factor T k / E) slots in token order. Options:
 a shared expert (``shared_d_ff``: a dense MLP every token goes through, added to the routed output) and
-expert parallelism (``ep_group``: each rank holds E / W experts; slots travel by fixed-size all-to-alls).
-The layer never reads the expert sizes on the host: its buffers have the worst-case size for the number of
+expert parallelism (``ep_group``: each rank holds E / W experts; slots travel by all-to-alls, of a fixed size
+with a capacity; dropless expert parallelism reads the row counts on the host).
+Otherwise the layer never reads the expert sizes on the host: its buffers have the worst-case size for the number of
 tokens, and the layout is computed on the GPU, so a training step with MoE layers can be captured in a CUDA
 graph and traced by ``torch.compile`` without graph breaks. That holds for the NVFP4 experts and for the
 high-precision ones (Triton grouped GEMMs, nvfp4._bf16_grouped); only without Triton (native Windows) or
@@ -315,21 +316,64 @@ def _plan(slot_expert: torch.Tensor, slot_src: torch.Tensor, n_src: int, n_exper
     return _Layout(tiles, tile_rows, segs_d, segs_f, src, pos), counts
 
 
-class _AllToAll(torch.autograd.Function):
-    """all_to_all_single with equal splits along dim 0; the backward is the reverse exchange."""
+class _Pending:
+    """An exchange in flight: the forward's work handle, and the backward's (work, output, input kept alive)."""
+    __slots__ = ("work", "bwork", "bout", "bin")
+
+
+def _a2a(x: torch.Tensor, send, recv, group, async_op: bool):
+    """(output, work) of all_to_all_single over x's rows: equal splits (send / recv None) or the given row
+    counts per rank."""
+    rows = x.shape[0] if recv is None else sum(recv)
+    out = x.new_empty((rows,) + tuple(x.shape[1:]))
+    work = dist.all_to_all_single(out, x.contiguous(), recv, send, group=group, async_op=async_op)
+    return out, work
+
+
+class _ExchangeStart(torch.autograd.Function):
+    """Starts all_to_all_single of x's rows (``send`` / ``recv``: rows per rank, None for equal splits) without
+    waiting; _ExchangeWait finishes it. Whatever runs between the two overlaps with the exchange, in the forward
+    and, in reverse, in the backward: _ExchangeWait.backward starts the reverse exchange and this backward
+    waits for it, and autograd runs the nodes created in between (higher sequence numbers) first."""
 
     @staticmethod
-    def forward(ctx, x, group):
-        ctx.group = group
-        out = torch.empty_like(x)
-        dist.all_to_all_single(out, x.contiguous(), group=group)
+    def forward(ctx, x, group, send, recv, pend: _Pending):
+        ctx.pend = pend
+        out, pend.work = _a2a(x, send, recv, group, True)
         return out
 
     @staticmethod
     def backward(ctx, g):
-        out = torch.empty_like(g)
-        dist.all_to_all_single(out, g.contiguous(), group=ctx.group)
-        return out, None
+        pend = ctx.pend
+        pend.bwork.wait()
+        out = pend.bout
+        pend.bwork = pend.bout = pend.bin = None
+        return out, None, None, None, None
+
+
+class _ExchangeWait(torch.autograd.Function):
+    @staticmethod
+    def forward(ctx, out, group, send, recv, pend: _Pending):
+        pend.work.wait()
+        pend.work = None
+        ctx.group, ctx.send, ctx.recv, ctx.pend = group, send, recv, pend
+        return out.view_as(out)
+
+    @staticmethod
+    def backward(ctx, g):
+        pend = ctx.pend
+        pend.bin = g.contiguous()
+        pend.bout, pend.bwork = _a2a(pend.bin, ctx.recv, ctx.send, ctx.group, True)
+        return g, None, None, None, None  # a placeholder: _ExchangeStart.backward returns the exchanged rows
+
+
+def _exchange(x: torch.Tensor, group, send=None, recv=None, overlap=None):
+    """(rows exchanged over ``group``, overlap()'s result): ``overlap`` runs while the rows travel (and its
+    backward while their gradients travel back)."""
+    pend = _Pending()
+    out = _ExchangeStart.apply(x, group, send, recv, pend)
+    res = overlap() if overlap is not None else None
+    return _ExchangeWait.apply(out, group, send, recv, pend), res
 
 
 def _combine(ys: torch.Tensor, pos: torch.Tensor, w: torch.Tensor) -> torch.Tensor:
@@ -359,9 +403,12 @@ class MoE(nn.Module):
     are one of hidden n h). Parameters ``shared_w_*`` [1, ., .] (and ``shared_b_*``).
     ep_group (None: every expert on this process): expert parallelism over a torch.distributed process group
     of W ranks: this rank holds experts [r E / W, (r + 1) E / W) (the stacked parameters have E / W rows), and
-    the routed slots travel to their expert's rank and back by two fixed-size all-to-alls, one per direction.
-    Needs ``capacity_factor`` (C slots per expert and source rank). The router and the shared expert are
-    replicated; gradients of the local experts already include every rank's tokens.
+    the routed slots travel to their expert's rank and back by two all-to-alls, one per direction. With
+    ``capacity_factor`` the exchanges have a fixed size (C slots per expert and source rank) and nothing is read
+    on the host; dropless, the row counts are exchanged first and read on the host once per forward (as in
+    Megatron-LM's dropless dispatcher), so such a step cannot be captured in a CUDA graph. The shared expert
+    runs while the expert outputs travel back (``ep_overlap = False``: after them). The router and the shared
+    expert are replicated; gradients of the local experts already include every rank's tokens.
 
     After forward, ``aux_loss`` holds the Switch Transformer load-balancing loss E * sum_e f_e P_e (f_e:
     fraction of routed slots, P_e: mean router probability of expert e; before dropping; this rank's tokens),
@@ -387,8 +434,6 @@ class MoE(nn.Module):
             self.ep_size, self.ep_rank = dist.get_world_size(ep_group), dist.get_rank(ep_group)
             if n_experts % self.ep_size:
                 raise ValueError(f"{n_experts} experts do not split over {self.ep_size} ranks")
-            if capacity_factor is None:
-                raise ValueError("expert parallelism needs a capacity_factor (fixed-size all-to-alls)")
         self.d, self.d_ff, self.n_experts, self.top_k = d, d_ff, n_experts, top_k
         self.activation, self.normalize_weights = activation, normalize_weights
         self.capacity_factor, self.shared_d_ff = capacity_factor, shared_d_ff
@@ -406,6 +451,7 @@ class MoE(nn.Module):
         self.reset_parameters()
         self.nvfp4 = False
         self.bf16_impl = "auto"
+        self.ep_overlap = True
         self.wgrad_rht = True
         self.fuse_wgrad_accumulation = False
         self.cache_weight_quantization = False
@@ -604,43 +650,66 @@ class MoE(nn.Module):
         else:
             self._dropped = torch.zeros((), device=dev, dtype=torch.long)
         slot_src = torch.arange(S, device=dev) // k
-        if self.ep_group is None:
+        if self.ep_group is not None:
+            y, sh = self._forward_ep(x2d, slot_expert, slot_src, rank, counts, w, C)
+        else:
             max_rows = S if C is None else min(S, E * C)
             ys, pos = self._mlp(x2d, slot_expert, slot_src, k, E, self.d_ff, max_rows, C is not None,
                                 self.experts_weights(), self.experts_biases(), self._caches)
             y = _combine(ys, pos, w)
-        else:
-            y = self._forward_ep(x2d, slot_expert, slot_src, rank, counts, w, C)
-        if self.shared_d_ff:
-            y = y + self._shared(x2d).to(y.dtype)
+            sh = self._shared(x2d) if self.shared_d_ff else None
+        if sh is not None:
+            y = y + sh.to(y.dtype)
         return y.reshape(*lead, self.d)
 
-    def _forward_ep(self, x2d, slot_expert, slot_src, rank, counts, w, C: int):
-        """Expert parallelism: send buffer [W, E/W, C, d] (expert e's kept slots in rows e C + rank), an
-        all-to-all, the local experts on the received [W, E/W, C] rows (each source's first count rows of
-        each expert are real), the reverse all-to-all, and the combine."""
+    def _forward_ep(self, x2d, slot_expert, slot_src, rank, counts, w, C: int | None):
+        """Expert parallelism: (routed output, shared expert's output or None). The slots go to their expert's
+        rank, the local experts run on the received rows, the outputs come back and are combined. The shared
+        expert runs while the outputs travel back (and its backward while their gradients go out)."""
         T, k, E, W, El = x2d.shape[0], self.top_k, self.n_experts, self.ep_size, self.n_local
         dev, S = x2d.device, T * k
+        nvfp4 = self.nvfp4 and not ops.high_precision() and x2d.is_cuda
+        xin = x2d.to(BF16) if nvfp4 else x2d  # NVFP4 experts read bf16: half the bytes on the wire
+        shared = (lambda: self._shared(x2d)) if self.shared_d_ff else None
+        overlap = shared if self.ep_overlap else None
+        group, ws, bs = self.ep_group, self.experts_weights(), self.experts_biases()
+        if C is None:
+            # dropless: rows sorted by expert (so by rank), variable splits; one host read of the counts
+            order = torch.argsort(slot_expert, stable=True)
+            pos = torch.empty_like(order).index_copy_(0, order, torch.arange(S, device=dev)).view(T, k)
+            xs = _Dispatch.apply(xin, slot_src.index_select(0, order), pos)
+            recv_counts = torch.empty_like(counts)
+            dist.all_to_all_single(recv_counts, counts, group=group)  # [W, E/W]: per source rank
+            host = torch.cat([counts, recv_counts]).tolist()
+            send = [sum(host[r * El:(r + 1) * El]) for r in range(W)]
+            recv = [sum(host[E + r * El:E + (r + 1) * El]) for r in range(W)]
+            R = sum(recv)
+            xr, _ = _exchange(xs, group, send, recv)  # [R, d]: by source rank, then by local expert
+            e_loc = torch.arange(El, device=dev).repeat(W).repeat_interleave(recv_counts, output_size=R)
+            ys, p = self._mlp(xr, e_loc, torch.arange(R, device=dev), 1, El, self.d_ff, R, False, ws, bs,
+                              self._caches)
+            yb, sh = _exchange(ys.index_select(0, p.view(-1)), group, recv, send, overlap)
+            return _combine(yb, pos, w), (sh if overlap is not None or shared is None else shared())
+        # capacity: fixed-size buffer [W, E/W, C, d] (expert e's kept slots in rows e C + rank)
         kept = slot_expert >= 0
         send_pos = torch.where(kept, slot_expert * C + rank, E * C)  # E C: a zero row, not sent
         send_src = torch.full((E * C + 1,), T, device=dev, dtype=torch.long).index_copy_(
             0, send_pos, torch.where(kept, slot_src, T))
-        nvfp4 = self.nvfp4 and not ops.high_precision() and x2d.is_cuda
-        xin = x2d.to(BF16) if nvfp4 else x2d
         xs = _Dispatch.apply(xin, send_src, send_pos.view(T, k))[:E * C]
         kept_counts = torch.minimum(counts, torch.full_like(counts, C))
         recv_counts = torch.empty_like(kept_counts)
-        dist.all_to_all_single(recv_counts, kept_counts, group=self.ep_group)  # [W, E/W]: per source rank
-        xr = _AllToAll.apply(xs, self.ep_group)  # [W, E/W, C, d] from every source rank
+        dist.all_to_all_single(recv_counts, kept_counts, group=group)  # [W, E/W]: per source rank
+        xr, _ = _exchange(xs, group)  # [W, E/W, C, d] from every source rank
         n = W * El * C
         cpos = torch.arange(n, device=dev)
         e_loc = (cpos // C) % El
         valid = (cpos % C) < recv_counts.view(-1).repeat_interleave(C)
-        ys, pos = self._mlp(xr, torch.where(valid, e_loc, -1), cpos, 1, El, self.d_ff, n, True,
-                            self.experts_weights(), self.experts_biases(), self._caches)
-        yr = ys.index_select(0, pos.view(-1))  # [W, E/W, C, d]; invalid rows are zero
-        yb = _AllToAll.apply(yr, self.ep_group)  # back to the source: rows e C + c
-        return _combine(torch.cat([yb, yb.new_zeros(1, self.d)]), send_pos.view(T, k), w)
+        ys, pos = self._mlp(xr, torch.where(valid, e_loc, -1), cpos, 1, El, self.d_ff, n, True, ws, bs,
+                            self._caches)
+        # back to the source: rows e C + c (invalid rows are zero)
+        yb, sh = _exchange(ys.index_select(0, pos.view(-1)), group, overlap=overlap)
+        y = _combine(torch.cat([yb, yb.new_zeros(1, self.d)]), send_pos.view(T, k), w)
+        return y, (sh if overlap is not None or shared is None else shared())
 
     def extra_repr(self) -> str:
         r = f"d={self.d}, d_ff={self.d_ff}, n_experts={self.n_experts}, top_k={self.top_k}, " \

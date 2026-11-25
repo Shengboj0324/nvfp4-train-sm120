@@ -1,5 +1,6 @@
-"""nvfp4.moe.MoE options of v0.15: capacity-limited routing (token dropping), the shared expert, and expert
-parallelism over a process group (two ranks over gloo on one GPU), against per-token references."""
+"""nvfp4.moe.MoE options of v0.15 / v0.16: capacity-limited routing (token dropping), the shared expert, and
+expert parallelism over a process group, with a capacity or dropless (two ranks over gloo on one GPU), against
+per-token references."""
 import copy
 import os
 
@@ -131,12 +132,15 @@ def test_capacity_validation_and_repr():
 
 # --- expert parallelism: two ranks over gloo on the one GPU --------------------------------------------
 
-def _ep_pair(world, rank, group, fp4, seed=3):
-    """(reference MoE with all experts, the EP MoE of this rank holding its slice of the same weights)."""
-    kw = dict(d=256, d_ff=256, E=4, k=2, seed=seed, capacity_factor=0.75, shared_d_ff=256, bias=True)
+def _ep_pair(world, rank, group, fp4, cf, seed=3):
+    """(reference MoE with all experts, the EP MoE of this rank holding its slice of the same weights; the
+    routing skewed toward expert 0, so the ranks receive different numbers of rows)."""
+    kw = dict(d=256, d_ff=256, E=4, k=2, seed=seed, capacity_factor=cf, shared_d_ff=256, bias=True)
     ref = _moe("swiglu", **kw)
+    with torch.no_grad():
+        ref.router.weight[0] += 0.3 * ref.router.weight[1]
     torch.manual_seed(seed)
-    ep = MoE(256, 256, 4, top_k=2, activation="swiglu", bias=True, capacity_factor=0.75, shared_d_ff=256,
+    ep = MoE(256, 256, 4, top_k=2, activation="swiglu", bias=True, capacity_factor=cf, shared_d_ff=256,
              ep_group=group).to(DEV)
     El = 4 // world
     with torch.no_grad():
@@ -155,11 +159,13 @@ def _ep_data(r):
     return torch.randn(200, 256, device=DEV, generator=g), torch.randn(200, 256, device=DEV, generator=g)
 
 
-def _check_ep(rank, world, group):
+def _check_ep(rank, world, group, cf, overlap=True):
     import torch.distributed as dist
     # fp32 experts: the EP output on each rank equals the single-process layer on that rank's tokens; the
-    # local experts' gradients are the sum over both ranks' tokens
-    ref, ep = _ep_pair(world, rank, group, fp4=False)
+    # local experts' gradients are the sum over both ranks' tokens (the shared expert's backward runs while
+    # the output gradients travel: its gradients and the router's are checked too)
+    ref, ep = _ep_pair(world, rank, group, fp4=False, cf=cf)
+    ep.ep_overlap = overlap
     El = 4 // world
     ref_grads = {n: torch.zeros_like(p) for n, p in ref.named_parameters()}
     for r in range(world):
@@ -173,19 +179,26 @@ def _check_ep(rank, world, group):
         if r == rank:
             y_want, dx_want, router_want, dropped = yr.detach(), xr.grad, ref.router.weight.grad.clone(), \
                 ref.last_dropped
+            ref_local = {n: p.grad.clone() for n, p in ref.named_parameters()}
     x, g = _ep_data(rank)
     xe = x.clone().requires_grad_()
     ye = ep(xe)
     ye.backward(g)
-    assert ep.last_dropped == dropped > 0
+    assert ep.last_dropped == dropped and (dropped > 0) == (cf is not None)
+    if cf is None:  # skewed routing: the two ranks' experts get different numbers of rows
+        c = torch.tensor(ep.last_counts, device=DEV)
+        dist.all_reduce(c, group=group)
+        assert c[:2].sum() != c[2:].sum()
     torch.testing.assert_close(ye, y_want, rtol=1e-4, atol=1e-5)
     torch.testing.assert_close(xe.grad, dx_want, rtol=1e-4, atol=1e-5)
     torch.testing.assert_close(ep.router.weight.grad, router_want, rtol=1e-4, atol=1e-5)
     for n, p in ep.named_parameters():
         if n.startswith(("w_", "b_")):  # local experts: every rank's tokens
             torch.testing.assert_close(p.grad, ref_grads[n][rank * El:(rank + 1) * El], rtol=1e-4, atol=1e-5)
+        elif n.startswith("shared_"):  # replicated: this rank's tokens
+            torch.testing.assert_close(p.grad, ref_local[n], rtol=1e-4, atol=1e-5)
     # NVFP4 experts: the same exchange (tensor scales now span both ranks' tokens: compared by cosine)
-    ref, ep = _ep_pair(world, rank, group, fp4=True)
+    ref, ep = _ep_pair(world, rank, group, fp4=True, cf=cf)
     with torch.autocast("cuda", dtype=torch.bfloat16):
         y_ref = ref(x)
         y = ep(xe.detach())
@@ -193,16 +206,20 @@ def _check_ep(rank, world, group):
     dist.barrier(group)
 
 
-def _ep_worker(rank, world, port):
+def _ep_worker(rank, world, port, backend="gloo"):
     import datetime
 
     import torch.distributed as dist
     os.environ["MASTER_ADDR"], os.environ["MASTER_PORT"] = "127.0.0.1", str(port)
     torch.set_num_threads(2)
-    torch.cuda.set_device(0)
-    dist.init_process_group("gloo", rank=rank, world_size=world, timeout=datetime.timedelta(minutes=3))
+    torch.cuda.set_device(rank if backend == "nccl" else 0)
+    dist.init_process_group(backend, rank=rank, world_size=world, timeout=datetime.timedelta(minutes=3),
+                            device_id=torch.device("cuda", rank) if backend == "nccl" else None)
     try:
-        _check_ep(rank, world, dist.group.WORLD)
+        for cf in (0.75, None):
+            _check_ep(rank, world, dist.group.WORLD, cf)
+        # without the overlap: the same results
+        _check_ep(rank, world, dist.group.WORLD, 0.75, overlap=False)
     finally:
         dist.destroy_process_group()
 
@@ -217,7 +234,22 @@ def test_expert_parallel_two_ranks():
     mp.spawn(_ep_worker, args=(2, _free_port()), nprocs=2, join=True)
 
 
-def test_expert_parallel_needs_capacity():
+def test_multi_gpu_nccl_expert_parallel():
+    """The same checks with one process per GPU over NCCL (needs two sm_120 GPUs)."""
+    import torch.distributed as dist
+    import torch.multiprocessing as mp
+    from test_integration_cuda import _free_port
+
+    from nvfp4 import ops as _ops
+    if torch.cuda.device_count() < 2 or not all(_ops.available(i) for i in range(2)):
+        pytest.skip("needs two sm_120 GPUs")
+    if not dist.is_available() or not dist.is_nccl_available():
+        pytest.skip("NCCL not available")
+    os.environ.setdefault("OMP_NUM_THREADS", "2")
+    mp.spawn(_ep_worker, args=(2, _free_port(), "nccl"), nprocs=2, join=True)
+
+
+def test_expert_parallel_validation():
     class _G:  # a stand-in group: only the size and rank are read before the check
         pass
     import torch.distributed as dist
@@ -225,10 +257,50 @@ def test_expert_parallel_needs_capacity():
     dist.get_world_size, dist.get_rank = (lambda g=None: 2), (lambda g=None: 0)
     try:
         with pytest.raises(ValueError):
-            MoE(256, 256, 4, ep_group=_G())
-        with pytest.raises(ValueError):
             MoE(256, 256, 3, capacity_factor=1.0, ep_group=_G())
+        assert MoE(256, 256, 4, ep_group=_G()).n_local == 2  # dropless expert parallelism
         m = MoE(256, 256, 4, capacity_factor=1.0, ep_group=_G())
         assert m.w_gate.shape[0] == 2 and m.router.weight.shape[0] == 4 and "expert_parallel=2" in repr(m)
     finally:
         dist.get_world_size, dist.get_rank = orig
+
+
+@pytest.mark.parametrize("cf", [1.0, None])
+def test_expert_parallel_overlap_order(monkeypatch, cf):
+    """The shared expert's forward runs between the start and the end of the outputs' exchange, and its
+    backward between the start and the end of the reverse exchange (one rank over gloo: the order of the
+    calls, not the timing)."""
+    import torch.distributed as dist
+    from test_integration_cuda import _free_port
+
+    from nvfp4 import moe as moe_mod
+    if not dist.is_available() or not dist.is_gloo_available():
+        pytest.skip("gloo not available")
+    events = []
+    for cls, tag in ((moe_mod._ExchangeStart, "start"), (moe_mod._ExchangeWait, "wait")):
+        for fn in ("forward", "backward"):
+            orig = getattr(cls, fn)
+
+            def wrapped(ctx, *a, _orig=orig, _name=f"{tag}.{fn}"):
+                events.append(_name)
+                return _orig(ctx, *a)
+            monkeypatch.setattr(cls, fn, staticmethod(wrapped))
+    store = dist.TCPStore("127.0.0.1", _free_port(), 1, True)
+    dist.init_process_group("gloo", store=store, rank=0, world_size=1)
+    try:
+        m = MoE(256, 256, 4, capacity_factor=cf, shared_d_ff=256, ep_group=dist.group.WORLD).to(DEV)
+        m.bf16_impl = "grouped"
+        orig_shared = m._shared
+
+        def shared(x):
+            events.append("shared.forward")
+            return orig_shared(x)
+        m._shared = shared
+        m.shared_w_gate.register_hook(lambda g: events.append("shared.backward"))
+        m(torch.randn(64, 256, device=DEV, requires_grad=True)).sum().backward()
+    finally:
+        dist.destroy_process_group()
+    assert events == ["start.forward", "wait.forward",  # dispatch
+                      "start.forward", "shared.forward", "wait.forward",  # outputs back, shared expert
+                      "wait.backward", "shared.backward", "start.backward",  # output gradients out
+                      "wait.backward", "start.backward"], events  # input gradients back

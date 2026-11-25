@@ -11,11 +11,13 @@
 #   tests   the full suite (incl. the two-GPU NCCL tests), then sanitizers + 5-minute soak
 #   bench   GEMM, quantizer, GPT-block, Llama-block, attention and long-context benchmarks on this GPU model
 #   gpt     GPT-124M, 3000 steps: BF16 and NVFP4 on one GPU, NVFP4 with DDP over all GPUs (NCCL)
+#   ep      MoE expert parallelism over all GPUs (NCCL): the MoE tests, bench/bench_moe_ep.py, bench_moe.py
 # Everything ends up in $OUT (default /workspace/nvfp4_results) and $OUT.tar.gz.
 # Every GPU job runs under tools/guard.py (temperature / memory limits, over all GPUs).
 set -uo pipefail
 OUT=${OUT:-/workspace/nvfp4_results}
 REPO=${REPO:-/workspace/nvfp4-train-sm120}
+BRANCH=${BRANCH:-main}
 PHASES=${PHASES:-env build tests bench gpt}
 mkdir -p "$OUT"
 exec > >(tee -a "$OUT/session.log") 2>&1
@@ -76,7 +78,7 @@ sys.exit(0 if ok else 1)
 PY
   pip install -q numpy pytest matplotlib tiktoken
   python -c "import torch; print('torch', torch.__version__, 'cuda', torch.version.cuda, [torch.cuda.get_device_name(i) for i in range(torch.cuda.device_count())])" | tee "$OUT/torch.txt"
-  if [ ! -d "$REPO/.git" ]; then git clone -q https://github.com/Shengboj0324/nvfp4-train-sm120 "$REPO" || return 1; fi
+  if [ ! -d "$REPO/.git" ]; then git clone -q -b "$BRANCH" https://github.com/Shengboj0324/nvfp4-train-sm120 "$REPO" || return 1; fi
   git -C "$REPO" log --oneline -1 | tee "$OUT/commit.txt"
   echo "export PATH=$PATH CUDA_HOME=$CUDA_HOME" > "$OUT/env.sh"
 }
@@ -171,6 +173,24 @@ PY
   return $st
 }
 
+do_ep() {
+  cd "$REPO" || return 1
+  export PYTHONPATH=$REPO
+  local st=0 ngpu
+  ngpu=$(nvidia-smi -L | wc -l)
+  [ "$ngpu" -ge 2 ] || { echo "expert parallelism needs two GPUs"; return 1; }
+  timeout 900 python tools/guard.py --log "$OUT/tests_moe.csv" -- python -m pytest -q tests/test_moe_features_cuda.py \
+    tests/test_moe_cuda.py -p no:cacheprovider -rs > "$OUT/tests_moe.log" 2>&1 || st=1
+  grep -E "passed|failed|SKIPPED.*nccl" "$OUT/tests_moe.log" | tail -4
+  python tools/guard.py --log "$OUT/bench_ep.csv" -- torchrun --standalone --nproc_per_node "$ngpu" \
+    bench/bench_moe_ep.py --out "$OUT/moe_ep.json" > "$OUT/bench_ep.log" 2>&1 || st=1
+  grep -v "guard\] sample" "$OUT/bench_ep.log" | tail -12
+  python tools/guard.py --log "$OUT/bench_moe.csv" -- python bench/bench_moe.py --out "$OUT/moe.json" \
+    > "$OUT/bench_moe.log" 2>&1 || st=1
+  tail -8 "$OUT/bench_moe.log"
+  return $st
+}
+
 for p in $PHASES; do
   case $p in
     env) phase env do_env ;;
@@ -178,6 +198,7 @@ for p in $PHASES; do
     tests) phase tests do_tests ;;
     bench) phase bench do_bench ;;
     gpt) phase gpt do_gpt ;;
+    ep) phase ep do_ep ;;
   esac
 done
 echo; echo "== summary"; for p in $PHASES; do echo "  $p: ${STATUS[$p]:-not run}"; done
