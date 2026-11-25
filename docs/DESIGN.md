@@ -95,6 +95,21 @@ baseline: same initialization, data order and rounding seeds, so seed noise larg
   paper's constants: a block maximum maps to 6.07 instead of 6, and the tensor scale uses 256 as its E4M3
   ceiling, leaving room for the correction to raise a scale.
   It removes the per-element random numbers from the gradient operand and halves its error.
+- **MS-EDEN on dgrad** (`set_ms_eden(True, dgrad=True)`, v0.12; Quartet II's backward). dX = dY W
+  contracts over N, so both operands are rotated along N by the same 64-point RHT. The A operand is the
+  stochastically rounded row output of the dual quantizer (dY, or the GELU / SwiGLU input gradients the
+  producers compute): its row phase applies `rht16` per thread and the 4-point stage across the four
+  16-blocks of a tile row through shared memory (a 64×64 tile row is exactly one 64-element block), then
+  quantizes with EDEN. The column phase, which needs the unrotated tile, reads its values into registers
+  first; the amax pass computes amax of the rotated rows as a third maximum. Both are a separate
+  instantiation of each kernel (template parameter), so the other paths are unchanged (A/B identical).
+  The rotation's signs come from the row SR seed XOR a fixed salt, so no new parameters thread through the
+  producers. The B operand cannot be the 16×16-block transpose any more (a rotation along N mixes the
+  2D blocks): the layers dequantize the fprop weight and quantize it along N under the same rotation
+  (round-to-nearest, `linear.dgrad_weight_operand`), so dgrad sees the forward's weights up to a second
+  rounding, as Quartet II and Mosaic do with 1×16 weights. Cost: the gradient quantizer about doubles
+  (both of its outputs rotate), plus one weight re-quantization per backward (not cacheable: the
+  rotation changes every call).
 - **1×16 weights with re-quantization** (`set_weight_blocks("1d")`, Quartet II / Mosaic). fprop uses W
   in 1×16 blocks along K (lower error than 16×16 blocks, and Four Over Six can choose per row); dgrad
   uses the dequantized fprop weight re-quantized in 1×16 blocks along N, so both GEMMs see the same
@@ -115,6 +130,8 @@ baseline: same initialization, data order and rounding seeds, so seed noise larg
 | 1×16 weights | +1.20% | −0.12% ± 0.09 | −12% |
 | 1×16 weights + Four Over Six | +1.20% | −0.13% ± 0.20 | −13% |
 | 1×16 weights + MS-EDEN + Four Over Six | +1.13% | −0.19% ± 0.11 | −17% |
+| MS-EDEN on wgrad and dgrad (v0.12) | +1.24% | −0.08% ± 0.15 | −15% |
+| MS-EDEN on wgrad and dgrad + Four Over Six (v0.12) | +1.12% | −0.20% ± 0.17 | −16% |
 | fc2 kept in BF16 (precision budget) | +1.05% | −0.27% ± 0.06 | −12% |
 | **BF16 tail (last 10% of steps)** | **+0.62%** | **−0.70% ± 0.04** | −4% |
 | BF16 tail + MS-EDEN + Four Over Six | +0.55% | −0.76% ± 0.20 | −7% |
@@ -126,9 +143,9 @@ the gap on every seed for 4% of the run's time, and on top of it the quantizer o
 resolvable. So the quantizer options stay off by default (they change numerics and cost 2–13% throughput
 for ~0.1% loss), and the tail is the recommended addition (it is a training-loop decision, so it is a
 switch the loop flips, not a default). A tail-trained model should be served in BF16: evaluated with its
-NVFP4 layers it is no better than the baseline (RESULTS.md §4.2). Not implemented: MS-EDEN on the dgrad operands (it needs a rotation of W^T along N,
-incompatible with 2D weight blocks), the low-rank BF16 weight subspace of Full-Stack FP4 (+4%
-parameters) and oscillation damping (ALTO; aimed at gaps that grow with training, which ours does not).
+NVFP4 layers it is no better than the baseline (RESULTS.md §4.2). Not implemented: the low-rank BF16
+weight subspace of Full-Stack FP4 (+4% parameters) and oscillation damping (ALTO; aimed at gaps that grow
+with training, which ours does not).
 
 ## 3. Quantizers (`csrc/quantize_dual.cu`, `csrc/quantize.cu`)
 
@@ -544,6 +561,43 @@ rows.
 zero-filled copies, and stores are guarded. `K` must be a multiple of 128 (256 for the TMA loop).
 `NVFP4Linear` zero-pads the token dimension for wgrad.
 
+### 4.5 Grouped GEMMs for mixture of experts (v0.12, `ops.gemm_grouped`)
+
+A MoE layer runs every projection of every expert in one launch of the persistent TMA kernel. The kernel's
+work-unit decoder (`unit_of`) is the only place that changes; the pipeline, the MMA loop and the epilogue are
+the dense kernel's. Two modes:
+
+- **Ragged M** (forward and input gradient). The routed tokens sit in one buffer sorted by expert, each
+  expert's rows padded to a multiple of 128 (one tile), and are quantized once. An int32 table gives
+  the expert of every 128-row tile. A unit reads A rows `m0` as usual and B rows
+  `expert * N + n0` from the stacked weights. The dgrad operand of 16×16-block weights is the column output
+  of the stacked weight's quantization, [K, E N], rearranged bytewise to [E K, N] (`ops.stack_transposed`;
+  blocks never straddle experts).
+- **Ragged K** (weight gradients). Each expert's output tiles reduce over its own token range of the
+  column-quantized operands, `[k0, k0 + len)`, and write rows `expert * R + m0` of the stacked gradient
+  (accumulating into `.grad` in place). Ranges are multiples of 128 tokens, but the k-tile is 256 deep and
+  TMA needs 16-byte-aligned box starts in the scale rows. So a unit starts at `floor(k0 / 256) * 256`, and
+  the MMAs of the first k-tile's first half or the last k-tile's second half are skipped when they lie
+  outside the range (the data loaded for them is never multiplied).
+- **K not a multiple of 256** (e.g. d_ff = 1408). The last k-tile reads zeros past K: the data tensor
+  map's out-of-bounds fill, with the scale rows padded to a 16-byte stride (`ops._scales_ld16`). Dense GEMMs
+  still require K % 256 for the TMA loop.
+
+The grouped code is a separate instantiation of the kernel (template parameter): the dense kernel compiles
+exactly as before. That matters: with runtime branches the dense GEMM lost 2–5%, without them it measures
+the same as v0.11 (463 vs 464 TFLOPS at 8192³, interleaved A/B). Grouped results are bit-identical to the
+dense TMA GEMM of each group where that one runs the same loop (`tests/test_grouped_gemm_cuda.py`).
+
+The MoE layer around it (`nvfp4/moe.py`):
+
+- **Dispatch** is one gather into the padded buffer (in bf16, which the quantizer reads anyway).
+- **Combine** is a gather of each token's k rows and a k-term weighted sum (a batched matmul).
+- **Backward** of the dispatch sums each token's k rows by gather. Neither direction uses scatter-add
+  atomics, so the layer is deterministic.
+- **Per step** that is a fixed number of kernels whatever the number of experts: 258 for a forward and
+  backward of a 32-expert layer, vs 1,903 with per-expert launches (v0.11). The GEMMs are about a third
+  of it; quantizers, the weight quantization and the routing gathers are most of the rest.
+
 ## 5. Verification
 
 | Layer | Test | Criterion |
@@ -571,6 +625,8 @@ Every benchmark checks correctness against the reference before it times anythin
 
 ## 6. Known limitations and next steps
 
+Done in v0.12: grouped GEMMs for mixture-of-experts layers (§4.5; item 5), MS-EDEN on the dgrad operands
+(§2.1).
 Done in v0.11: the recipe options of the 2026 literature with a three-seed ablation (§2.1), a BF16-tail
 precision switch, cheaper stochastic rounding (§3.2, item 3), mixture-of-experts layers (item 5), and a
 research survey of the open problems (docs/research/nvfp4-open-problems-2026-11/).
@@ -625,11 +681,10 @@ accumulation.
    `invalidate_weight_caches`. Under FSDP2 the cache hits only when the all-gathered weight lands at
    the same address within a step (the allocator's choice; correct either way).
 5. **Fused sub-blocks** cover GPT / BERT / ViT-style and Llama-style blocks, pre-norm or (via the
-   norm-free MLPs) post-norm, with biases anywhere. v0.11 adds mixture-of-experts MLPs (`nvfp4.moe.MoE`,
-   dropless top-k): tokens are sorted by expert and each expert runs the fused MLP on its slice, one
-   launch sequence per expert rather than a grouped GEMM. That is 1.7–2.2× BF16 with 8 large experts but
-   only 1.25× with 32 small ones (RESULTS.md §8), where a grouped (tile-list) GEMM over all experts would
-   help; the per-layer host synchronization for the expert sizes also rules out CUDA-graph capture.
+   norm-free MLPs) post-norm, with biases anywhere. Mixture-of-experts MLPs (`nvfp4.moe.MoE`, dropless
+   top-k; v0.11, grouped GEMMs since v0.12, §4.5) cover SwiGLU and GELU experts without biases. The expert
+   sizes are read on the host once per layer (as in MegaBlocks), so a step with MoE layers is not
+   CUDA-graph capturable and `torch.compile` breaks the graph there.
 6. **Framework coverage.** DDP, FSDP1 and FSDP2 are tested with two ranks on one GPU over gloo and
    (v0.8) with NCCL across two physical RTX 5090s, bit-identical to a single process. Data-parallel
    *speed* depends on the host: on the rented two-GPU machine all-reduce ran at 2 GB/s (no P2P), so DDP

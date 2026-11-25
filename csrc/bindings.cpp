@@ -50,6 +50,10 @@ std::vector<torch::Tensor> nvfp4_swiglu_backward_quantize_dual(torch::Tensor dy,
 std::vector<torch::Tensor> nvfp4_norm_backward(torch::Tensor dy, torch::Tensor x, const OptTensor& mean,
                                                torch::Tensor rstd, torch::Tensor w, const OptTensor& dres, bool need_dx,
                                                bool need_dw, bool need_db);
+torch::Tensor nvfp4_gemm_grouped(torch::Tensor a, torch::Tensor sfa, torch::Tensor gdec_a, torch::Tensor b,
+                                 torch::Tensor sfb, torch::Tensor gdec_b, int64_t mode, torch::Tensor meta,
+                                 int64_t group_rows, c10::ScalarType out_dtype, c10::optional<torch::Tensor> out,
+                                 bool accumulate);
 torch::Tensor nvfp4_gemm(torch::Tensor a, torch::Tensor sfa, torch::Tensor gdec_a, torch::Tensor b, torch::Tensor sfb,
                          torch::Tensor gdec_b, c10::ScalarType out_dtype, c10::optional<torch::Tensor> out,
                          bool accumulate, int64_t impl, int64_t splits, c10::optional<torch::Tensor> bias,
@@ -59,6 +63,8 @@ void nvfp4_set_four_six(bool on);
 bool nvfp4_four_six();
 void nvfp4_set_ms_eden(bool on);
 bool nvfp4_ms_eden();
+void nvfp4_set_ms_eden_dgrad(bool on);
+bool nvfp4_ms_eden_dgrad();
 std::vector<torch::Tensor> nvfp4_attn_quant(torch::Tensor x, const OptTensor& mean, const OptTensor& o, bool want_row,
                                             bool want_col, bool want_bf16, bool want_deq);
 std::vector<torch::Tensor> nvfp4_attn_fwd(torch::Tensor q, torch::Tensor qs, torch::Tensor k, torch::Tensor ks,
@@ -131,6 +137,10 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
         "LayerNorm (mean given) / RMSNorm backward from the fused quantizers' statistics, + residual gradient",
         py::arg("dy"), py::arg("x"), py::arg("mean"), py::arg("rstd"), py::arg("w"), py::arg("dres") = py::none(),
         py::arg("need_dx") = true, py::arg("need_dw") = true, py::arg("need_db") = false);
+  m.def("gemm_grouped", &nvfp4_gemm_grouped, "grouped NVFP4 GEMMs (mixture of experts)", py::arg("a"),
+        py::arg("sfa"), py::arg("gdec_a"), py::arg("b"), py::arg("sfb"), py::arg("gdec_b"), py::arg("mode"),
+        py::arg("meta"), py::arg("group_rows"), py::arg("out_dtype"), py::arg("out") = py::none(),
+        py::arg("accumulate") = false);
   m.def("gemm", &nvfp4_gemm, "NVFP4 TN GEMM: D = A @ B^T", py::arg("a"), py::arg("sfa"), py::arg("gdec_a"),
         py::arg("b"), py::arg("sfb"), py::arg("gdec_b"), py::arg("out_dtype"), py::arg("out") = py::none(),
         py::arg("accumulate") = false, py::arg("impl") = 0, py::arg("splits") = 0, py::arg("bias") = py::none(),
@@ -142,6 +152,10 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
         "Enable / disable MS-EDEN (64-point RHT, EDEN-corrected scales instead of element SR) on wgrad operands",
         py::arg("on"));
   m.def("ms_eden", &nvfp4_ms_eden, "Whether MS-EDEN is enabled");
+  m.def("set_ms_eden_dgrad", &nvfp4_set_ms_eden_dgrad,
+        "MS-EDEN on the dgrad operands: stochastically rounded row outputs of the dual quantizer get a 64-point "
+        "RHT along the row (signs from the row seed) and EDEN-corrected scales");
+  m.def("ms_eden_dgrad", &nvfp4_ms_eden_dgrad, "Whether MS-EDEN on the dgrad operands is enabled");
   m.def("attn_quant", &nvfp4_attn_quant,
         "Attention operand quantization: x [B, H, N, D] -> int8 row / MXFP8 col (transposed, permuted) layouts (+ delta)",
         py::arg("x"), py::arg("mean") = py::none(), py::arg("o") = py::none(), py::arg("want_row") = true,

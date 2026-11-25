@@ -85,23 +85,55 @@ def high_precision() -> bool:
 
 
 _MS_EDEN = [False]
+_MS_EDEN_DGRAD = [False]
+ROW_RHT_SALT = 0x1E3779B97F4A7C15  # reference.ROW_RHT_SALT, csrc kRowRhtSalt
 
 
-def set_ms_eden(on: bool) -> None:
+def set_ms_eden(on: bool, *, dgrad: bool = False) -> None:
     """Recipe switch: MS-EDEN for the weight-gradient GEMM's operands (Quartet II, arXiv 2601.22813). The dual
     quantizer's RHT outputs (X^T and dY^T, transformed along the tokens with one seed so the rotation cancels in
     dW = dY^T X) use a 64-point randomized Hadamard transform instead of 16-point, and the stochastically
     rounded one (dY^T) is quantized with round-to-nearest elements and an EDEN-corrected, stochastically
     rounded block scale instead of element-wise stochastic rounding: unbiased, ~half the error. Needs
-    col_pad % 64 == 0 (NVFP4Linear uses 128)."""
-    _MS_EDEN[0] = bool(on)
+    col_pad % 64 == 0 (NVFP4Linear uses 128).
+
+    ``dgrad=True`` (needs ``on``) also applies it to the input-gradient GEMM dX = dY W: every stochastically
+    rounded row output of the dual quantizer (dY, the GELU / SwiGLU input gradients: the dgrad A operands) is
+    rotated along its row by a 64-point RHT whose signs come from its row seed (``row_rht_seed``) and quantized
+    with EDEN instead of element SR, and the layers quantize the dgrad weight operand W^T from the
+    dequantized forward weight under the same rotation (``rotated_weight_t``): (R dY)(R W^T)^T = dY W. Quartet
+    II's backward; it replaces the 16x16-block transpose for dgrad by a second (rotated) weight quantization
+    per backward."""
+    if dgrad and not on:
+        raise ValueError("MS-EDEN on dgrad needs MS-EDEN on (on=True)")
+    _MS_EDEN[0], _MS_EDEN_DGRAD[0] = bool(on), bool(dgrad)
     if _C is not None:
         _C.set_ms_eden(bool(on))
+        _C.set_ms_eden_dgrad(bool(dgrad))
 
 
 def ms_eden() -> bool:
     """Whether MS-EDEN is on (``set_ms_eden``)."""
     return _MS_EDEN[0]
+
+
+def ms_eden_dgrad() -> bool:
+    """Whether MS-EDEN also covers the dgrad operands (``set_ms_eden(True, dgrad=True)``)."""
+    return _MS_EDEN_DGRAD[0]
+
+
+def row_rht_seed(row_sr_seed):
+    """The RHT seed of a row output quantized with ``row_sr_seed`` under MS-EDEN dgrad (int or int64 tensor;
+    no host sync for a tensor)."""
+    return row_sr_seed ^ ROW_RHT_SALT
+
+
+def rotated_weight_t(wq: NVFP4Tensor, row_sr_seed, groups: int = 1) -> NVFP4Tensor:
+    """The dgrad weight operand under MS-EDEN dgrad: the dequantized forward weight wq [N, K] transposed and
+    quantized along N (round-to-nearest) after the 64-point RHT that the row output with ``row_sr_seed``
+    received, [K, N] (``groups`` > 1: a stacked [G N, K] weight -> [G K, N], see stack_transposed)."""
+    _, wt = quantize_dual(wq.dequantize(), row=False, col=True, rht_seed=row_rht_seed(row_sr_seed), col_pad=128)
+    return stack_transposed(wt, groups) if groups > 1 else wt
 
 
 class four_six_scales:
@@ -339,3 +371,46 @@ def gemm(a: NVFP4Tensor, b: NVFP4Tensor, out_dtype: torch.dtype = torch.bfloat16
         return _lib.gemm(a.data, a.scales, a.gdec, b.data, b.scales, b.gdec, out_dtype, impl_id, splits)
     _lib.gemm_out(a.data, a.scales, a.gdec, b.data, b.scales, b.gdec, out, accumulate, impl_id, splits)
     return out
+
+
+def _scales_ld16(t: torch.Tensor) -> torch.Tensor:
+    """Scales [R, C/16] with a row stride that is a multiple of 16 bytes (a padded copy if needed)."""
+    c = t.shape[1]
+    if c % 16 == 0 and t.is_contiguous():
+        return t
+    return torch.nn.functional.pad(t, (0, (-c) % 16))[:, :c]
+
+
+def gemm_grouped(a: NVFP4Tensor, b: NVFP4Tensor, mode: str, meta: torch.Tensor, *, group_rows: int = 0,
+                 out_dtype: torch.dtype = torch.bfloat16, out: torch.Tensor | None = None,
+                 accumulate: bool = False) -> torch.Tensor:
+    """Grouped NVFP4 GEMMs on the TMA main loop (mixture of experts; K a multiple of 128).
+
+    ``mode="m"`` (ragged M: forward and input gradient): A [M, K] holds the groups' rows back to back, each
+    group starting on a 128-row tile; ``meta`` (int32 [ceil(M / 128)]) gives the group of every tile and
+    ``b`` stacks the groups' [group_rows, K] matrices. Returns D [M, group_rows] with
+    D[rows of g] = A[rows of g] @ B_g^T.
+
+    ``mode="k"`` (ragged K: weight gradients): ``meta`` (int32 [G, 3]) = (k0, length, out_row0) per group,
+    k0 and length multiples of 128; ``out[out_row0 + i, j] (+)= sum_{k0 <= k < k0 + length} A[i, k] B[j, k]``
+    for i < A's rows. ``out`` is required; with ``accumulate`` (fp32) it is added to.
+    """
+    m = {"m": 1, "k": 2}[mode]
+    sfa, sfb = _scales_ld16(a.scales), _scales_ld16(b.scales)
+    if sfa.stride(0) != sfb.stride(0):
+        raise ValueError("A and B must have the same K")
+    return _C.gemm_grouped(a.data, sfa, a.gdec, b.data, sfb, b.gdec, m, meta, int(group_rows), out_dtype, out,
+                           accumulate)
+
+
+def stack_transposed(t: NVFP4Tensor, groups: int) -> NVFP4Tensor:
+    """[K, G * N] -> [G * K, N]: the transposed quantization of G stacked [N, K] matrices (``quantize_dual`` of
+    a [G * N, K] tensor, column output) rearranged so that group g's [K, N] block is rows [g K, (g + 1) K), the
+    layout gemm_grouped(mode="m") reads (bytes only: blocks never straddle groups when N % 16 == 0)."""
+    k, gn = t.shape
+    if gn % (groups * 16):
+        raise ValueError(f"{gn} columns do not split into {groups} groups of multiples of 16")
+    n = gn // groups
+    data = t.data.view(k, groups, n // 2).transpose(0, 1).reshape(groups * k, n // 2)
+    scales = t.scales.view(k, groups, n // 16).transpose(0, 1).reshape(groups * k, n // 16)
+    return NVFP4Tensor(data, scales, t.gdec)

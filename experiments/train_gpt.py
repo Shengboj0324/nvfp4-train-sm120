@@ -108,14 +108,17 @@ class GPT(nn.Module):
         self.head = nn.Linear(d, vocab, bias=False)
         self.head.weight = self.wte.weight  # tied
         self.apply(self._init)
-        for name, p in self.named_parameters():
-            if name.endswith(("proj.weight", "fc2.weight")):
+        for name, p in self.named_parameters():  # residual projections, incl. the MoE's stacked w_fc2 / w_down
+            if name.endswith(("proj.weight", "fc2.weight", "moe.w_fc2", "moe.w_down")):
                 nn.init.normal_(p, 0.0, 0.02 / math.sqrt(2 * layers))
 
     @staticmethod
     def _init(m):
         if isinstance(m, (nn.Linear, nn.Embedding)):
             nn.init.normal_(m.weight, 0.0, 0.02)
+        elif isinstance(m, MoE):  # stacked expert weights: the same init as the dense layers' nn.Linear
+            for w in m.experts_weights():
+                nn.init.normal_(w, 0.0, 0.02)
 
     def forward(self, idx, targets=None):
         t = idx.shape[1]
@@ -179,6 +182,8 @@ def main():
                     help="Four Over Six adaptive block scales on the round-to-nearest NVFP4 operands (ops.set_four_six)")
     ap.add_argument("--weight-1d", action="store_true",
                     help="1x16 weight blocks, dgrad weight re-quantized from the fprop one (ops.set_weight_blocks)")
+    ap.add_argument("--ms-eden-dgrad", action="store_true",
+                    help="with --ms-eden: MS-EDEN on the dgrad operands too (ops.set_ms_eden(True, dgrad=True))")
     ap.add_argument("--ms-eden", action="store_true",
                     help="MS-EDEN on the wgrad operands: 64-point RHT, EDEN-corrected scales instead of element SR")
     ap.add_argument("--moe-experts", type=int, default=0, help="mixture-of-experts MLPs with this many experts")
@@ -221,8 +226,8 @@ def main():
         from nvfp4 import ops as _ops
         if a.four_six:
             _ops.set_four_six(True)
-        if a.ms_eden:
-            _ops.set_ms_eden(True)
+        if a.ms_eden or a.ms_eden_dgrad:
+            _ops.set_ms_eden(True, dgrad=a.ms_eden_dgrad)
         if a.weight_1d:
             _ops.set_weight_blocks("1d")
         converted = convert_linears(model.blocks, skip=tuple(s[len("blocks."):] for s in skip),

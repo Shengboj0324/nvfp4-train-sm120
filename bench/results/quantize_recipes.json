@@ -4,32 +4,35 @@
    8192,
    2304
   ],
-  "activation_rn_us": 87.14559555053711,
-  "gradient_sr_us": 117.97439575195314,
-  "activation_four_six_us": 136.36287689208984,
-  "activation_ms_eden_us": 152.78207778930664,
-  "gradient_ms_eden_us": 171.53919219970706
+  "activation_rn_us": 85.82912445068358,
+  "gradient_sr_us": 118.31040382385254,
+  "activation_four_six_us": 136.4908790588379,
+  "activation_ms_eden_us": 153.4943962097168,
+  "gradient_ms_eden_us": 172.6438331604004,
+  "gradient_ms_eden_dgrad_us": 251.3983917236328
  },
  {
   "shape": [
    8192,
    8192
   ],
-  "activation_rn_us": 436.32129669189453,
-  "gradient_sr_us": 487.1923065185547,
-  "activation_four_six_us": 540.3340911865234,
-  "activation_ms_eden_us": 623.3843231201172,
-  "gradient_ms_eden_us": 736.219482421875
+  "activation_rn_us": 432.32257843017584,
+  "gradient_sr_us": 493.2633590698243,
+  "activation_four_six_us": 548.6751937866211,
+  "activation_ms_eden_us": 640.0601959228517,
+  "gradient_ms_eden_us": 724.9343872070312,
+  "gradient_ms_eden_dgrad_us": 966.0889434814452
  },
  {
   "shape": [
    16384,
    3072
   ],
-  "activation_rn_us": 333.0860900878906,
-  "gradient_sr_us": 378.73470306396484,
-  "activation_four_six_us": 418.44158172607416,
-  "activation_ms_eden_us": 452.4358367919922,
-  "gradient_ms_eden_us": 524.2822265625
+  "activation_rn_us": 344.66175079345703,
+  "gradient_sr_us": 401.62879943847656,
+  "activation_four_six_us": 452.16960906982416,
+  "activation_ms_eden_us": 478.67393493652344,
+  "gradient_ms_eden_us": 528.1433486938477,
+  "gradient_ms_eden_dgrad_us": 733.5846710205078
  }
 ]

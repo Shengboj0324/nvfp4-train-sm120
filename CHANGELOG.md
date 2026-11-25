@@ -1,5 +1,49 @@
 # Changelog
 
+## 0.12.0 — grouped GEMMs for mixture of experts, MS-EDEN on dgrad (2026-11-24)
+
+- **Grouped NVFP4 GEMMs** (`ops.gemm_grouped`, DESIGN.md §4.5). The persistent TMA kernel gets a
+  work-unit decoder for groups; the pipeline, MMA loop and epilogue are unchanged.
+  - Ragged M (forward, dgrad): 128-row tiles, each tagged with its group, against stacked B.
+  - Ragged K (wgrad): per-group token ranges `(k0, len, row0)`. Half k-tile masks cover ranges that
+    aren't multiples of 256.
+  - K % 128 is accepted, with zero-filled tails and 16-byte scale strides.
+  - It is a separate template instantiation, so the dense GEMM compiles as before (463 vs 464 TFLOPS,
+    interleaved A/B).
+  - `ops.stack_transposed` rearranges a stacked weight's 16×16-block transpose into the grouped dgrad
+    operand.
+- **MoE runs on grouped GEMMs.** `nvfp4.moe.MoE` quantizes the expert-sorted tokens once and runs each
+  projection of all experts as one GEMM, plus one ragged-K GEMM for their weight gradients (fused
+  accumulation into `.grad`).
+  - Kernels per step are fixed: 258 for a 32-expert layer, down from 1,903.
+  - Layer step vs BF16: 2.12× / 2.57× with 8 experts (v0.11: 1.74× / 2.15×), **2.14× with 32 small
+    experts (v0.11: 1.25×)**, 1.67× for GELU at d = 768.
+  - MoE GPT, 2 seeds: +0.88% loss at +25% tokens/s. v0.11.0 rerun on the same seed lands 0.1% away.
+  - Dispatch and combine are now gathers (bf16 first, a batched-matmul combine), with no scatter-add
+    atomics and no per-expert slicing, so both precisions are deterministic. The BF16 experts get faster
+    too (32 experts: 148.9 → 77.5 ms).
+- **MS-EDEN on the dgrad operands** (`ops.set_ms_eden(True, dgrad=True)`, `train_gpt.py --ms-eden-dgrad`;
+  DESIGN.md §2.1), Quartet II's backward.
+  - dY and the GELU / SwiGLU input gradients are rotated along N by a 64-point RHT in the dual
+    quantizer's row phase and quantized with EDEN scales.
+  - The rotation's signs come from the row SR seed, so no new parameters thread through the producers.
+  - Rotating along N would split the 16×16 weight blocks, so the dgrad weight operand is the fprop
+    weight dequantized and re-quantized along N under the same rotation (`linear.dgrad_weight_operand`).
+  - The other quantizer paths are unchanged (template instantiation), and the new path is bit-exact
+    against the extended reference.
+  - GPT-124M, 3 seeds, paired vs the baseline: −0.08% ± 0.15 alone (same as wgrad-only MS-EDEN) and
+    −0.20% ± 0.17 with Four Over Six, at 14% more wall time. Nothing resolvable, so it is off by default.
+- **Breaking: MoE parameters are stacked.** `w_gate` / `w_up` / `w_down` (SwiGLU) or `w_fc1` / `w_fc2`
+  (GELU), each [E, ., .].
+  - The `experts` ModuleList and the `bias` argument are gone.
+  - `MoE.to_nvfp4(...)` (called by `convert_linears`) replaces the per-expert conversion.
+  - A model-level init that matches `nn.Linear` no longer reaches the experts: initialize
+    `moe.experts_weights()` explicitly (USAGE.md §3.4). Left at the default, GPT's MoE ends 1% worse.
+    `train_gpt.py` does this now.
+- `experiments/run_moe.sh` runs seeds 0 and 1 into `experiments/results/v0.12_moe/`. The sanitizer
+  driver covers the grouped GEMMs and the MS-EDEN dgrad paths. 881 tests (860 pass on the laptop, 21
+  skip). memcheck / racecheck / synccheck / initcheck are clean, and the 5-minute soak passes.
+
 ## 0.11.0 — recipe options, BF16 tail, mixture of experts, cheaper stochastic rounding (2026-11-24)
 
 - **`ops.set_high_precision(True)`, the BF16 tail** (NVIDIA arXiv 2509.25149 §4.4): while on, `NVFP4Linear`

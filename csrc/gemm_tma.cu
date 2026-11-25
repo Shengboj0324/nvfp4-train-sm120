@@ -135,19 +135,45 @@ __device__ __forceinline__ uint32_t sfull_bar(uint32_t bars, int q) { return bar
 // is already loading the next tile's first k-tiles and scales, so the pipeline never drains between
 // tiles (a non-persistent CTA paid the full load latency, plus launch and barrier setup, per tile).
 
+// m0 / n0: the output tile; am0 / bn0: the A / B rows it reads (different only in grouped GEMMs); k0: first
+// K element (a multiple of BK in grouped GEMMs: TMA needs 16-byte-aligned box starts in the scale rows);
+// nk: k-tiles; half: bit 0: the last k-tile's second half, bit 1: the first k-tile's first half lies outside
+// the unit's K range (ragged K with ranges on odd multiples of 128): those MMAs are skipped, the data
+// loaded for them is never used.
 struct Unit {
-  int m0, n0, kt0, nk, z, tile;
+  int m0, n0, am0, bn0, k0, nk, half, z, tile;
 };
 
+template <bool G>
 __device__ __forceinline__ Unit unit_of(const Args& p, int u, int tiles_n, int tiles) {
   Unit w;
+  if (G && p.group_mode == 2) {  // `tiles` per group
+    const int g = u / tiles, t = u % tiles;
+    const int* sg = p.segs + 3 * g;
+    const int len = __ldg(sg + 1);
+    w.z = 0;
+    w.tile = u;
+    w.am0 = (t / tiles_n) * BM;
+    w.n0 = w.bn0 = (t % tiles_n) * BN;
+    w.m0 = __ldg(sg + 2) + w.am0;
+    const int k0 = __ldg(sg), k1 = k0 + len;
+    w.k0 = k0 / BK * BK;
+    w.nk = (k1 - w.k0 + BK - 1) / BK;
+    w.half = ((k1 % BK) != 0 ? 1 : 0) | ((k0 % BK) != 0 ? 2 : 0);
+    return w;
+  }
   w.z = u / tiles;
   w.tile = u % tiles;
-  w.m0 = (w.tile / tiles_n) * BM;
-  w.n0 = (w.tile % tiles_n) * BN;
-  const int KT = p.K / BK;  // KT * splits < 2^31 (host check): 32-bit division, no 64-bit division call
-  w.kt0 = KT * w.z / p.splits;
-  w.nk = KT * (w.z + 1) / p.splits - w.kt0;
+  w.m0 = w.am0 = (w.tile / tiles_n) * BM;
+  w.n0 = w.bn0 = (w.tile % tiles_n) * BN;
+  if (G && p.group_mode == 1) w.bn0 = __ldg(p.tile_group + w.tile / tiles_n) * p.b_group_rows + w.n0;
+  // KT * splits < 2^31 (host check): 32-bit division, no 64-bit division call. A partial last k-tile (K % BK
+  // != 0, grouped GEMMs only) reads zeros past the end of K (tensor-map out-of-bounds fill).
+  const int KT = G ? (p.K + BK - 1) / BK : p.K / BK;
+  const int kt0 = KT * w.z / p.splits;
+  w.nk = KT * (w.z + 1) / p.splits - kt0;
+  w.k0 = kt0 * BK;
+  w.half = 0;
   return w;
 }
 
@@ -169,13 +195,15 @@ struct Producer {
   Unit qw;
 };
 
+template <bool G>
 __device__ __forceinline__ void producer_init(Producer& pr, const Args& p, const Grid& gd) {
   pr.du = pr.qu = blockIdx.x;
   pr.dk = pr.dseq = pr.qq = pr.qseq = 0;
-  pr.dw = pr.qw = unit_of(p, blockIdx.x, gd.tiles_n, gd.tiles);
+  pr.dw = pr.qw = unit_of<G>(p, blockIdx.x, gd.tiles_n, gd.tiles);
 }
 
 // Load the next k-tile (if any; only if `issue`) into data stage dseq % STAGES and advance the cursor.
+template <bool G>
 __device__ __forceinline__ void issue_next_stage(Producer& pr, const Args& p, const Grid& gd, uint32_t base,
                                                  uint32_t bars, const Maps& mp, bool issue = true) {
   if (pr.du >= gd.total) return;
@@ -184,35 +212,36 @@ __device__ __forceinline__ void issue_next_stage(Producer& pr, const Args& p, co
     const int s = pr.dseq % STAGES;
     const uint32_t stage = base + s * STAGE_BYTES, full = full_bar(bars, s);
     mbar_expect_tx(full, STAGE_BYTES);
-    tma_load_2d(stage, mp.a, (w.kt0 + pr.dk) * BKB, w.m0, full);
-    tma_load_2d(stage + A_BYTES, mp.b, (w.kt0 + pr.dk) * BKB, w.n0, full);
+    tma_load_2d(stage, mp.a, w.k0 / 2 + pr.dk * BKB, w.am0, full);
+    tma_load_2d(stage + A_BYTES, mp.b, w.k0 / 2 + pr.dk * BKB, w.bn0, full);
   }
   ++pr.dseq;
   if (++pr.dk == w.nk) {
     pr.dk = 0;
     pr.du += gridDim.x;
-    if (pr.du < gd.total) pr.dw = unit_of(p, pr.du, gd.tiles_n, gd.tiles);
+    if (pr.du < gd.total) pr.dw = unit_of<G>(p, pr.du, gd.tiles_n, gd.tiles);
   }
 }
 
 // Load the scales of the next 4 k-tiles (one quad; past the end of K the box is zero-filled and those
 // bytes are never read) into quad buffer qseq & 1 (only if `issue`) and advance the cursor.
+template <bool G>
 __device__ __forceinline__ void issue_next_quad(Producer& pr, const Args& p, const Grid& gd, uint32_t base,
                                                 uint32_t bars, const Maps& mp, bool issue = true) {
   if (pr.qu >= gd.total) return;
   const Unit& w = pr.qw;
   if (issue) {
     const uint32_t buf = base + SCALE_BASE + (pr.qseq & 1) * QUAD_BYTES, full = sfull_bar(bars, pr.qseq & 1);
-    const int x = (w.kt0 + QUAD * pr.qq) * SFK;
+    const int x = w.k0 / 16 + QUAD * pr.qq * SFK;
     mbar_expect_tx(full, QUAD_BYTES);
-    tma_load_2d(buf, mp.sa, x, w.m0, full);
-    tma_load_2d(buf + SA_BYTES, mp.sb, x, w.n0, full);
+    tma_load_2d(buf, mp.sa, x, w.am0, full);
+    tma_load_2d(buf + SA_BYTES, mp.sb, x, w.bn0, full);
   }
   ++pr.qseq;
   if (++pr.qq == quads_of(w.nk)) {
     pr.qq = 0;
     pr.qu += gridDim.x;
-    if (pr.qu < gd.total) pr.qw = unit_of(p, pr.qu, gd.tiles_n, gd.tiles);
+    if (pr.qu < gd.total) pr.qw = unit_of<G>(p, pr.qu, gd.tiles_n, gd.tiles);
   }
 }
 
@@ -258,9 +287,10 @@ struct Scales {
 
 // Where the current work unit sits in the CTA's ring.
 struct Pos {
-  int g0;  // sequence number of the unit's first k-tile
-  int q0;  // sequence number of the unit's first scale quad
-  int nk;  // k-tiles in the unit
+  int g0;    // sequence number of the unit's first k-tile
+  int q0;    // sequence number of the unit's first scale quad
+  int nk;    // k-tiles in the unit
+  int half;  // skip half of the last / first k-tile (Unit::half)
 };
 
 // Scales of local k-tile `it`, waiting for its scale quad first if `it` starts one. The 64-byte scale
@@ -293,7 +323,7 @@ __device__ __forceinline__ void load_scales(Scales& sc, const LaneAddr& la, uint
   }
 }
 
-template <int S>
+template <int S, bool G>
 __device__ __forceinline__ void refill(Producer& pr, const Args& p, const Grid& gd, uint32_t base, uint32_t bars,
                                        int it, const Pos& ps, const Maps& mp, bool issue);
 
@@ -314,7 +344,7 @@ struct Shared {
 // The warp that releases it last refills it at once (an atomic count of the releases elects it): the TMA
 // load of k-tile it + STAGES then starts the moment the stage is free, rather than when one fixed thread
 // gets past its own MMAs (warps waited on late data ~12% of the time with thread 0 as the only producer).
-template <int S>
+template <int S, bool G>
 __device__ __forceinline__ void consume_stage(float (&acc)[MI][NI][4], Frag (&fr)[2], Scales& sc, const LaneAddr& la,
                                               uint32_t bars, int it, const Pos& ps, int lane, const Shared& sh) {
   constexpr int SN = (S + 1) % STAGES;
@@ -333,7 +363,7 @@ __device__ __forceinline__ void consume_stage(float (&acc)[MI][NI][4], Frag (&fr
           mbar_arrive(empty_bar(bars, S));
           // the count only grows: release r of the stage's every round is warps r * 8 .. r * 8 + 7
           const bool last = (atomicAdd(sh.cnt + S, 1u) % (WARPS_M * WARPS_N)) == WARPS_M * WARPS_N - 1;
-          refill<S>(*sh.pr, *sh.p, *sh.gd, sh.base, bars, it, ps, *sh.mp, last);
+          refill<S, G>(*sh.pr, *sh.p, *sh.gd, sh.base, bars, it, ps, *sh.mp, last);
         }
         __syncwarp();  // reconverge before the next .aligned instruction
       }
@@ -343,6 +373,10 @@ __device__ __forceinline__ void consume_stage(float (&acc)[MI][NI][4], Frag (&fr
       load_frag<SN>(fr[0], la, 0);
     }
     // (B-reuse and serpentine orders measured the same.)
+    if constexpr (G) {
+      if (ps.half && ((ks >= KS / 2 && (ps.half & 1) && it + 1 == ps.nk) || (ks < KS / 2 && (ps.half & 2) && it == 0)))
+        continue;
+    }
 #pragma unroll
     for (int i = 0; i < MI; ++i)
 #pragma unroll
@@ -356,51 +390,52 @@ __device__ __forceinline__ void consume_stage(float (&acc)[MI][NI][4], Frag (&fr
 // release the finished quad buffer is free too. Only the last warp to release (`issue`) loads, after the
 // empty-barrier wait (acquire: the TMA writes are ordered after every warp's reads); every warp advances
 // its cursors.
-template <int S>
+template <int S, bool G>
 __device__ __forceinline__ void refill(Producer& pr, const Args& p, const Grid& gd, uint32_t base, uint32_t bars,
                                        int it, const Pos& ps, const Maps& mp, bool issue) {
   if (pr.du >= gd.total) return;  // nothing left to load (quads run ahead of the data: none left either)
   if (issue) mbar_wait(empty_bar(bars, S), ((ps.g0 + it) / STAGES) & 1);
-  issue_next_stage(pr, p, gd, base, bars, mp, issue);
-  if (it % QUAD == QUAD - 1 || it == ps.nk - 1) issue_next_quad(pr, p, gd, base, bars, mp, issue);
+  issue_next_stage<G>(pr, p, gd, base, bars, mp, issue);
+  if (it % QUAD == QUAD - 1 || it == ps.nk - 1) issue_next_quad<G>(pr, p, gd, base, bars, mp, issue);
 }
 
 // Local k-tiles it + J, it + J + 1, ... it + STAGES - 1 of the unit, whose first k-tile sits in stage OFF
 // (k-tile it + J in stage (OFF + J) % STAGES, a compile-time constant).
-template <int J, int OFF>
+template <int J, int OFF, bool G>
 __device__ __forceinline__ void steps(float (&acc)[MI][NI][4], Frag (&fr)[2], Scales& sc, const LaneAddr& la,
                                       uint32_t bars, int it, const Pos& ps, int lane, const Shared& sh) {
   if constexpr (J < STAGES) {
     if (it + J < ps.nk) {
-      consume_stage<(OFF + J) % STAGES>(acc, fr, sc, la, bars, it + J, ps, lane, sh);
-      steps<J + 1, OFF>(acc, fr, sc, la, bars, it, ps, lane, sh);
+      consume_stage<(OFF + J) % STAGES, G>(acc, fr, sc, la, bars, it + J, ps, lane, sh);
+      steps<J + 1, OFF, G>(acc, fr, sc, la, bars, it, ps, lane, sh);
     }
   }
 }
 
 // The main loop of one work unit whose first k-tile sits in stage OFF.
-template <int OFF>
+template <int OFF, bool G>
 __device__ __forceinline__ void unit_loop(float (&acc)[MI][NI][4], Frag (&fr)[2], Scales& sc, const LaneAddr& la,
                                           uint32_t bars, const Pos& ps, int lane, const Shared& sh) {
   mbar_wait(full_bar(bars, OFF), (ps.g0 / STAGES) & 1);
   load_scales(sc, la, bars, 0, ps);
   load_frag<OFF>(fr[0], la, 0);
-  for (int it = 0; it < ps.nk; it += STAGES) steps<0, OFF>(acc, fr, sc, la, bars, it, ps, lane, sh);
+  for (int it = 0; it < ps.nk; it += STAGES) steps<0, OFF, G>(acc, fr, sc, la, bars, it, ps, lane, sh);
 }
 
-template <int OFF>
+template <int OFF, bool G>
 __device__ __forceinline__ void unit_loop_any(int off, float (&acc)[MI][NI][4], Frag (&fr)[2], Scales& sc,
                                               const LaneAddr& la, uint32_t bars, const Pos& ps, int lane,
                                               const Shared& sh) {
   if constexpr (OFF < STAGES) {
     if (off == OFF)
-      unit_loop<OFF>(acc, fr, sc, la, bars, ps, lane, sh);
+      unit_loop<OFF, G>(acc, fr, sc, la, bars, ps, lane, sh);
     else
-      unit_loop_any<OFF + 1>(off, acc, fr, sc, la, bars, ps, lane, sh);
+      unit_loop_any<OFF + 1, G>(off, acc, fr, sc, la, bars, ps, lane, sh);
   }
 }
 
-template <typename OutT, bool kAccum>
+// G: grouped GEMMs (Args::group_mode); a separate instantiation so the dense kernel carries none of it.
+template <typename OutT, bool kAccum, bool G>
 __global__ void __launch_bounds__(THREADS, 1)
     nvfp4_gemm_tma_kernel(Args p, const __grid_constant__ TmaParam tm_a, const __grid_constant__ TmaParam tm_b,
                           const __grid_constant__ TmaParam tm_sa, const __grid_constant__ TmaParam tm_sb) {
@@ -413,15 +448,20 @@ __global__ void __launch_bounds__(THREADS, 1)
                 reinterpret_cast<const CUtensorMap*>(&tm_sa), reinterpret_cast<const CUtensorMap*>(&tm_sb)};
   Grid gd;
   gd.tiles_n = (p.N + BN - 1) / BN;
-  gd.tiles = gd.tiles_n * ((p.M + BM - 1) / BM);
-  gd.total = gd.tiles * p.splits;
+  if (G && p.group_mode == 2) {
+    gd.tiles = gd.tiles_n * (p.a_rows / BM);
+    gd.total = gd.tiles * p.groups;
+  } else {
+    gd.tiles = gd.tiles_n * ((p.M + BM - 1) / BM);
+    gd.total = gd.tiles * p.splits;
+  }
 
   const int warp = threadIdx.x >> 5, lane = threadIdx.x & 31;
   unsigned* cnt = reinterpret_cast<unsigned*>(smem + CNT_OFF);
   static_assert(STAGES * sizeof(unsigned) <= 64, "shared pipeline state");
   // every warp's lane 0 keeps the load cursors; thread 0 also issues the prologue loads
   Producer pr;
-  producer_init(pr, p, gd);
+  producer_init<G>(pr, p, gd);
   if (threadIdx.x == 0) {
     for (int s = 0; s < STAGES; ++s) {
       mbar_init(full_bar(bars, s), 1);
@@ -433,8 +473,8 @@ __global__ void __launch_bounds__(THREADS, 1)
   }
   {
     const bool issue = threadIdx.x == 0;
-    for (int q = 0; q < 2; ++q) issue_next_quad(pr, p, gd, base, bars, mp, issue);
-    for (int s = 0; s < STAGES; ++s) issue_next_stage(pr, p, gd, base, bars, mp, issue);
+    for (int q = 0; q < 2; ++q) issue_next_quad<G>(pr, p, gd, base, bars, mp, issue);
+    for (int s = 0; s < STAGES; ++s) issue_next_stage<G>(pr, p, gd, base, bars, mp, issue);
   }
   __syncthreads();
   const Shared sh{cnt, &pr, &p, &gd, &mp, base};
@@ -456,10 +496,11 @@ __global__ void __launch_bounds__(THREADS, 1)
     la.sx = (g >> 1) & 3;  // (row >> 1) & 3 for every scale row this lane reads
   }
 
-  Pos ps{0, 0, 0};
+  Pos ps{0, 0, 0, 0};
   for (int u = blockIdx.x; u < gd.total; u += gridDim.x) {
-    const Unit w = unit_of(p, u, gd.tiles_n, gd.tiles);
+    const Unit w = unit_of<G>(p, u, gd.tiles_n, gd.tiles);
     ps.nk = w.nk;
+    ps.half = G ? w.half : 0;
     // the epilogue reads the old output (accumulate) or the residual: start fetching it into L2 now
     if (kAccum && p.splits == 1) prefetch_tile_l2(p.d, 4, p, w.m0, w.n0);
     if (!kAccum && p.res != nullptr) prefetch_tile_l2(p.res, p.res_bf16 ? 2 : 4, p, w.m0, w.n0);
@@ -473,7 +514,7 @@ __global__ void __launch_bounds__(THREADS, 1)
     if (w.nk > 0) {
       Frag fr[2];
       Scales sc;
-      unit_loop_any<0>(ps.g0 % STAGES, acc, fr, sc, la, bars, ps, lane, sh);
+      unit_loop_any<0, G>(ps.g0 % STAGES, acc, fr, sc, la, bars, ps, lane, sh);
     }
     ps.g0 += w.nk;
     ps.q0 += quads_of(w.nk);
@@ -497,9 +538,9 @@ EncodeFn encode_fn() {
 
 // 2D uint8 map over a row-major [rows, cols] byte matrix, box {box_cols, box_rows}.
 bool make_map(CUtensorMap* map, const void* ptr, int64_t rows, int64_t cols, int box_cols, int box_rows,
-              CUtensorMapSwizzle swizzle) {
+              CUtensorMapSwizzle swizzle, int64_t ld = 0) {
   const cuuint64_t dims[2] = {static_cast<cuuint64_t>(cols), static_cast<cuuint64_t>(rows)};
-  const cuuint64_t strides[1] = {static_cast<cuuint64_t>(cols)};
+  const cuuint64_t strides[1] = {static_cast<cuuint64_t>(ld > 0 ? ld : cols)};
   const cuuint32_t box[2] = {static_cast<cuuint32_t>(box_cols), static_cast<cuuint32_t>(box_rows)};
   const cuuint32_t estr[2] = {1, 1};
   return encode_fn()(map, CU_TENSOR_MAP_DATA_TYPE_UINT8, 2, const_cast<void*>(ptr), dims, strides, box, estr,
@@ -507,10 +548,10 @@ bool make_map(CUtensorMap* map, const void* ptr, int64_t rows, int64_t cols, int
                      CU_TENSOR_MAP_FLOAT_OOB_FILL_NONE) == CUDA_SUCCESS;
 }
 
-template <typename OutT, bool kAccum>
+template <typename OutT, bool kAccum, bool G = false>
 void launch(const Args& p, const CUtensorMap (&maps)[4], dim3 grid, cudaStream_t stream) {
   static std::atomic<uint64_t> configured{0};
-  const cudaError_t err = ensure_smem_attr(nvfp4_gemm_tma_kernel<OutT, kAccum>, SMEM_BYTES, configured);
+  const cudaError_t err = ensure_smem_attr(nvfp4_gemm_tma_kernel<OutT, kAccum, G>, SMEM_BYTES, configured);
   if (err != cudaSuccess) throw std::runtime_error(std::string("nvfp4 TMA GEMM: ") + cudaGetErrorString(err));
   TmaParam prm[4];
   static_assert(sizeof(prm) == sizeof(maps), "tensor map parameter layout");
@@ -521,12 +562,38 @@ void launch(const Args& p, const CUtensorMap (&maps)[4], dim3 grid, cudaStream_t
   C10_CUDA_CHECK(cudaGetDevice(&dev));
   C10_CUDA_CHECK(cudaDeviceGetAttribute(&sms, cudaDevAttrMultiProcessorCount, dev));
   const dim3 pgrid(std::max(1, std::min(units, sms)));
-  nvfp4_gemm_tma_kernel<OutT, kAccum><<<pgrid, THREADS, SMEM_BYTES, stream>>>(p, prm[0], prm[1], prm[2], prm[3]);
+  nvfp4_gemm_tma_kernel<OutT, kAccum, G><<<pgrid, THREADS, SMEM_BYTES, stream>>>(p, prm[0], prm[1], prm[2], prm[3]);
 }
 
 }  // namespace tma
 
 int tma_k_tile() { return tma::BK; }
+
+// Grouped GEMMs (Args::group_mode 1 / 2): A has a_map_rows rows, B b_map_rows; scale rows have stride p.sf_ld
+// bytes (a multiple of 16, >= K / 16). Launches `units` persistent CTAs at most. Returns false (nothing
+// launched) if a descriptor cannot be made.
+bool launch_tma_grouped(const Args& p, int64_t a_map_rows, int64_t b_map_rows, bool out_fp32, bool accumulate,
+                        int units, cudaStream_t stream) {
+  using namespace tma;
+  if (encode_fn() == nullptr) return false;
+  CUtensorMap maps[4];
+  const CUtensorMapSwizzle swz = BKB == 128 ? CU_TENSOR_MAP_SWIZZLE_128B : CU_TENSOR_MAP_SWIZZLE_64B;
+  const bool ok = make_map(&maps[0], p.a, a_map_rows, p.K / 2, BKB, BM, swz) &&
+                  make_map(&maps[1], p.b, b_map_rows, p.K / 2, BKB, BN, swz) &&
+                  make_map(&maps[2], p.sfa, a_map_rows, p.K / 16, QB, BM, CU_TENSOR_MAP_SWIZZLE_64B, p.sf_ld) &&
+                  make_map(&maps[3], p.sfb, b_map_rows, p.K / 16, QB, BN, CU_TENSOR_MAP_SWIZZLE_64B, p.sf_ld);
+  if (!ok) return false;
+  const dim3 grid(units);
+  if (out_fp32) {
+    if (accumulate)
+      launch<float, true, true>(p, maps, grid, stream);
+    else
+      launch<float, false, true>(p, maps, grid, stream);
+  } else {
+    launch<__nv_bfloat16, false, true>(p, maps, grid, stream);
+  }
+  return true;
+}
 
 bool tma_supported(const Args& p) {
   auto aligned = [](const void* q) { return (reinterpret_cast<uintptr_t>(q) & 15) == 0; };

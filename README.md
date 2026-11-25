@@ -120,15 +120,16 @@ x = rmsnorm_swiglu_mlp(x, blk.norm2, blk.gate, blk.up, blk.down, residual=True)
 from nvfp4.attention import attention
 o = attention(q, k, v, causal=True)            # backward="bf16" (default, exact) | "8bit" (faster, +0.5% loss)
 
-# 5. Mixture of experts: dropless top-k, NVFP4 experts with the fused MLPs
+# 5. Mixture of experts: dropless top-k; NVFP4 experts run as grouped GEMMs (one launch per projection)
 from nvfp4.moe import MoE
-moe = MoE(d=1024, d_ff=2816, n_experts=8, top_k=2, activation="swiglu").cuda()
+moe = MoE(d=1024, d_ff=2816, n_experts=8, top_k=2, activation="swiglu").cuda()  # w_gate/w_up/w_down [E, ., .]
 convert_linears(moe, fuse_wgrad_accumulation=True)
 y = moe(x); loss = loss + 0.01 * moe.aux_loss
 
 # 6. Recipe switches (process-wide, read at kernel launch)
 ops.set_high_precision(True)     # BF16 tail: NVFP4 layers compute in BF16 from here on (flip back any time)
 ops.set_ms_eden(True)            # MS-EDEN wgrad operands (64-point RHT, unbiased scale-level SR)
+ops.set_ms_eden(True, dgrad=True)  # ... and dgrad operands (dY and W^T rotated along N)
 ops.set_four_six(True)           # Four Over Six block scales on round-to-nearest operands
 ops.set_weight_blocks("1d")      # 1x16 weight blocks + re-quantized dgrad weight (default "2d")
 
@@ -136,6 +137,7 @@ ops.set_weight_blocks("1d")      # 1x16 weight blocks + re-quantized dgrad weigh
 qa = ops.quantize(a)                                   # NVFP4Tensor(data u8 [M, K/2], scales e4m3-as-u8 [M, K/16], gdec fp32)
 qb, qbt = ops.quantize_dual(b, block_2d=True)          # b and bᵀ from one read
 d = ops.gemm(qa, qb, torch.bfloat16, bias=bias, residual=r)  # r + a @ bᵀ + bias
+y = ops.gemm_grouped(qa, qw_stacked, "m", tile_group, group_rows=N)  # per-group a_g @ W_gᵀ (MoE)
 ```
 
 | Module | Public surface |
@@ -143,8 +145,8 @@ d = ops.gemm(qa, qb, torch.bfloat16, bias=bias, residual=r)  # r + a @ bᵀ + bi
 | [`nvfp4.linear`](nvfp4/linear.py) | `NVFP4Linear`, `convert_linears`, `WeightQuantCache`, `invalidate_weight_caches` |
 | [`nvfp4.fused`](nvfp4/fused.py) | `layernorm_linear`, `layernorm_mlp`, `gelu_mlp`, `rmsnorm_linear`, `rmsnorm_swiglu_mlp`, `swiglu_mlp` |
 | [`nvfp4.attention`](nvfp4/attention.py) | `attention(q, k, v, *, causal, scale, smooth_k, backward)` (falls back to SDPA outside its coverage) |
-| [`nvfp4.moe`](nvfp4/moe.py) | `MoE(d, d_ff, n_experts, top_k, activation, bias, normalize_weights)`, `.aux_loss`, `.last_counts` |
-| [`nvfp4.ops`](nvfp4/ops.py) | `quantize`, `quantize_dual` (+ `layernorm_` / `rmsnorm_` / `gelu_` / `swiglu_` fused variants and backwards), `gemm`, `norm_backward`, recipe switches, `available` |
+| [`nvfp4.moe`](nvfp4/moe.py) | `MoE(d, d_ff, n_experts, top_k, activation, normalize_weights)`, `.to_nvfp4(...)`, `.aux_loss`, `.last_counts` |
+| [`nvfp4.ops`](nvfp4/ops.py) | `quantize`, `quantize_dual` (+ `layernorm_` / `rmsnorm_` / `gelu_` / `swiglu_` fused variants and backwards), `gemm`, `gemm_grouped`, `stack_transposed`, `norm_backward`, recipe switches, `available` |
 | [`nvfp4.reference`](nvfp4/reference.py) | pure-PyTorch spec: `quantize`, `quantize_dual`, `dequantize`, `apply_rht`, `e2m1_round_stochastic`, ... |
 
 **Guarantees** ([USAGE.md §4](docs/USAGE.md)):
@@ -166,8 +168,8 @@ benchmark checks results against the reference before timing.
 | GPT block, fwd + bwd | 1.82× (d = 768) → 2.65× (d = 2048) → 3.22× (d = 4096) vs BF16; 3.50× with the weight cache |
 | Llama block (RMSNorm, SwiGLU) | 2.09× (d = 1024) → 3.32× (d = 4096) vs BF16; up to 3.64× cached |
 | 8-bit attention | forward 1.2–1.6× FlashAttention (SDPA), fwd + bwd 1.07–1.12× at BF16 quality; forward-only up to 2.1× (`backward="8bit"`) |
-| MoE layer, fwd + bwd | 1.74× (d = 1024, 8 experts) → 2.15× (d = 2048, 8 experts); 1.25× with 32 small experts |
-| End to end | GPT-124M +32% tokens/s, −22% GPU energy; GPT-507M 1.62× tokens/s, −39% energy; MoE GPT (8 experts) +20% tokens/s |
+| MoE layer, fwd + bwd (grouped GEMMs) | 2.12× (d = 1024, 8 experts) → 2.57× (d = 2048, 8 experts); 2.14× with 32 small experts |
+| End to end | GPT-124M +32% tokens/s, −22% GPU energy; GPT-507M 1.62× tokens/s, −39% energy; MoE GPT (8 experts) +25% tokens/s |
 
 ## Training quality
 
@@ -181,10 +183,10 @@ the last 2 of 12 blocks in BF16. Losses are final validation loss, with gaps rel
 | GPT-124M + **BF16 tail** (last 10% of steps in BF16), 3 seeds | **+0.62%** | +27% |
 | GPT-124M + MS-EDEN + Four Over Six, 3 seeds | +1.21% | +26% |
 | GPT-124M, 8-bit attention at 4096 tokens, 2 seeds | same as BF16 attention | |
-| MoE GPT (8 experts, 294M parameters), 1 seed | +0.76% | +20% |
+| MoE GPT (8 experts, 294M parameters), 2 seeds | +0.88% | +25% |
 
-The 2026 recipe options (Four Over Six, MS-EDEN, 1×16 weights) each lower the loss by only 0.03–0.13% (0.19% all together)
-at this scale. Switching to BF16 for the last tenth of training removes about half of the gap
+The 2026 recipe options (Four Over Six, MS-EDEN on wgrad and dgrad, 1×16 weights) each lower the loss by only
+0.03–0.13% (about 0.2% in the best combinations) at this scale. Switching to BF16 for the last tenth of training removes about half of the gap
 ([DESIGN.md §2.1](docs/DESIGN.md), [RESULTS.md §4.2](docs/RESULTS.md)). Validate the recipe on your own
 model before relying on it.
 
@@ -220,7 +222,8 @@ tools/run.sh NAME script.py [args]               # run any job under tools/guard
 ## Repository layout
 
 ```
-csrc/gemm_tma.cu        persistent TMA + mbarrier block-scaled mma.sync TN GEMM (kind::mxf4nvf4)
+csrc/gemm_tma.cu        persistent TMA + mbarrier block-scaled mma.sync TN GEMM (kind::mxf4nvf4), dense and
+                        grouped (ragged-M / ragged-K work units for mixture of experts)
 csrc/gemm.cu            cp.async main loop (short K / fallback), tile + split-K dispatch
 csrc/gemm_common.cuh    epilogue: deterministic split-K, fused fp32 accumulate, bias / residual add
 csrc/quantize_dual.cu   fused row + transposed quantizer: 2D blocks, RHT16 / RHT64, SR, Four Over Six,
@@ -235,8 +238,8 @@ nvfp4/ops.py            Python ops, NVFP4Tensor, recipe switches
 nvfp4/linear.py         NVFP4Linear autograd, weight-quantization cache, convert_linears
 nvfp4/fused.py          fused transformer sub-blocks (autograd functions)
 nvfp4/attention.py      attention() with both backwards and the SDPA fallback
-nvfp4/moe.py            MoE layer: routing, expert sort, per-expert fused NVFP4 MLPs, load-balancing loss
-tests/                  835 tests: bit-exact vs spec, autograd, compile / graphs, DDP / FSDP, MoE, attention
+nvfp4/moe.py            MoE layer: routing, deterministic dispatch / combine, grouped NVFP4 expert MLPs
+tests/                  881 tests: bit-exact vs spec, autograd, compile / graphs, DDP / FSDP, MoE, attention
 bench/, experiments/    benchmarks and pretraining runs, each with results/ (raw JSON / JSONL)
 tools/                  build, check, guard, sanitize, soak, WSL setup, Runpod session script
 docs/                   USAGE.md, DESIGN.md, RESULTS.md, research/ (survey of open problems, Nov 2026)
@@ -251,8 +254,8 @@ The full list is in [DESIGN.md §6](docs/DESIGN.md#6-known-limitations-and-next-
 - **8-bit attention training speedup is small:** 1.07–1.12× at BF16 quality. The exact backward runs at
   BF16 speed, and P·V needs two e4m3 terms. Coverage is causal or full masks and head dims 64 / 128;
   everything else falls back to SDPA.
-- **MoE runs per expert.** There is one launch sequence per expert rather than a grouped GEMM, and one
-  host sync per layer, so MoE steps are not CUDA-graph capturable.
+- **MoE host sync.** The expert sizes are read on the host once per MoE layer, so steps with MoE layers
+  are not CUDA-graph capturable. Experts have no biases.
 - **Stochastic rounding is software** (no `cvt.rs` on sm_120a), at about 12 extra instructions per
   element.
 - **Hardware coverage.** Tested on the RTX 5090 Laptop and the desktop RTX 5090 (two over NCCL), not yet

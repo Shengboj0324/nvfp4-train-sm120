@@ -56,6 +56,19 @@ struct Args {
   const void* res;     // [M, N] (ld N), bf16 if res_bf16 else fp32, or null
   int res_bf16;
   int bias_round;
+  // Grouped GEMMs (mixture of experts; TMA main loop only, splits == 1, see nvfp4_gemm_grouped):
+  //   1 "ragged M": A [M, K] holds the groups' rows back to back, each group starting on a BM-row tile;
+  //     group g multiplies B rows [g * b_group_rows, (g + 1) * b_group_rows) and writes D[M, N] (N =
+  //     b_group_rows) in place: D[rows of g] = A[rows of g] @ B_g^T.
+  //   2 "ragged K": every group g reduces over its own K range [k0, k0 + k_len) of A [a_rows, K] and
+  //     B [N, K] and writes D rows [out_row0, out_row0 + a_rows): the weight gradients of all experts.
+  int group_mode;          // 0: dense
+  const int* tile_group;   // mode 1: group of each BM-row tile of A
+  int b_group_rows;        // mode 1
+  const int* segs;         // mode 2: {k0, k_len, out_row0} per group (k0, k_len multiples of 128)
+  int groups;              // mode 2: groups (work)
+  int a_rows;              // mode 2: rows of A (= D rows per group, a multiple of BM)
+  int sf_ld;               // scale row stride in bytes for the tensor maps (0: K / 16)
 };
 
 __device__ __forceinline__ float bf16_round(float v) { return __bfloat162float(__float2bfloat16_rn(v)); }

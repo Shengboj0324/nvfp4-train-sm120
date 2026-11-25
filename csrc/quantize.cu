@@ -170,15 +170,18 @@ __global__ void quantize_kernel(const T* __restrict__ x, QParams p, const unsign
 }  // namespace nvfp4
 
 namespace nvfp4 {
-static std::atomic<bool> g_four_six{false}, g_ms_eden{false};
+static std::atomic<bool> g_four_six{false}, g_ms_eden{false}, g_ms_eden_dgrad{false};
 bool four_six_enabled() { return g_four_six.load(std::memory_order_relaxed); }
 bool ms_eden_enabled() { return g_ms_eden.load(std::memory_order_relaxed); }
+bool ms_eden_dgrad_enabled() { return g_ms_eden_dgrad.load(std::memory_order_relaxed); }
 }  // namespace nvfp4
 
 void nvfp4_set_four_six(bool on) { nvfp4::g_four_six.store(on); }
 bool nvfp4_four_six() { return nvfp4::four_six_enabled(); }
 void nvfp4_set_ms_eden(bool on) { nvfp4::g_ms_eden.store(on); }
 bool nvfp4_ms_eden() { return nvfp4::ms_eden_enabled(); }
+void nvfp4_set_ms_eden_dgrad(bool on) { nvfp4::g_ms_eden_dgrad.store(on); }
+bool nvfp4_ms_eden_dgrad() { return nvfp4::ms_eden_dgrad_enabled(); }
 
 // Returns {data uint8 [R_out, C_out/2], scales uint8 [R_out, C_out/16], gdec fp32 [1]}.
 std::vector<torch::Tensor> nvfp4_quantize(torch::Tensor x, bool transpose, bool block_2d, bool stochastic,

@@ -57,6 +57,11 @@ struct Params {
   uint64_t rht_mask;  // rht_sign_mask(rht_seed), or rht_sign_mask64 with rht64
   bool rht64;         // 64-point RHT along the col output's rows (MS-EDEN recipe; R_pad % 64 == 0)
   bool col_eden;      // MS-EDEN instead of element SR on the col output
+  // MS-EDEN on the dgrad operand (the stochastically rounded row output; C % 64 == 0): 64-point RHT along the
+  // row with the signs of rht_sign_mask64(row seed ^ kRowRhtSalt), RTN codes, EDEN-corrected SR scales.
+  // Kernels are instantiated with RR = row_rht, so the other paths carry none of it.
+  bool row_rht;
+  uint64_t row_rht_mask;  // host row seed's mask
   // Optional device-resident seeds (int64 scalars). When set they replace row_seed / col_seed /
   // rht_seed, so the seeds can come from a GPU random generator: no host sync, CUDA-graph capturable
   // (every replay reads that replay's values), and traceable by torch.compile.
@@ -75,6 +80,7 @@ struct Params {
 struct Seeds {
   uint64_t row, col;
   uint64_t rht_mask;
+  uint64_t row_rht_mask;  // RR only
 };
 
 __device__ __forceinline__ const int64_t* seed_ptr(const Params& p, unsigned i) {
@@ -82,12 +88,18 @@ __device__ __forceinline__ const int64_t* seed_ptr(const Params& p, unsigned i) 
 }
 
 // After the barrier that publishes s_seed (convergent: all threads).
+template <bool RR>
 __device__ __forceinline__ Seeds resolve_seeds(const Params& p, const int64_t (&s_seed)[3]) {
-  return {p.row_seed_ptr ? static_cast<uint64_t>(s_seed[0]) : p.row_seed,
+  Seeds s{p.row_seed_ptr ? static_cast<uint64_t>(s_seed[0]) : p.row_seed,
           p.col_seed_ptr ? static_cast<uint64_t>(s_seed[1]) : p.col_seed,
           p.rht_seed_ptr ? (p.rht64 ? rht_sign_mask64_warp(static_cast<uint64_t>(s_seed[2]))
                                     : rht_sign_mask_warp(static_cast<uint64_t>(s_seed[2])))
-                         : p.rht_mask};
+                         : p.rht_mask,
+          0};
+  if constexpr (RR)
+    s.row_rht_mask = p.row_seed_ptr ? rht_sign_mask64_warp(static_cast<uint64_t>(s_seed[0]) ^ kRowRhtSalt)
+                                    : p.row_rht_mask;
+  return s;
 }
 
 // The column RHT of block b (rows 16 b .. 16 b + 15 of the tile) of column c, in place in v: the 16-point RHT
@@ -109,6 +121,26 @@ __device__ __forceinline__ void col_rht(float (&v)[kBlock], uint64_t mask, bool 
     const float r = b == 0 ? __fadd_rn(a, e) : b == 1 ? __fadd_rn(d01, d23) : b == 2 ? __fsub_rn(a, e)
                                                                                 : __fsub_rn(d01, d23);
     v[i] = r * 0.5f;
+  }
+}
+
+// The row RHT of block b (columns 16 b .. 16 b + 15 of the tile) of row r, in place in v: the 16-point RHT with
+// this block's slice of the 64 signs, then the 4-point Hadamard across the row's four blocks (x 0.5) through the
+// tile: H64 = H4 (x) H16 along the row (reference.apply_rht(n=64) on rows). Convergent (all threads); the tile
+// is overwritten.
+__device__ __forceinline__ void row_rht64(float (&v)[kBlock], uint64_t mask, float (*tile)[TILE + 1], int b, int r) {
+  rht16(v, static_cast<uint32_t>(mask >> (16 * b)) & 0xFFFFu);
+  __syncthreads();  // every thread has read its block from the tile
+#pragma unroll
+  for (int i = 0; i < kBlock; ++i) tile[r][b * kBlock + i] = v[i];
+  __syncthreads();
+#pragma unroll
+  for (int i = 0; i < kBlock; ++i) {
+    const float w0 = tile[r][i], w1 = tile[r][kBlock + i], w2 = tile[r][2 * kBlock + i], w3 = tile[r][3 * kBlock + i];
+    const float a = __fadd_rn(w0, w1), d01 = __fsub_rn(w0, w1), e = __fadd_rn(w2, w3), d23 = __fsub_rn(w2, w3);
+    const float x = b == 0 ? __fadd_rn(a, e) : b == 1 ? __fadd_rn(d01, d23) : b == 2 ? __fsub_rn(a, e)
+                                                                              : __fsub_rn(d01, d23);
+    v[i] = x * 0.5f;
   }
 }
 
@@ -313,16 +345,20 @@ __global__ void __launch_bounds__(THREADS) amax_flat_kernel(const T* __restrict_
   if (threadIdx.x == 0) atomicMax(out, __float_as_uint(m));
 }
 
-// amax(op(X)) -> amax[0] and, if p.col_rht, amax(RHT applied to the 16-row column blocks of op(X))
-// -> amax[1]. Persistent: each CTA loops over tiles (grid-stride), then contributes one atomic per output.
-template <typename T, int PRO>
+// amax(op(X)) -> amax[0], if p.col_rht amax(RHT applied to the 16-row column blocks of op(X)) -> amax[1], and
+// with RR amax(row RHT64 of op(X)) -> amax[2]. Persistent: each CTA loops over tiles (grid-stride), then
+// contributes one atomic per output.
+template <typename T, int PRO, bool RR>
 __global__ void __launch_bounds__(THREADS) amax_tile_kernel(const T* __restrict__ x, const Params p, ProArgs<T> pa,
                                                             unsigned int* __restrict__ amax) {
   __shared__ float tile[TILE][LD];
-  __shared__ int64_t s_rht_seed;
+  __shared__ int64_t s_rht_seed, s_row_seed;
   const bool seed_loader = threadIdx.x == 0 && p.rht_seed_ptr != nullptr;
   const int64_t rht_seed = seed_loader ? __ldg(p.rht_seed_ptr) : 0;
-  uint64_t rht_mask = p.rht_mask;
+  const bool row_loader = RR && threadIdx.x == 1 && p.row_seed_ptr != nullptr;
+  const int64_t row_seed = row_loader ? __ldg(p.row_seed_ptr) : 0;
+  uint64_t rht_mask = p.rht_mask, row_mask = p.row_rht_mask;
+  float m_rrow = 0.0f;
   bool first = true;
   const int tiles_c = (p.C + TILE - 1) / TILE;
   const int ntiles = tiles_c * ((p.R + TILE - 1) / TILE);  // padding rows add nothing
@@ -332,27 +368,43 @@ __global__ void __launch_bounds__(THREADS) amax_tile_kernel(const T* __restrict_
     const int r0 = (t / tiles_c) * TILE, c0 = (t % tiles_c) * TILE;
     __syncthreads();  // previous iteration's column reads are done
     m_plain = nan_max(m_plain, load_tile<T, PRO>(x, p, pa, r0, c0, tile));
-    if (!p.col_rht) continue;
+    if (!p.col_rht && !RR) continue;
     if (first && seed_loader) s_rht_seed = rht_seed;
+    if (first && row_loader) s_row_seed = row_seed;
     __syncthreads();
     if (first) {  // uniform: every thread runs the same iterations
       if (p.rht_seed_ptr)
         rht_mask = p.rht64 ? rht_sign_mask64_warp(static_cast<uint64_t>(s_rht_seed))
                            : rht_sign_mask_warp(static_cast<uint64_t>(s_rht_seed));
+      if (RR && p.row_seed_ptr) row_mask = rht_sign_mask64_warp(static_cast<uint64_t>(s_row_seed) ^ kRowRhtSalt);
       first = false;
     }
-    float v[kBlock];
+    float vr[kBlock];  // the row RHT's block (row c, block b), read before the column RHT reuses the tile
+    if constexpr (RR) {
 #pragma unroll
-    for (int i = 0; i < kBlock; ++i) v[i] = tile[b * kBlock + i][c];
-    col_rht(v, rht_mask, p.rht64, tile, b, c);
+      for (int i = 0; i < kBlock; ++i) vr[i] = tile[c][b * kBlock + i];
+    }
+    if (p.col_rht) {
+      float v[kBlock];
 #pragma unroll
-    for (int i = 0; i < kBlock; ++i) m_rht = nan_max(m_rht, fabsf(v[i]));
+      for (int i = 0; i < kBlock; ++i) v[i] = tile[b * kBlock + i][c];
+      col_rht(v, rht_mask, p.rht64, tile, b, c);
+#pragma unroll
+      for (int i = 0; i < kBlock; ++i) m_rht = nan_max(m_rht, fabsf(v[i]));
+    }
+    if constexpr (RR) {
+      row_rht64(vr, row_mask, tile, b, c);
+#pragma unroll
+      for (int i = 0; i < kBlock; ++i) m_rrow = nan_max(m_rrow, fabsf(vr[i]));
+    }
   }
   m_plain = block_max(m_plain);
   m_rht = block_max(m_rht);
+  if constexpr (RR) m_rrow = block_max(m_rrow);
   if (threadIdx.x == 0) {
     atomicMax(amax, __float_as_uint(m_plain));
     atomicMax(amax + 1, __float_as_uint(m_rht));
+    if constexpr (RR) atomicMax(amax + 2, __float_as_uint(m_rrow));
   }
 }
 
@@ -396,7 +448,7 @@ __device__ __forceinline__ void store_stage(const Stage& st, uint8_t* __restrict
   }
 }
 
-template <typename T, int PRO>
+template <typename T, int PRO, bool RR>
 __global__ void __launch_bounds__(THREADS) dual_quantize_kernel(const T* __restrict__ x, const Params p, ProArgs<T> pa,
                                                                 const unsigned int* __restrict__ amax_row,
                                                                 const unsigned int* __restrict__ amax_col,
@@ -410,7 +462,7 @@ __global__ void __launch_bounds__(THREADS) dual_quantize_kernel(const T* __restr
   load_tile<T, PRO>(x, p, pa, r0, c0, tile);
   if (my_seed_ptr) s_seed[threadIdx.x] = my_seed;
   __syncthreads();
-  const Seeds seeds = resolve_seeds(p, s_seed);
+  const Seeds seeds = resolve_seeds<RR>(p, s_seed);
   if (o.colsum != nullptr && threadIdx.x < TILE && c0 + static_cast<int>(threadIdx.x) < p.C) {
     float cs = 0.0f;  // rows past R are zero padding
 #pragma unroll 8
@@ -423,19 +475,28 @@ __global__ void __launch_bounds__(THREADS) dual_quantize_kernel(const T* __restr
   const bool first = blockIdx.x == 0 && blockIdx.y == 0 && threadIdx.x == 0;
   float v[kBlock];
 
+  float vc[kBlock];  // RR: the col phase's block, read before the row RHT reuses the tile
   if (p.do_row) {
-    const float genc = global_encode_scale(__uint_as_float(*amax_row), p.row_46);
+    const float genc = RR ? eden_encode_scale(__uint_as_float(*amax_row))
+                          : global_encode_scale(__uint_as_float(*amax_row), p.row_46);
     if (first) *o.row_gdec = __fdiv_rn(1.0f, genc);
     const int gr = r0 + k, gb = c0 / kBlock + b;
     float bmax = 0.0f;
 #pragma unroll
-    for (int i = 0; i < kBlock; ++i) {
-      v[i] = tile[k][b * kBlock + i];
-      bmax = fmaxf(bmax, fabsf(v[i]));
+    for (int i = 0; i < kBlock; ++i) v[i] = tile[k][b * kBlock + i];
+    if constexpr (RR) {
+      if (p.do_col) {
+#pragma unroll
+        for (int i = 0; i < kBlock; ++i) vc[i] = tile[b * kBlock + i][k];
+      }
+      row_rht64(v, seeds.row_rht_mask, tile, b, k);
     }
+#pragma unroll
+    for (int i = 0; i < kBlock; ++i) bmax = fmaxf(bmax, fabsf(v[i]));
     if (p.block_2d) bmax = max16(bmax);
     const uint64_t lin0 = static_cast<uint64_t>(gr) * p.C + gb * kBlock;
-    st.scales[k][b] = p.row_sr   ? quantize16<true>(v, bmax, genc, seeds.row, lin0, st.codes[k][b])
+    st.scales[k][b] = RR         ? quantize16_eden(v, bmax, genc, seeds.row, lin0 >> 4, st.codes[k][b])
+                      : p.row_sr ? quantize16<true>(v, bmax, genc, seeds.row, lin0, st.codes[k][b])
                       : p.row_46 ? quantize16_four_six(v, bmax, genc, st.codes[k][b])
                                  : quantize16<false>(v, bmax, genc, 0, lin0, st.codes[k][b]);
     __syncthreads();
@@ -450,7 +511,7 @@ __global__ void __launch_bounds__(THREADS) dual_quantize_kernel(const T* __restr
     if (first) *o.col_gdec = __fdiv_rn(1.0f, genc);
     const int gc = c0 + k, gb = r0 / kBlock + b;  // logical row / block column of X^T
 #pragma unroll
-    for (int i = 0; i < kBlock; ++i) v[i] = tile[b * kBlock + i][k];
+    for (int i = 0; i < kBlock; ++i) v[i] = (RR && p.do_row) ? vc[i] : tile[b * kBlock + i][k];
     if (p.col_rht) col_rht(v, seeds.rht_mask, p.rht64, tile, b, k);
     float bmax = 0.0f;
 #pragma unroll
@@ -585,6 +646,9 @@ std::vector<torch::Tensor> run_dual(const torch::Tensor& x, int pro, const torch
   p.row_seed_ptr = seed_ptr(seeds.row, x, "row_seed tensor");
   p.col_seed_ptr = seed_ptr(seeds.col, x, "col_seed tensor");
   p.rht_seed_ptr = seed_ptr(seeds.rht, x, "rht_seed tensor");
+  p.row_rht = ms_eden_dgrad_enabled() && do_row && row_sr && !block_2d;
+  TORCH_CHECK(!p.row_rht || p.C % 64 == 0, "MS-EDEN on the dgrad operand needs x.shape[1] % 64 == 0");
+  p.row_rht_mask = rht_sign_mask64(static_cast<uint64_t>(row_seed) ^ kRowRhtSalt);
 
   auto u8 = x.options().dtype(at::kByte);
   auto f32 = x.options().dtype(at::kFloat);
@@ -608,7 +672,7 @@ std::vector<torch::Tensor> run_dual(const torch::Tensor& x, int pro, const torch
     return {rd, rs, rg, cd, cs, cg};
   }
 
-  auto amax = torch::zeros({2}, x.options().dtype(at::kInt));
+  auto amax = torch::zeros({3}, x.options().dtype(at::kInt));
   auto* amax_ptr = reinterpret_cast<unsigned int*>(amax.data_ptr<int>());
   auto stream = at::cuda::getCurrentCUDAStream();
   Outputs o{do_row ? rd.data_ptr<uint8_t>() : nullptr, do_row ? rs.data_ptr<uint8_t>() : nullptr,
@@ -616,6 +680,7 @@ std::vector<torch::Tensor> run_dual(const torch::Tensor& x, int pro, const torch
             do_row ? rg.data_ptr<float>() : nullptr,   do_col ? cg.data_ptr<float>() : nullptr,
             col_sums ? csum.data_ptr<float>() : nullptr};
   const unsigned int* amax_col = p.col_rht ? amax_ptr + 1 : amax_ptr;
+  const unsigned int* amax_row = p.row_rht ? amax_ptr + 2 : amax_ptr;
 
   auto run = [&](auto* xp, auto pro_c) {
     using T = std::remove_cv_t<std::remove_pointer_t<decltype(xp)>>;
@@ -627,10 +692,13 @@ std::vector<torch::Tensor> run_dual(const torch::Tensor& x, int pro, const torch
         (i == 0 ? pa.part0 : i == 1 ? pa.part1 : pa.part2) = reinterpret_cast<const T*>((*parts)[i].data_ptr());
     // amax passes are persistent: ~4 CTAs per SM, grid-stride
     const int max_ctas = 4 * at::cuda::getCurrentDeviceProperties()->multiProcessorCount;
-    if (p.col_rht || (PRO != kNone && PRO != kParts)) {
+    if (p.col_rht || p.row_rht || (PRO != kNone && PRO != kParts)) {
       const int64_t ntiles = static_cast<int64_t>((p.C + TILE - 1) / TILE) * ((p.R + TILE - 1) / TILE);
       const int agrid = static_cast<int>(std::min<int64_t>(ntiles, max_ctas));
-      amax_tile_kernel<T, PRO><<<agrid, THREADS, 0, stream>>>(xp, p, pa, amax_ptr);
+      if (p.row_rht)
+        amax_tile_kernel<T, PRO, true><<<agrid, THREADS, 0, stream>>>(xp, p, pa, amax_ptr);
+      else
+        amax_tile_kernel<T, PRO, false><<<agrid, THREADS, 0, stream>>>(xp, p, pa, amax_ptr);
     } else {
       const int64_t nvec = x.numel() / (16 / static_cast<int64_t>(sizeof(T)));
       const int agrid = static_cast<int>(std::min<int64_t>((nvec + THREADS - 1) / THREADS, max_ctas));
@@ -638,7 +706,10 @@ std::vector<torch::Tensor> run_dual(const torch::Tensor& x, int pro, const torch
         amax_flat_kernel<T><<<agrid, THREADS, 0, stream>>>(
             p.part_cols == 0 ? xp : i == 0 ? pa.part0 : i == 1 ? pa.part1 : pa.part2, nvec, amax_ptr);
     }
-    dual_quantize_kernel<T, PRO><<<grid, THREADS, 0, stream>>>(xp, p, pa, amax_ptr, amax_col, o);
+    if (p.row_rht)
+      dual_quantize_kernel<T, PRO, true><<<grid, THREADS, 0, stream>>>(xp, p, pa, amax_row, amax_col, o);
+    else
+      dual_quantize_kernel<T, PRO, false><<<grid, THREADS, 0, stream>>>(xp, p, pa, amax_ptr, amax_col, o);
   };
   const bool bf16 = x.scalar_type() == at::kBFloat16;
   const auto* xb = reinterpret_cast<const __nv_bfloat16*>(x.data_ptr());

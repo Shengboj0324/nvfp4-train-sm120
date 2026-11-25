@@ -38,7 +38,7 @@ from __future__ import annotations
 import torch
 
 from nvfp4 import ops
-from nvfp4.linear import (ALIGN, NVFP4Linear, _weight_grad, draw_seeds, quantized_weight, unflatten_output,
+from nvfp4.linear import (ALIGN, NVFP4Linear, _weight_grad, dgrad_weight_operand, draw_seeds, unflatten_output,
                           weight_cache)
 
 BF16 = torch.bfloat16
@@ -118,7 +118,7 @@ class _NormLinearFn(torch.autograd.Function):
         seeds = draw_seeds(3, x2d.device) if need_dn or need_w or need_b else None  # [dY row SR, dY^T SR, RHT]
         use_rht = need_w and rht_on
         mean, rstd, xq, xtq = _norm_quantize(kind, x2d, norm_w, norm_b, eps, need_w, seeds[2] if use_rht else None)
-        wq, wtq = quantized_weight(weight, need_dn, "cuda", wcache)
+        wq, wtq = dgrad_weight_operand("cuda", weight, need_dn, wcache, seeds[0] if need_dn else None)
         y = _out_gemm(xq, wq, dt, bias, None)
         ctx.save_for_backward(x2d if kind != "none" else None, norm_w, mean, rstd, seeds,
                               *(xtq.as_storage() if need_w else ()), *(wtq.as_storage() if need_dn else ()))
@@ -168,11 +168,11 @@ class _GeluMLPFn(torch.autograd.Function):
         seeds = draw_seeds(6, x2d.device) if need_dh or need_w2 or need_b2 else None
         rht1, rht2 = need_w1 and rht_on, need_w2 and rht_on
         mean, rstd, xq, xtq = _norm_quantize(kind, x2d, norm_w, norm_b, eps, need_w1, seeds[2] if rht1 else None)
-        w1q, w1tq = quantized_weight(w1, need_dn, "cuda", wc1)
+        w1q, w1tq = dgrad_weight_operand("cuda", w1, need_dn, wc1, seeds[0] if need_dn else None)
         h = ops.gemm(xq, w1q, BF16)                                       # fc1 output (GELU input, without bias)
         gq, gtq = ops.gelu_quantize_dual(h, bias=b1, approximate=approximate, col=need_w2,
                                          rht_seed=seeds[5] if rht2 else None, col_pad=ALIGN)
-        w2q, w2tq = quantized_weight(w2, need_dh, "cuda", wc2)
+        w2q, w2tq = dgrad_weight_operand("cuda", w2, need_dh, wc2, seeds[3] if need_dh else None)
         out = _out_gemm(gq, w2q, dt, b2, x2d if residual else None)
         saved = [x2d if kind != "none" else None, norm_w, mean, rstd, h, seeds, b1]
         for flag, q in ((need_w1, xtq), (need_dn, w1tq), (need_w2, gtq), (need_dh, w2tq)):
@@ -247,13 +247,13 @@ class _SwiGLUMLPFn(torch.autograd.Function):
         seeds = draw_seeds(8, x2d.device) if need_da or need_wd or need_bd else None
         rht_x, rht_a = need_xt and rht_on, need_wd and rht_on
         mean, rstd, xq, xtq = _norm_quantize(kind, x2d, norm_w, norm_b, eps, need_xt, seeds[2] if rht_x else None)
-        wgq, wgtq = quantized_weight(wg, need_dn, "cuda", wcg)
-        wuq, wutq = quantized_weight(wu, need_dn, "cuda", wcu)
+        wgq, wgtq = dgrad_weight_operand("cuda", wg, need_dn, wcg, seeds[0] if need_dn else None)
+        wuq, wutq = dgrad_weight_operand("cuda", wu, need_dn, wcu, seeds[6] if need_dn else None)
         g = ops.gemm(xq, wgq, BF16)                                    # gate projection (without bias)
         u = ops.gemm(xq, wuq, BF16)                                    # up projection (without bias)
         aq, atq = ops.swiglu_quantize_dual(g, u, bias_g=bg, bias_u=bu, col=need_wd,
                                            rht_seed=seeds[5] if rht_a else None, col_pad=ALIGN)
-        wdq, wdtq = quantized_weight(wd, need_da, "cuda", wcd)
+        wdq, wdtq = dgrad_weight_operand("cuda", wd, need_da, wcd, seeds[3] if need_da else None)
         out = _out_gemm(aq, wdq, dt, bd, x2d if residual else None)
         saved = [x2d if kind != "none" else None, norm_w, mean, rstd, g, u, seeds, bg, bu]
         for flag, q in ((need_xt, xtq), (need_dn, wgtq), (need_dn, wutq), (need_wd, atq), (need_da, wdtq)):

@@ -25,6 +25,8 @@ namespace gemm {
 bool launch_tma(const Args& p, bool out_fp32, bool accumulate, dim3 grid, cudaStream_t stream);  // gemm_tma.cu
 bool tma_supported(const Args& p);
 int tma_k_tile();
+bool launch_tma_grouped(const Args& p, int64_t a_map_rows, int64_t b_map_rows, bool out_fp32, bool accumulate,
+                        int units, cudaStream_t stream);
 
 namespace legacy {
 
@@ -283,6 +285,85 @@ torch::Tensor nvfp4_gemm(torch::Tensor a, torch::Tensor sfa, torch::Tensor gdec_
     TORCH_CHECK(impl != 2, "TMA descriptor creation failed");
     legacy::launch_any(p, fp32, accumulate, grid, stream);
   }
+  C10_CUDA_KERNEL_LAUNCH_CHECK();
+  return d;
+}
+
+// Grouped NVFP4 GEMMs for mixture-of-experts layers, on the persistent TMA main loop (Args::group_mode):
+//   mode 1 ("ragged M", forward and input gradient): out[M, N] = A[M, K] @ B_g^T for the rows of each group g,
+//     B_g = rows [g N, (g + 1) N) of b [G N, K]; meta: int32 [ceil(M / 128)], the group of each 128-row tile
+//     of A (groups start on tile boundaries; rows of no group can be given any group: A rows of zeros).
+//   mode 2 ("ragged K", weight gradients): out[r0_g + i, j] (+)= sum over k in [k0_g, k0_g + len_g) of
+//     a[i, k] b[j, k]; meta: int32 [G, 3] = (k0, len, r0) per group (k0, len multiples of 128, len > 0);
+//     a [R, K] with R % 128 == 0, out [rows, N] given by the caller (accumulate=True adds to it).
+// Scales may have a row stride (sfa.stride(0) == sfb.stride(0)) larger than K / 16: it must be a multiple of
+// 16 bytes, so K need only be a multiple of 128 (the last k-tile reads zeros past K).
+torch::Tensor nvfp4_gemm_grouped(torch::Tensor a, torch::Tensor sfa, torch::Tensor gdec_a, torch::Tensor b,
+                                 torch::Tensor sfb, torch::Tensor gdec_b, int64_t mode, torch::Tensor meta,
+                                 int64_t group_rows, c10::ScalarType out_dtype, c10::optional<torch::Tensor> out,
+                                 bool accumulate) {
+  using namespace nvfp4::gemm;
+  for (auto* t : {&a, &b})
+    TORCH_CHECK(t->is_cuda() && t->scalar_type() == at::kByte && t->dim() == 2 && t->is_contiguous(),
+                "NVFP4 operands must be contiguous 2D uint8 CUDA tensors");
+  const int64_t K = a.size(1) * 2;
+  TORCH_CHECK(b.size(1) * 2 == K && K % 128 == 0 && K > 0, "A and B must have the same K, a multiple of 128");
+  for (auto* t : {&sfa, &sfb})
+    TORCH_CHECK(t->is_cuda() && t->scalar_type() == at::kByte && t->dim() == 2 && t->stride(1) == 1 &&
+                    t->size(1) == K / 16 && t->stride(0) % 16 == 0 && t->stride(0) >= K / 16 &&
+                    t->stride(0) == sfa.stride(0) && (reinterpret_cast<uintptr_t>(t->data_ptr()) & 15) == 0,
+                "scales must be [rows, K/16] uint8 with the same row stride, a multiple of 16 bytes");
+  TORCH_CHECK(sfa.size(0) == a.size(0) && sfb.size(0) == b.size(0), "scale rows must match the operands");
+  TORCH_CHECK(gdec_a.scalar_type() == at::kFloat && gdec_b.scalar_type() == at::kFloat, "gdec must be fp32");
+  TORCH_CHECK(meta.is_cuda() && meta.scalar_type() == at::kInt && meta.is_contiguous(), "meta must be int32 CUDA");
+  TORCH_CHECK(out_dtype == at::kBFloat16 || out_dtype == at::kFloat, "out_dtype must be bf16 or fp32");
+  TORCH_CHECK(!accumulate || (out.has_value() && out_dtype == at::kFloat), "accumulate needs an fp32 `out`");
+  for (auto* t : {&a, &b, &sfa, &sfb})
+    TORCH_CHECK((reinterpret_cast<uintptr_t>(t->data_ptr()) & 15) == 0, "operands must be 16-byte aligned");
+  const c10::cuda::CUDAGuard guard(a.device());
+  int64_t M, N, units_per = 0;
+  Args p{a.data_ptr<uint8_t>(), b.data_ptr<uint8_t>(), sfa.data_ptr<uint8_t>(), sfb.data_ptr<uint8_t>(),
+         gdec_a.data_ptr<float>(), gdec_b.data_ptr<float>(), nullptr, nullptr, nullptr, 0, 0, static_cast<int>(K), 1};
+  p.sf_ld = static_cast<int>(sfa.stride(0));
+  if (mode == 1) {
+    M = a.size(0);
+    N = group_rows;
+    TORCH_CHECK(N > 0 && N % BN == 0 && b.size(0) % N == 0, "group_rows must be a multiple of 128 dividing B's rows");
+    TORCH_CHECK(meta.dim() == 1 && meta.size(0) == (M + BM - 1) / BM, "meta must hold one group per 128-row tile");
+    p.group_mode = 1;
+    p.tile_group = meta.data_ptr<int>();
+    p.b_group_rows = static_cast<int>(N);
+    units_per = ((M + BM - 1) / BM) * (N / BN);
+  } else {
+    TORCH_CHECK(mode == 2, "mode must be 1 (ragged M) or 2 (ragged K)");
+    TORCH_CHECK(out.has_value(), "ragged-K grouped GEMMs need `out`");
+    TORCH_CHECK(meta.dim() == 2 && meta.size(1) == 3, "meta must be [groups, 3]");
+    TORCH_CHECK(a.size(0) % BM == 0, "A rows must be a multiple of 128");
+    M = out->size(0);
+    N = b.size(0);
+    p.group_mode = 2;
+    p.segs = meta.data_ptr<int>();
+    p.groups = static_cast<int>(meta.size(0));
+    p.a_rows = static_cast<int>(a.size(0));
+    units_per = (a.size(0) / BM) * ((N + BN - 1) / BN) * meta.size(0);
+  }
+  TORCH_CHECK(M < (int64_t{1} << 31) && N < (int64_t{1} << 31) && units_per < (int64_t{1} << 31), "too large");
+  torch::Tensor d;
+  if (out.has_value()) {
+    d = *out;
+    TORCH_CHECK(d.is_cuda() && d.device() == a.device() && d.scalar_type() == out_dtype && d.is_contiguous() &&
+                    d.dim() == 2 && d.size(0) == M && d.size(1) == N,
+                "out must be a contiguous [M, N] tensor of out_dtype on the same device");
+  } else {
+    d = torch::empty({M, N}, a.options().dtype(out_dtype));
+  }
+  p.d = d.data_ptr();
+  p.M = static_cast<int>(M);
+  p.N = static_cast<int>(N);
+  if (units_per == 0 || M == 0) return d;
+  const bool ok = launch_tma_grouped(p, a.size(0), b.size(0), out_dtype == at::kFloat, accumulate,
+                                     static_cast<int>(units_per), at::cuda::getCurrentCUDAStream());
+  TORCH_CHECK(ok, "TMA descriptor creation failed");
   C10_CUDA_KERNEL_LAUNCH_CHECK();
   return d;
 }

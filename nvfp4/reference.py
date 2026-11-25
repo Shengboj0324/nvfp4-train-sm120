@@ -303,18 +303,27 @@ def quantize(x: torch.Tensor, *, block_2d: bool = False, stochastic: bool = Fals
     return data.contiguous(), s.contiguous(), gdec.reshape(()).float()
 
 
+ROW_RHT_SALT = 0x1E3779B97F4A7C15  # csrc kRowRhtSalt
+
+
 def quantize_dual(x: torch.Tensor, *, row: bool = True, col: bool = True, block_2d: bool = False,
                   row_sr_seed: int | None = None, col_sr_seed: int | None = None, rht_seed: int | None = None,
-                  col_pad: int = 16, four_six: bool = False, ms_eden: bool = False):
+                  col_pad: int = 16, four_six: bool = False, ms_eden: bool = False, ms_eden_dgrad: bool = False):
     """Spec of the fused dual quantizer: (quantize(x), quantize(RHT(pad_rows(x, col_pad).T))).
 
-    Either output is None when disabled. A seed of None means round-to-nearest-even.
+    Either output is None when disabled. A seed of None means round-to-nearest-even. ``ms_eden_dgrad``: a
+    stochastically rounded row output is the 64-point RHT of x along its rows with seed row_sr_seed ^
+    ROW_RHT_SALT, quantized with EDEN (the dgrad operand of MS-EDEN).
     """
     xf = x.float()
     r_out = c_out = None
     if row:
-        r_out = quantize(xf, block_2d=block_2d, stochastic=row_sr_seed is not None, seed=row_sr_seed or 0,
-                         four_six=four_six)
+        if ms_eden_dgrad and row_sr_seed is not None and not block_2d:
+            r_out = quantize(apply_rht(xf, row_sr_seed ^ ROW_RHT_SALT, 64), stochastic=True, seed=row_sr_seed,
+                             eden=True)
+        else:
+            r_out = quantize(xf, block_2d=block_2d, stochastic=row_sr_seed is not None, seed=row_sr_seed or 0,
+                             four_six=four_six)
     if col:
         pad = (-xf.shape[0]) % col_pad
         y = torch.nn.functional.pad(xf, (0, 0, 0, pad)).T.contiguous()

@@ -66,6 +66,10 @@ __host__ __device__ __forceinline__ uint64_t rht_sign_mask64(uint64_t seed) {
   return m;
 }
 
+// MS-EDEN on the dgrad operands: the row output's 64-point RHT takes its signs from the row SR seed XOR this
+// salt (reference.ROW_RHT_SALT), so the dgrad weight operand can be rotated identically from the same seed.
+constexpr uint64_t kRowRhtSalt = 0x1E3779B97F4A7C15ull;
+
 // rht_sign_mask64 computed by a whole warp (two ballots; convergent).
 __device__ __forceinline__ uint64_t rht_sign_mask64_warp(uint64_t seed) {
   const unsigned lane = threadIdx.x & 31u;
@@ -205,6 +209,7 @@ bool four_six_enabled();
 // Host-side recipe switch for MS-EDEN (nvfp4.ops.set_ms_eden): the dual quantizer's RHT outputs use a 64-point
 // RHT, and its stochastically rounded RHT outputs (the wgrad gradient operand) MS-EDEN instead of element SR.
 bool ms_eden_enabled();
+bool ms_eden_dgrad_enabled();
 
 // MS-EDEN (Quartet II, arXiv 2601.22813): round-to-nearest with the block max mapped to s = 6 * 16/17 / 0.93
 // (clipping slightly; minimises the MSE of N(0, 1)), tensor scale genc = s * 256 / amax (headroom for the

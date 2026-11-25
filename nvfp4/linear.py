@@ -62,7 +62,8 @@ class _QuantizerEmulate:
     @staticmethod
     def dual(x, **kw):
         kw = {k: int(v) if isinstance(v, torch.Tensor) else v for k, v in kw.items()}  # seed tensors -> ints
-        outs = ref.quantize_dual(x, four_six=ops.four_six(), ms_eden=ops.ms_eden(), **kw)
+        outs = ref.quantize_dual(x, four_six=ops.four_six(), ms_eden=ops.ms_eden(),
+                                 ms_eden_dgrad=ops.ms_eden_dgrad(), **kw)
         return tuple(None if o is None else ops.NVFP4Tensor(o[0], o[1], o[2].reshape(1)) for o in outs)
 
     @staticmethod
@@ -125,7 +126,9 @@ register_optimizer_step_post_hook(_count_optimizer_step)
 def _quantize_weight(be, w: torch.Tensor, need_t: bool):
     """(W, W^T or None) in NVFP4: 16x16 blocks (one quantization, exact transpose), or with
     ops.weight_blocks("1d") 1x16 blocks along K for fprop and, for dgrad, the dequantized fprop weight
-    re-quantized along N (Quartet II / Mosaic: both GEMMs see the fprop weight up to a second rounding)."""
+    re-quantized along N (Quartet II / Mosaic: both GEMMs see the fprop weight up to a second rounding).
+    A stacked [E, N, K] weight (mixture of experts) is quantized as one [E N, K] matrix."""
+    w = w.reshape(-1, w.shape[-1])
     if ops.weight_blocks() == "2d":
         return be.dual(w, col=need_t, block_2d=True)
     wq, _ = be.dual(w, col=False)
@@ -152,6 +155,22 @@ def quantized_weight(weight: torch.Tensor, need_t: bool, backend_name: str, cach
     wq, wtq = _quantize_weight(be, weight.detach(), need_t)
     cache.key, cache.wq, cache.wtq = key, wq, wtq
     cache.misses += 1
+    return wq, wtq
+
+
+def dgrad_weight_operand(backend_name: str, weight: torch.Tensor, need_dgrad: bool, cache: WeightQuantCache | None,
+                         row_seed=None):
+    """(W for fprop, the dgrad operand W^T or None). Normally W^T is the transpose of W's 16x16-block
+    quantization (or the 1x16 re-quantization, see _quantize_weight). With MS-EDEN on dgrad
+    (``ops.set_ms_eden(True, dgrad=True)``) it is the dequantized fprop weight, transposed and quantized along N
+    after the 64-point RHT that the output gradient's row quantization with ``row_seed`` (its row SR seed)
+    applies, so that the rotations cancel in dX = (R dY)(R W^T)^T. A stacked [E, N, K] weight gives
+    [K, E N] (see ops.stack_transposed)."""
+    rot = need_dgrad and ops.ms_eden_dgrad()
+    wq, wtq = quantized_weight(weight, need_dgrad and not rot, backend_name, cache)
+    if rot:
+        _, wtq = _BACKENDS[backend_name].dual(wq.dequantize(), row=False, col=True,
+                                              rht_seed=ops.row_rht_seed(row_seed), col_pad=ALIGN)
     return wq, wtq
 
 
@@ -235,7 +254,7 @@ class _NVFP4LinearFn(torch.autograd.Function):
         # X  -> rowwise for fprop, and (if wgrad) X^T along tokens, RHT, zero-padded to ALIGN tokens
         xq, xtq = be.dual(x2d, col=need_wgrad, rht_seed=rht, col_pad=ALIGN)
         # W  -> 16x16 tiles; W^T (exact transpose) for dgrad
-        wq, wtq = quantized_weight(weight, need_dgrad, backend_name, wcache)
+        wq, wtq = dgrad_weight_operand(backend_name, weight, need_dgrad, wcache, seeds[0] if need_dgrad else None)
         if backend_name == "cuda" and (bias is not None or residual is not None):
             y = ops.gemm(xq, wq, out_dtype, bias=bias, residual=residual)  # [M, out], epilogue fused
         else:
@@ -370,12 +389,22 @@ class NVFP4Linear(torch.nn.Linear):
 
 
 def convert_linears(module: torch.nn.Module, *, skip=(), **kw) -> list[str]:
-    """Replace every eligible nn.Linear (dims % 128 == 0, name not starting with any ``skip`` prefix).
+    """Replace every eligible nn.Linear (dims % 128 == 0, name not starting with any ``skip`` prefix), and
+    switch mixture-of-experts layers (nvfp4.moe.MoE, anything with a ``to_nvfp4`` method) to NVFP4 experts
+    with the same keyword arguments (their routers stay as they are).
 
     Returns the names of converted modules.
     """
     converted = []
+    if hasattr(module, "to_nvfp4"):
+        module.to_nvfp4(**kw)
+        return [""]
     for name, child in list(module.named_modules()):
+        if hasattr(child, "to_nvfp4"):
+            if child is not module and not any(name.startswith(s) for s in skip):
+                child.to_nvfp4(**kw)
+                converted.append(name)
+            continue  # a MoE's router is not converted
         for cname, sub in list(child.named_children()):
             full = f"{name}.{cname}" if name else cname
             if (type(sub) is torch.nn.Linear and sub.in_features % ALIGN == 0 and sub.out_features % ALIGN == 0

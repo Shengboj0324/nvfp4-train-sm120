@@ -1,6 +1,7 @@
 """Cost of the quantizer recipe options on the dual quantizer (bf16, row + col, col RHT, col_pad 128):
 round-to-nearest vs stochastic rounding (8-bit integer-domain rounder) on gradient-shaped inputs, Four Over
-Six block scales on activation-shaped inputs, and MS-EDEN (64-point RHT, EDEN-corrected scales) on both.
+Six block scales on activation-shaped inputs, and MS-EDEN (64-point RHT, EDEN-corrected scales) on both, and
+with dgrad=True also on the gradient's row output.
 
     python bench/bench_sr_cost.py [--out bench/results/quantize_recipes.json]
 """
@@ -33,6 +34,8 @@ def main():
         ops.set_ms_eden(True)
         r["activation_ms_eden_us"] = t_us(act)
         r["gradient_ms_eden_us"] = t_us(grad)
+        ops.set_ms_eden(True, dgrad=True)
+        r["gradient_ms_eden_dgrad_us"] = t_us(grad)
         ops.set_ms_eden(False)
         rows.append(r)
         print(json.dumps({k: round(v, 1) if isinstance(v, float) else v for k, v in r.items()}), flush=True)

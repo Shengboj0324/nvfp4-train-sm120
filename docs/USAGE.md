@@ -150,23 +150,42 @@ grows with the share of attention in the step (long context). Errors are those o
 forward (output ~1–3% relative to exact attention, vs ~0.2% for BF16 flash attention); validate on your
 model.
 
-### 3.4 Mixture of experts (v0.11)
+### 3.4 Mixture of experts (v0.11; grouped GEMMs since v0.12)
 
 ```python
 from nvfp4.moe import MoE
 moe = MoE(d=1024, d_ff=2816, n_experts=8, top_k=2, activation="swiglu")   # or "gelu_tanh", "gelu"
-nvfp4.convert_linears(moe, fuse_wgrad_accumulation=True)   # experts -> NVFP4 (the router stays BF16)
+nvfp4.convert_linears(moe, fuse_wgrad_accumulation=True)   # = moe.to_nvfp4(...); the router stays BF16
 y = moe(x)                                    # x [..., d]
 loss = loss + 0.01 * moe.aux_loss             # Switch load-balancing loss (1.0 when balanced)
 ```
 
-Dropless top-k routing (softmax in fp32, weights renormalized over the k choices). Tokens are sorted by
-expert and each expert runs the fused NVFP4 MLP (`swiglu_mlp` / `gelu_mlp`) on its contiguous slice, so
-every expert's operands get their own tensor scales and the backward is the dense layers' path. The
-per-expert token counts are read on the host once per call (one synchronization per MoE layer, as in
-MegaBlocks), so a step with MoE layers is not CUDA-graph capturable and `torch.compile` breaks the graph
-there. `experiments/train_gpt.py --moe-experts 8` trains a GPT with MoE MLPs; `bench/bench_moe.py` times a
-layer (RESULTS.md §8).
+- **Routing.** Dropless top-k (softmax in fp32, weights renormalized over the k choices).
+- **Parameters.** Expert weights are stacked: `w_gate`, `w_up` [E, d_ff, d] and `w_down` [E, d, d_ff]
+  (SwiGLU), or `w_fc1` [E, d_ff, d] and `w_fc2` [E, d, d_ff] (GELU). There are no expert biases.
+  `convert_linears` / `to_nvfp4` take NVFP4Linear's keywords: `wgrad_rht`, `fuse_wgrad_accumulation`,
+  `cache_weight_quantization`.
+- **NVFP4 path** (DESIGN.md §4.5):
+  - The routed tokens are gathered once into a buffer sorted by expert (each expert padded to 128 rows)
+    and quantized once.
+  - Each projection of all experts is one grouped GEMM (`ops.gemm_grouped`), and the weight gradients of
+    all experts are one more.
+  - The activation and its backward are fused into the quantizers, as in the dense MLPs.
+- **BF16 path** (before conversion, or under `ops.set_high_precision`): the experts run one after another.
+- **Determinism.** Dispatch and combine are gathers (no scatter-add atomics), so both paths are
+  deterministic.
+- **Host sync.** The per-expert token counts are read on the host once per call (one synchronization per
+  MoE layer, as in MegaBlocks). A step with MoE layers is therefore not CUDA-graph capturable, and
+  `torch.compile` breaks the graph there.
+- **Scripts.** `experiments/train_gpt.py --moe-experts 8` trains a GPT with MoE MLPs; `bench/bench_moe.py`
+  times a layer (RESULTS.md §8).
+- **Changed in 0.12:** the per-expert `experts` ModuleList and the `bias` argument are gone. To load a
+  0.11 state dict, stack its `experts.{e}.gate.weight` etc. along a new dim 0. The stacked weights are
+  parameters, not `nn.Linear` modules, so a model-level init that matches `isinstance(m, nn.Linear)` (GPT's
+  N(0, 0.02) with scaled residual projections, for example) no longer reaches them: initialize
+  `moe.experts_weights()` explicitly, as `experiments/train_gpt.py` does. Left at their default (uniform,
+  bound 1/√fan_in) the GPT's expert output projections start about 3.6× larger, and NVFP4 training ends
+  about 1% worse.
 
 ### 3.5 Recipe options (v0.11)
 
@@ -176,6 +195,7 @@ Process-wide switches, read when a quantizer launches (set them before building 
 |---|---|---|
 | `ops.set_four_six(True)` (or `with ops.four_six_scales():`) | "Four Over Six" block scales on every round-to-nearest operand: each 16-block keeps the smaller-error of max → 6 and max → 4; tensor scale 6 · 256 / amax | off |
 | `ops.set_ms_eden(True)` | MS-EDEN on the wgrad operands: 64-point RHT along the tokens, and the gradient operand quantized with RTN elements and an EDEN-corrected, stochastically rounded block scale (unbiased, about half the error of element SR) | off |
+| `ops.set_ms_eden(True, dgrad=True)` | MS-EDEN on the dgrad operands as well (v0.12): dY and the GELU / SwiGLU input gradients rotated along N by a 64-point RHT and quantized with EDEN; the dgrad weight operand is the dequantized fprop weight re-quantized under the same rotation | off |
 | `ops.set_weight_blocks("1d")` | 1×16 weight blocks for fprop, the dequantized fprop weight re-quantized along N for dgrad | `"2d"` (16×16) |
 | `ops.set_high_precision(True)` | BF16 tail: `NVFP4Linear` and the fused sub-blocks compute exactly what the modules they replace would (BF16 GEMMs, ordinary autograd) until switched off; weights and optimizer state are untouched, so flip it for the last ~10% of steps | off |
 
@@ -185,7 +205,7 @@ GPT-124M scale for 2–13% throughput. Recommended: the default recipe plus a BF
 `set_ms_eden(True)` and `set_four_six(True)` only after checking them on your model.
 
 Their measured effect on GPT-124M is in RESULTS.md §4.2; `experiments/train_gpt.py` has `--four-six`,
-`--ms-eden`, `--weight-1d`, `--bf16-tail FRAC`, and `--hp-modules fc2` (keep a linear in BF16 in every
+`--ms-eden`, `--ms-eden-dgrad`, `--weight-1d`, `--bf16-tail FRAC`, and `--hp-modules fc2` (keep a linear in BF16 in every
 block).
 
 ### 3.6 Low-level ops
@@ -197,6 +217,9 @@ qb, qbt = quantize_dual(b, block_2d=True)          # b and b^T from one read
 d = gemm(qa, qb)                                   # a @ b^T, bf16 (or fp32 / into `out`, accumulate=True)
 y = gemm(qa, qb, torch.bfloat16, bias=bias, residual=r)  # r + (a @ b^T + bias), fused in the store
 r_q, c_q, db = quantize_dual([dq, dk, dv], bias_grad=True)  # concatenation read in place + column sums
+# grouped GEMMs (MoE): rows of `a` grouped in 128-row tiles (tile_group: int32 group per tile), B stacked
+y = ops.gemm_grouped(a_q, w_stacked_q, "m", tile_group, group_rows=N)
+ops.gemm_grouped(a_t, b_t, "k", segs, out_dtype=torch.float32, out=dw, accumulate=True)  # segs: (k0, len, row0)
 ```
 
 Seeds (`row_sr_seed`, `col_sr_seed`, `rht_seed`) are Python ints or one-element int64 tensors on the
