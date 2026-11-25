@@ -78,8 +78,9 @@ def _gemm_grouped_reference(a, b, mode, meta, *, group_rows=0, out_dtype=torch.b
     if mode == "m":
         res = torch.zeros(A.shape[0], group_rows, dtype=torch.float64, device=A.device)
         for t, g in enumerate(meta.tolist()):
-            rows = slice(128 * t, 128 * (t + 1))
-            res[rows] = A[rows] @ B[g * group_rows:(g + 1) * group_rows].T
+            if g >= 0:  # -1: an unused tile, zeros
+                rows = slice(128 * t, 128 * (t + 1))
+                res[rows] = A[rows] @ B[g * group_rows:(g + 1) * group_rows].T
         res = res.to(out_dtype)
         if out is None:
             return res

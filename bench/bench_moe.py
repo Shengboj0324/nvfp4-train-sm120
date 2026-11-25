@@ -1,5 +1,5 @@
 """Training-step time (forward + backward) of an nvfp4.moe.MoE layer, BF16 experts vs NVFP4 experts (fused
-MLPs, fused wgrad accumulation), for a few expert configurations.
+MLPs, fused wgrad accumulation), eager and captured in a CUDA graph, for a few expert configurations.
 
     python bench/bench_moe.py [--out bench/results/moe.json]
 """
@@ -38,6 +38,30 @@ def step_ms(moe, x):
     return timeit(step, iters=5, warmup=2, trials=5) * 1e3
 
 
+def graph_step_ms(moe, x):
+    """The same step captured once in a CUDA graph and replayed (NVFP4 experts only: the BF16 loop reads
+    the expert sizes on the host). A fresh copy of the layer and input: autograd's gradient-accumulation
+    nodes created by eager steps on the default stream must not leak into the capture."""
+    moe = copy.deepcopy(moe)
+    x = x.detach().clone().requires_grad_()
+    g = torch.randn(x.shape, device="cuda", dtype=torch.bfloat16)
+
+    def step():
+        with torch.autocast("cuda", dtype=torch.bfloat16):
+            y = moe(x)
+        y.backward(g)
+    s = torch.cuda.Stream()
+    s.wait_stream(torch.cuda.current_stream())
+    with torch.cuda.stream(s):
+        for _ in range(3):
+            step()
+    torch.cuda.current_stream().wait_stream(s)
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        step()
+    return timeit(graph.replay, iters=5, warmup=2, trials=5) * 1e3
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--out", default="bench/results/moe.json")
@@ -49,9 +73,9 @@ def main():
         fp4 = copy.deepcopy(bf16)
         convert_linears(fp4, fuse_wgrad_accumulation=True)
         x = torch.randn(T, d, device="cuda", requires_grad=True)
-        tb, tf = step_ms(bf16, x), step_ms(fp4, x)
+        tb, tf, tg = step_ms(bf16, x), step_ms(fp4, x), graph_step_ms(fp4, x)
         r = {"d": d, "d_ff": d_ff, "experts": E, "top_k": k, "activation": act, "tokens": T,
-             "bf16_ms": tb, "nvfp4_ms": tf, "speedup": tb / tf}
+             "bf16_ms": tb, "nvfp4_ms": tf, "speedup": tb / tf, "nvfp4_graph_ms": tg, "speedup_graph": tb / tg}
         rows.append(r)
         print(json.dumps({k_: round(v, 3) if isinstance(v, float) else v for k_, v in r.items()}), flush=True)
         del bf16, fp4, x

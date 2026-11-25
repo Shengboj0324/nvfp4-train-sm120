@@ -75,6 +75,48 @@ def test_ragged_k(accumulate):
             assert torch.equal(out[r0:r0 + R], ops.gemm(sl(aq), sl(bq), torch.float32, impl="tma", splits=1))
 
 
+@pytest.mark.parametrize("accumulate", [False, True])
+def test_unused_tiles_and_empty_segments(accumulate):
+    """Work units without k-tiles (tile group -1; ragged-K segments of length 0, at k0 % 256 == 0 and == 128)
+    load nothing and store a zero tile (or leave an accumulated output unchanged), interleaved with real units
+    so that the load cursors must skip them to stay in step with the consumers; more units than SMs."""
+    torch.manual_seed(5)
+    K, N = 512, 256
+    a_src = torch.randn(128 * 300, K, device="cuda")
+    b_src = torch.randn(3 * N, K, device="cuda")
+    aq, _ = ops.quantize_dual(a_src, col=False)
+    bq, _ = ops.quantize_dual(b_src, col=False)
+    tg = torch.tensor([(t % 3) if t % 4 else -1 for t in range(300)], device="cuda", dtype=torch.int32)
+    base = torch.randn(128 * 300, N, device="cuda")
+    out = base.clone() if accumulate else torch.full_like(base, float("nan"))
+    ops.gemm_grouped(aq, bq, "m", tg, group_rows=N, out_dtype=torch.float32, out=out, accumulate=accumulate)
+    full = _ref(aq, bq)
+    for t in range(300):
+        rows, g = slice(128 * t, 128 * (t + 1)), int(tg[t])
+        got = out[rows] - (base[rows] if accumulate else 0)
+        if g < 0:
+            assert torch.count_nonzero(got) == 0
+        else:
+            _close(got, full[rows, g * N:(g + 1) * N])
+    # ragged K: R = 128 output rows per group, segments of length 0 between real ones
+    R, Ktot = 128, 1024
+    a2, _ = ops.quantize_dual(torch.randn(R, Ktot, device="cuda"), col=False)
+    b2, _ = ops.quantize_dual(torch.randn(N, Ktot, device="cuda"), col=False)
+    segs = [(0, 0), (0, 384), (384, 0), (384, 128), (512, 0), (512, 512), (1024, 0)] * 6
+    meta = torch.tensor([[k0, n, i * R] for i, (k0, n) in enumerate(segs)], device="cuda", dtype=torch.int32)
+    base2 = torch.randn(len(segs) * R, N, device="cuda")
+    out2 = base2.clone() if accumulate else torch.full_like(base2, float("nan"))
+    ops.gemm_grouped(a2, b2, "k", meta, out_dtype=torch.float32, out=out2, accumulate=accumulate)
+    for i, (k0, n) in enumerate(segs):
+        got = out2[i * R:(i + 1) * R] - (base2[i * R:(i + 1) * R] if accumulate else 0)
+        if n == 0:
+            assert torch.count_nonzero(got) == 0
+        else:
+            sl = lambda t: ops.NVFP4Tensor(t.data[:, k0 // 2:(k0 + n) // 2].contiguous(),  # noqa: E731
+                                           t.scales[:, k0 // 16:(k0 + n) // 16].contiguous(), t.gdec)
+            _close(got, _ref(sl(a2), sl(b2)))
+
+
 def test_stack_transposed_matches_per_group_transpose():
     torch.manual_seed(2)
     G, N, K = 3, 256, 384

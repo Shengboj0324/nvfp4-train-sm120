@@ -1,5 +1,41 @@
 # Changelog
 
+## 0.13.0 — MoE without host synchronization: CUDA graphs, torch.compile, data parallel (2026-11-24)
+
+- **The NVFP4 MoE layer never synchronizes with the host.**
+  - The token buffer has the worst-case size for the step's tokens (T k + E·127 rows, rounded up to 256).
+    The tile table, ragged-K segments and dispatch indices are computed on the GPU from device-side
+    counts (an integer `scatter_add`, deterministic).
+  - Training steps with MoE layers can be captured in CUDA graphs. One graph serves any routing of the
+    same token count: replays equal eager bit for bit while the routing changes, including experts that
+    get no tokens. Captured Adam steps learn.
+  - `torch.compile(fullgraph=True)` traces the layer with no graph breaks (`gemm_grouped` is now a
+    `torch.library` custom op).
+  - Layer step: 32 experts at 2.39× BF16 in a CUDA graph (2.12× eager); 8 experts at 2.23× / 2.66×.
+- **Grouped GEMM: work units without k-tiles.**
+  - Tile group −1 marks an unused tile, which is stored as zeros without loading anything.
+  - Ragged-K segments may have length 0 (zeros, or the output left unchanged with `accumulate`).
+  - The load cursors skip such units (`skip_empty`, grouped instantiation only). The dense GEMM is
+    unchanged (461–468 TFLOPS at 8192³).
+- **Tested now** (`tests/test_moe_integration_cuda.py`, both activations):
+  - no host sync (`set_sync_debug_mode("error")`);
+  - CUDA-graph forward and full training step;
+  - `torch.compile` vs eager;
+  - activation checkpointing (bit-identical gradients);
+  - two-process DDP, FSDP1 and FSDP2, fused and unfused, bit-identical to a single process;
+  - deepcopy / pickle.
+- **Compiled vs eager.** Inductor's fused kernels keep fp32 where eager rounds to bf16. A slightly
+  different bf16 gradient moves an NVFP4 tensor scale, so compiled MoE training matches eager
+  statistically, not bit for bit. With `emulate_precision_casts=True` (and `fallback_random=True`) the
+  output and the expert weight gradients are bit-identical (USAGE.md §3.4).
+- **Fixed:** `copy.deepcopy` / pickling of a MoE layer after a forward pass. `aux_loss`, a non-leaf
+  tensor, made deepcopy raise.
+- **Changed:** `MoE.last_counts` is a property that reads the device-side counts on demand (that read
+  synchronizes). The MoE GPT trains as before: 1.5033 / 1.4965 for seeds 0 / 1 against v0.12's
+  1.5006 / 1.4973. The wider buffer changes only the stochastic-rounding bits of the wgrad operands.
+- Sanitizer driver covers the empty units. 900 tests (879 pass on the laptop, 21 skip), memcheck /
+  racecheck / synccheck / initcheck clean, 5-minute soak OK.
+
 ## 0.12.0 — grouped GEMMs for mixture of experts, MS-EDEN on dgrad (2026-11-24)
 
 - **Grouped NVFP4 GEMMs** (`ops.gemm_grouped`, DESIGN.md §4.5). The persistent TMA kernel gets a

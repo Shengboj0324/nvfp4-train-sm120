@@ -387,20 +387,26 @@ def gemm_grouped(a: NVFP4Tensor, b: NVFP4Tensor, mode: str, meta: torch.Tensor, 
     """Grouped NVFP4 GEMMs on the TMA main loop (mixture of experts; K a multiple of 128).
 
     ``mode="m"`` (ragged M: forward and input gradient): A [M, K] holds the groups' rows back to back, each
-    group starting on a 128-row tile; ``meta`` (int32 [ceil(M / 128)]) gives the group of every tile and
+    group starting on a 128-row tile; ``meta`` (int32 [ceil(M / 128)]) gives the group of every tile (-1: an
+    unused tile, whose output rows are stored as zeros without reading A or B) and
     ``b`` stacks the groups' [group_rows, K] matrices. Returns D [M, group_rows] with
     D[rows of g] = A[rows of g] @ B_g^T.
 
     ``mode="k"`` (ragged K: weight gradients): ``meta`` (int32 [G, 3]) = (k0, length, out_row0) per group,
-    k0 and length multiples of 128; ``out[out_row0 + i, j] (+)= sum_{k0 <= k < k0 + length} A[i, k] B[j, k]``
+    k0 and length multiples of 128 (length 0: the group's output tiles get zeros, or are left unchanged with
+    ``accumulate``); ``out[out_row0 + i, j] (+)= sum_{k0 <= k < k0 + length} A[i, k] B[j, k]``
     for i < A's rows. ``out`` is required; with ``accumulate`` (fp32) it is added to.
     """
     m = {"m": 1, "k": 2}[mode]
     sfa, sfb = _scales_ld16(a.scales), _scales_ld16(b.scales)
     if sfa.stride(0) != sfb.stride(0):
         raise ValueError("A and B must have the same K")
-    return _C.gemm_grouped(a.data, sfa, a.gdec, b.data, sfb, b.gdec, m, meta, int(group_rows), out_dtype, out,
-                           accumulate)
+    if out is not None and out.dtype != out_dtype:
+        raise RuntimeError(f"out is {out.dtype}, out_dtype {out_dtype}")
+    if out is None:
+        return _lib.gemm_grouped(a.data, sfa, a.gdec, b.data, sfb, b.gdec, m, meta, int(group_rows), out_dtype)
+    _lib.gemm_grouped_out(a.data, sfa, a.gdec, b.data, sfb, b.gdec, m, meta, int(group_rows), out, accumulate)
+    return out
 
 
 def stack_transposed(t: NVFP4Tensor, groups: int) -> NVFP4Tensor:

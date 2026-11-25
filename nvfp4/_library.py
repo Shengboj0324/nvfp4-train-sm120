@@ -172,6 +172,20 @@ def _gemm_out_impl(a: Tensor, sfa: Tensor, gdec_a: Tensor, b: Tensor, sfb: Tenso
     _C.gemm(a, sfa, gdec_a, b, sfb, gdec_b, out.dtype, out, accumulate, impl, splits)
 
 
+# (`group_mode`, not `mode`: auto_functionalized, which wraps the mutating op under torch.compile, has a
+# `mode` parameter of its own)
+def _gemm_grouped_impl(a: Tensor, sfa: Tensor, gdec_a: Tensor, b: Tensor, sfb: Tensor, gdec_b: Tensor,
+                       group_mode: int, meta: Tensor, group_rows: int, out_dtype: torch.dtype) -> Tensor:
+    require(a)
+    return _C.gemm_grouped(a, sfa, gdec_a, b, sfb, gdec_b, group_mode, meta, group_rows, out_dtype, None, False)
+
+
+def _gemm_grouped_out_impl(a: Tensor, sfa: Tensor, gdec_a: Tensor, b: Tensor, sfb: Tensor, gdec_b: Tensor,
+                           group_mode: int, meta: Tensor, group_rows: int, out: Tensor, accumulate: bool) -> None:
+    require(a)
+    _C.gemm_grouped(a, sfa, gdec_a, b, sfb, gdec_b, group_mode, meta, group_rows, out.dtype, out, accumulate)
+
+
 def _attn_quant_impl(x: Tensor, mean: Optional[Tensor], o: Optional[Tensor], want_row: bool,
                      want_col: bool, want_bf16: bool, want_deq: bool = False) -> List[Tensor]:
     require(x)
@@ -213,6 +227,9 @@ _swiglu_backward_quantize_dual_op = torch.library.custom_op("nvfp4::swiglu_backw
 _norm_backward_op = torch.library.custom_op("nvfp4::norm_backward", _norm_backward_impl, mutates_args=())
 _gemm_op = torch.library.custom_op("nvfp4::gemm", _gemm_impl, mutates_args=())
 _gemm_out_op = torch.library.custom_op("nvfp4::gemm_out", _gemm_out_impl, mutates_args=("out",))
+_gemm_grouped_op = torch.library.custom_op("nvfp4::gemm_grouped", _gemm_grouped_impl, mutates_args=())
+_gemm_grouped_out_op = torch.library.custom_op("nvfp4::gemm_grouped_out", _gemm_grouped_out_impl,
+                                               mutates_args=("out",))
 _attn_quant_op = torch.library.custom_op("nvfp4::attn_quant", _attn_quant_impl, mutates_args=())
 _attn_fwd_op = torch.library.custom_op("nvfp4::attn_fwd", _attn_fwd_impl, mutates_args=())
 _attn_bwd_op = torch.library.custom_op("nvfp4::attn_bwd", _attn_bwd_impl, mutates_args=())
@@ -307,6 +324,16 @@ def _(a, sfa, gdec_a, b, sfb, gdec_b, out, accumulate, impl, splits):
     return None
 
 
+@_gemm_grouped_op.register_fake
+def _(a, sfa, gdec_a, b, sfb, gdec_b, group_mode, meta, group_rows, out_dtype):
+    return a.new_empty((a.shape[0], group_rows), dtype=out_dtype)
+
+
+@_gemm_grouped_out_op.register_fake
+def _(a, sfa, gdec_a, b, sfb, gdec_b, group_mode, meta, group_rows, out, accumulate):
+    return None
+
+
 def _pad128(n: int) -> int:
     return (n + 127) // 128 * 128
 
@@ -379,6 +406,8 @@ swiglu_quantize_dual = _pick(_swiglu_quantize_dual_impl, _swiglu_quantize_dual_o
 swiglu_backward_quantize_dual = _pick(_swiglu_backward_quantize_dual_impl, _swiglu_backward_quantize_dual_op)
 gemm = _pick(_gemm_impl, _gemm_op)
 gemm_out = _pick(_gemm_out_impl, _gemm_out_op)
+gemm_grouped = _pick(_gemm_grouped_impl, _gemm_grouped_op)
+gemm_grouped_out = _pick(_gemm_grouped_out_impl, _gemm_grouped_out_op)
 attn_quant = _pick(_attn_quant_impl, _attn_quant_op)
 attn_fwd = _pick(_attn_fwd_impl, _attn_fwd_op)
 attn_bwd = _pick(_attn_bwd_impl, _attn_bwd_op)

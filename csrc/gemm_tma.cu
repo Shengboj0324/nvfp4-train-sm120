@@ -166,7 +166,6 @@ __device__ __forceinline__ Unit unit_of(const Args& p, int u, int tiles_n, int t
   w.tile = u % tiles;
   w.m0 = w.am0 = (w.tile / tiles_n) * BM;
   w.n0 = w.bn0 = (w.tile % tiles_n) * BN;
-  if (G && p.group_mode == 1) w.bn0 = __ldg(p.tile_group + w.tile / tiles_n) * p.b_group_rows + w.n0;
   // KT * splits < 2^31 (host check): 32-bit division, no 64-bit division call. A partial last k-tile (K % BK
   // != 0, grouped GEMMs only) reads zeros past the end of K (tensor-map out-of-bounds fill).
   const int KT = G ? (p.K + BK - 1) / BK : p.K / BK;
@@ -174,6 +173,13 @@ __device__ __forceinline__ Unit unit_of(const Args& p, int u, int tiles_n, int t
   w.nk = KT * (w.z + 1) / p.splits - kt0;
   w.k0 = kt0 * BK;
   w.half = 0;
+  if (G && p.group_mode == 1) {  // group < 0: an unused tile, stored as zeros without loading anything
+    const int g = __ldg(p.tile_group + w.tile / tiles_n);
+    if (g < 0)
+      w.nk = 0;
+    else
+      w.bn0 = g * p.b_group_rows + w.n0;
+  }
   return w;
 }
 
@@ -195,11 +201,25 @@ struct Producer {
   Unit qw;
 };
 
+// Grouped GEMMs have units without k-tiles (empty groups, unused tiles): they load nothing, so the load
+// cursors skip them (the consumer still runs them, storing a zero tile).
+template <bool G>
+__device__ __forceinline__ void skip_empty(int& u, Unit& w, const Args& p, const Grid& gd) {
+  if constexpr (G) {
+    while (u < gd.total && w.nk == 0) {
+      u += gridDim.x;
+      if (u < gd.total) w = unit_of<G>(p, u, gd.tiles_n, gd.tiles);
+    }
+  }
+}
+
 template <bool G>
 __device__ __forceinline__ void producer_init(Producer& pr, const Args& p, const Grid& gd) {
   pr.du = pr.qu = blockIdx.x;
   pr.dk = pr.dseq = pr.qq = pr.qseq = 0;
   pr.dw = pr.qw = unit_of<G>(p, blockIdx.x, gd.tiles_n, gd.tiles);
+  skip_empty<G>(pr.du, pr.dw, p, gd);
+  skip_empty<G>(pr.qu, pr.qw, p, gd);
 }
 
 // Load the next k-tile (if any; only if `issue`) into data stage dseq % STAGES and advance the cursor.
@@ -220,6 +240,7 @@ __device__ __forceinline__ void issue_next_stage(Producer& pr, const Args& p, co
     pr.dk = 0;
     pr.du += gridDim.x;
     if (pr.du < gd.total) pr.dw = unit_of<G>(p, pr.du, gd.tiles_n, gd.tiles);
+    skip_empty<G>(pr.du, pr.dw, p, gd);
   }
 }
 
@@ -242,6 +263,7 @@ __device__ __forceinline__ void issue_next_quad(Producer& pr, const Args& p, con
     pr.qq = 0;
     pr.qu += gridDim.x;
     if (pr.qu < gd.total) pr.qw = unit_of<G>(p, pr.qu, gd.tiles_n, gd.tiles);
+    skip_empty<G>(pr.qu, pr.qw, p, gd);
   }
 }
 

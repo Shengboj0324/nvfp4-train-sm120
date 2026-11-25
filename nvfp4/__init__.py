@@ -16,7 +16,7 @@ from nvfp4.ops import (NVFP4Tensor, available, gelu_backward_quantize_dual, gelu
                        layernorm_quantize_dual, norm_backward, quantize, quantize_dual, rmsnorm_quantize_dual,
                        swiglu_backward_quantize_dual, swiglu_quantize_dual)
 
-__version__ = "0.12.0"
+__version__ = "0.13.0"
 __all__ = ["reference", "attention", "MoE", "NVFP4Tensor", "NVFP4Linear", "WeightQuantCache", "available", "convert_linears",
            "invalidate_weight_caches", "gelu_backward_quantize_dual", "gelu_mlp", "norm_backward", "swiglu_mlp",
            "gelu_quantize_dual", "gemm", "layernorm_linear", "layernorm_mlp", "layernorm_quantize_dual", "quantize",

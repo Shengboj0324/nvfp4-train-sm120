@@ -150,7 +150,7 @@ grows with the share of attention in the step (long context). Errors are those o
 forward (output ~1–3% relative to exact attention, vs ~0.2% for BF16 flash attention); validate on your
 model.
 
-### 3.4 Mixture of experts (v0.11; grouped GEMMs since v0.12)
+### 3.4 Mixture of experts (v0.11; grouped GEMMs since v0.12; sync-free since v0.13)
 
 ```python
 from nvfp4.moe import MoE
@@ -174,9 +174,20 @@ loss = loss + 0.01 * moe.aux_loss             # Switch load-balancing loss (1.0 
 - **BF16 path** (before conversion, or under `ops.set_high_precision`): the experts run one after another.
 - **Determinism.** Dispatch and combine are gathers (no scatter-add atomics), so both paths are
   deterministic.
-- **Host sync.** The per-expert token counts are read on the host once per call (one synchronization per
-  MoE layer, as in MegaBlocks). A step with MoE layers is therefore not CUDA-graph capturable, and
-  `torch.compile` breaks the graph there.
+- **No host sync on the NVFP4 path (v0.13).** The expert sizes stay on the GPU:
+  - The token buffer has the worst-case size for the step's tokens (T k + E·127 rows, rounded up to 256),
+    and its layout tables are computed on the GPU.
+  - The grouped GEMMs skip the unused tail tiles and the experts that got no tokens.
+  - A training step with NVFP4 MoE layers can therefore be captured in a CUDA graph. One graph serves any
+    routing of the same number of tokens.
+  - It also compiles with `torch.compile(fullgraph=True)`.
+  - The BF16 loop still reads the sizes once per call.
+  - `moe.last_counts` reads them on demand (that read synchronizes).
+- **Compiled vs eager.** By default inductor keeps fp32 intermediates inside its fused kernels where eager
+  rounds to bf16. A slightly different bf16 gradient moves an NVFP4 tensor scale, and every rounding after
+  it. Compiled MoE training is then statistically the same as eager, not bit-identical. With
+  `torch._inductor.config.emulate_precision_casts = True` (and `fallback_random = True` for the seeds),
+  the outputs and the expert weight gradients are bit-identical to eager (tested).
 - **Scripts.** `experiments/train_gpt.py --moe-experts 8` trains a GPT with MoE MLPs; `bench/bench_moe.py`
   times a layer (RESULTS.md §8).
 - **Changed in 0.12:** the per-expert `experts` ModuleList and the `bias` argument are gone. To load a
@@ -217,7 +228,7 @@ qb, qbt = quantize_dual(b, block_2d=True)          # b and b^T from one read
 d = gemm(qa, qb)                                   # a @ b^T, bf16 (or fp32 / into `out`, accumulate=True)
 y = gemm(qa, qb, torch.bfloat16, bias=bias, residual=r)  # r + (a @ b^T + bias), fused in the store
 r_q, c_q, db = quantize_dual([dq, dk, dv], bias_grad=True)  # concatenation read in place + column sums
-# grouped GEMMs (MoE): rows of `a` grouped in 128-row tiles (tile_group: int32 group per tile), B stacked
+# grouped GEMMs (MoE): rows of `a` grouped in 128-row tiles (tile_group: int32 group per tile, -1 = unused), B stacked
 y = ops.gemm_grouped(a_q, w_stacked_q, "m", tile_group, group_rows=N)
 ops.gemm_grouped(a_t, b_t, "k", segs, out_dtype=torch.float32, out=dw, accumulate=True)  # segs: (k0, len, row0)
 ```
@@ -254,7 +265,7 @@ sync, and changes on every CUDA-graph replay. Both give bit-identical results fo
   FSDP1 (`FullyShardedDataParallel`, flat parameters or `use_orig_params=True`, with `no_sync`) and
   FSDP2 (`fully_shard`, with `set_requires_gradient_sync`) produce gradients bit-identical to a
   single-process computation of the same micro-batches, with or without fused accumulation (tested
-  with two processes, on Linux and on Windows). Under FSDP1 the layers see views of the flat
+  with two processes, on Linux and on Windows; the MoE layer too, v0.13). Under FSDP1 the layers see views of the flat
   parameter, so fused accumulation quietly takes the ordinary path. Kernel attributes are set per device, so one process driving several GPUs works
   too.
 - **Hangs become errors.** GEMM pipeline waits are bounded (1 s, then `trap`), so a fault surfaces as

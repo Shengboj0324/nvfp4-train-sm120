@@ -510,19 +510,23 @@ on the activations of a model trained at 4096 tokens (`bench/attention_real_erro
 [0.7–2.3%], dQ 0.4–2.0% [0.3–0.6%; v0.9.0: 0.4–24%], dK 1.2–6.9% [2.8–7.1%], dV 0.2–2.1% [2.5–3.1%].
 GPT-124M (attention a small share of the step) trains at the same speed with either.
 
-## 8. Mixture of experts (v0.11–v0.12, `bench/results/moe.json`, `experiments/results/v0.12_moe/`)
+## 8. Mixture of experts (v0.11–v0.13, `bench/results/moe.json`, `experiments/results/v0.12_moe/`, `…/v0.13_moe/`)
 
 `nvfp4.moe.MoE` layer, one training step (forward + backward, autocast BF16, 16,384 tokens), BF16 experts
 vs the same experts converted to NVFP4 (`bench/bench_moe.py`). v0.11 ran each expert's fused MLP in turn;
 v0.12 runs each projection of all experts as one grouped GEMM (DESIGN.md §4.5), and both precisions got
 the dispatch / combine rewrite (one gather each way, no scatter-add, no per-expert slicing):
 
-| d | expert d_ff | experts | top-k | activation | BF16 ms | NVFP4 ms (v0.12) | speedup v0.12 | speedup v0.11 |
-|---|---|---|---|---|---|---|---|---|
-| 1024 | 2816 | 8 | 2 | SwiGLU | 31.5 | 14.9 | **2.12×** | 1.74× |
-| 2048 | 5632 | 8 | 2 | SwiGLU | 109.5 | 42.6 | **2.57×** | 2.15× |
-| 2048 | 1408 | 32 | 4 | SwiGLU | 77.5 | 36.2 | **2.14×** | 1.25× |
-| 768 | 1536 | 8 | 2 | GELU (tanh) | 10.9 | 6.6 | **1.67×** | 1.27× |
+| d | expert d_ff | experts | top-k | activation | BF16 ms | NVFP4 ms | speedup | NVFP4, CUDA graph (v0.13) | speedup v0.11 |
+|---|---|---|---|---|---|---|---|---|---|
+| 1024 | 2816 | 8 | 2 | SwiGLU | 31.7 | 14.7 | **2.15×** | 14.2 ms (2.23×) | 1.74× |
+| 2048 | 5632 | 8 | 2 | SwiGLU | 110.9 | 42.4 | **2.62×** | 41.8 ms (2.66×) | 2.15× |
+| 2048 | 1408 | 32 | 4 | SwiGLU | 77.3 | 36.5 | **2.12×** | 32.3 ms (**2.39×**) | 1.25× |
+| 768 | 1536 | 8 | 2 | GELU (tanh) | 10.8 | 6.3 | **1.71×** | 5.9 ms (1.82×) | 1.27× |
+
+(v0.13 numbers; v0.12 measured 14.9 / 42.6 / 36.2 / 6.6 ms eager. The worst-case buffer of the sync-free
+layer costs nothing measurable: the unused tail tiles are zero stores. A captured step saves the launch
+and Python overhead of its 258 kernels, 3–12%, most with 32 experts.)
 
 With per-expert launches the speedup followed the per-expert GEMM size: 32 small experts (≈2,000 tokens ×
 1,408 each) ran 1,903 kernels per step and got 1.25×. Grouped, the kernel count is fixed (258) whatever
@@ -551,6 +555,10 @@ another order), against a BF16 run at 1.4830.
   skipped them and they kept the uniform default, with output projections 3.6× too large at the start.
   `train_gpt.py` now initializes `moe.experts_weights()` explicitly (USAGE.md §3.4); those runs are kept
   in `v0.12_moe/uniform_init/`.
+- **v0.13 (sync-free layer):** 1.5033 and 1.4965 for seeds 0 and 1 (gap +1.06%, +0.82%; v0.12: 1.5006,
+  1.4973). The rows, scales and reduction ranges are v0.12's; the wider buffer only changes the
+  stochastic-rounding bits of the weight-gradient operands (their counter is column × padded rows), so the
+  runs differ by rounding noise (+0.17%, −0.05%).
 - The NVFP4 gap (+0.88%) is below the dense model's +1.32% ± 0.16 but within reach of its seed range.
   End to end, NVFP4 is +25% tokens/s (dense: +32%): routing, the gathers and the per-layer host
   synchronization run at the same speed in both precisions.

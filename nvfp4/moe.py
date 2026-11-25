@@ -6,15 +6,19 @@
     y = moe(x)                               # x [..., d]; moe.aux_loss: Switch load-balancing loss
 
 Routing: softmax over the router logits (fp32), top-k experts per token, weights renormalized over the k
-choices. The (token, expert) pairs are sorted by expert (stable). No tokens are dropped (no capacity factor);
-the per-expert token counts are read on the host once per call (one synchronization, as in MegaBlocks).
+choices. The (token, expert) pairs are sorted by expert (stable). No tokens are dropped (no capacity factor).
+The NVFP4 path never reads the expert sizes on the host: its buffers have the worst-case size for the
+number of tokens, and the layout is computed on the GPU, so a training step with NVFP4 MoE layers can be
+captured in a CUDA graph and traced by ``torch.compile`` without graph breaks. (The BF16 loop reads the
+sizes once per call, as MegaBlocks does.)
 
 Expert weights are stacked parameters, ``w_gate`` / ``w_up`` [E, d_ff, d] and ``w_down`` [E, d, d_ff]
 (SwiGLU) or ``w_fc1`` [E, d_ff, d] and ``w_fc2`` [E, d, d_ff] (GELU), so all experts run in one GEMM launch
 per projection:
 
   * the routed tokens are gathered into one buffer, each expert's rows padded to a multiple of 128 (zero
-    rows), and quantized once (one tensor scale, like a dense layer's activation);
+    rows; T k + E 127 rows in all, the unused tail tiles skipped by the GEMMs), and quantized once (one
+    tensor scale, like a dense layer's activation);
   * forward and input-gradient GEMMs are grouped "ragged M" GEMMs (``ops.gemm_grouped(mode="m")``): every
     128-row tile reads its expert's weight rows; the stacked weights are quantized as one [E N, K] tensor
     (16x16 blocks, so the transposed copy is the same quantization, rearranged per expert);
@@ -258,7 +262,7 @@ class MoE(nn.Module):
         self.cache_weight_quantization = False
         self._caches = tuple(WeightQuantCache() for _ in self._names)
         self.aux_loss: torch.Tensor | None = None
-        self.last_counts: list[int] | None = None
+        self._counts: torch.Tensor | None = None
 
     def reset_parameters(self) -> None:
         """nn.Linear's default initialization for every expert matrix (uniform, bound 1/sqrt(fan_in))."""
@@ -282,6 +286,19 @@ class MoE(nn.Module):
     def experts_weights(self):
         return tuple(getattr(self, n) for n in self._names)
 
+    def __getstate__(self):
+        """Copies and pickles leave out the last forward's outputs (``aux_loss`` is a non-leaf tensor, which
+        deepcopy refuses; neither belongs to the module's state)."""
+        state = self.__dict__.copy()
+        state["aux_loss"] = None
+        state["_counts"] = None
+        return state
+
+    @property
+    def last_counts(self) -> list[int] | None:
+        """Tokens routed to each expert in the last forward (read from the GPU: synchronizes)."""
+        return None if self._counts is None else self._counts.tolist()
+
     def route(self, x2d: torch.Tensor):
         """(weights [T, k] fp32, experts [T, k] int64, router probabilities [T, E] fp32)."""
         probs = torch.softmax(self.router(x2d).float(), dim=-1)
@@ -304,30 +321,27 @@ class MoE(nn.Module):
                 outs.append(F.linear(F.gelu(F.linear(part, ws[0][e]), approximate=approx), ws[1][e]))
         return torch.cat(outs, 0)
 
-    def _experts_grouped(self, x2d, token, slot_expert, slot_of_sorted, counts: list[int]):
-        """(expert outputs of the padded buffer [M, d], the buffer row of every (token, choice) slot [T, k])."""
+    def _experts_grouped(self, x2d, token, slot_expert, slot_of_sorted, counts: torch.Tensor):
+        """(expert outputs of the padded buffer [M, d], the buffer row of every (token, choice) slot [T, k]).
+
+        No host synchronization: the buffer has the worst-case size for T tokens, M = T k + E (128 - 1) rounded
+        up to 256 (every expert's rows padded to 128), and the layout tables are computed on the GPU from the
+        device-side counts. Tiles past the used rows are tagged -1 (the grouped GEMM stores zeros there without
+        loading anything), and the ragged-K segments of experts without tokens are empty."""
         dev, E, d, f = x2d.device, self.n_experts, self.d, self.d_ff
-        padded = [(n + _ROWS - 1) // _ROWS * _ROWS for n in counts]
-        pstart = [0] * E
-        for e in range(1, E):
-            pstart[e] = pstart[e - 1] + padded[e - 1]
-        total = pstart[-1] + padded[-1]
-        m_pad = max(256, (total + 255) // 256 * 256)  # the column-quantized operands' K: a multiple of 256
-        cstart = [0] * E
-        for e in range(1, E):
-            cstart[e] = cstart[e - 1] + counts[e - 1]
-        tiles = [e for e in range(E) for _ in range(padded[e] // _ROWS)] + [0] * ((m_pad - total) // _ROWS)
-        active = [e for e in range(E) if counts[e]]
-        host = torch.tensor([*tiles, *pstart, *cstart] + [v for e in active for v in (pstart[e], padded[e], e * d)]
-                            + [v for e in active for v in (pstart[e], padded[e], e * f)], dtype=torch.int32)
-        meta = host.to(dev, non_blocking=True)
-        nt, na = len(tiles), len(active)
-        tiles_t = meta[:nt]
-        pstart_t, cstart_t = meta[nt:nt + E].long(), meta[nt + E:nt + 2 * E].long()
-        segs_d = meta[nt + 2 * E:nt + 2 * E + 3 * na].view(na, 3)
-        segs_f = meta[nt + 2 * E + 3 * na:].view(na, 3)
-        dest = torch.arange(token.numel(), device=dev) - cstart_t[slot_expert] + pstart_t[slot_expert]
         T, k = x2d.shape[0], self.top_k
+        m_pad = (T * k + E * (_ROWS - 1) + 255) // 256 * 256  # also the column operands' K: a multiple of 256
+        padded = (counts + _ROWS - 1) // _ROWS * _ROWS
+        pend = torch.cumsum(padded, 0)
+        pstart = pend - padded
+        cstart = torch.cumsum(counts, 0) - counts
+        tile_row = torch.arange(0, m_pad, _ROWS, device=dev)
+        tiles_t = torch.searchsorted(pend, tile_row, right=True)
+        tiles_t = torch.where(tiles_t < E, tiles_t, -1).to(torch.int32)  # rows past the last expert: unused
+        experts = torch.arange(E, device=dev)
+        segs_d = torch.stack([pstart, padded, experts * d], 1).to(torch.int32)
+        segs_f = torch.stack([pstart, padded, experts * f], 1).to(torch.int32)
+        dest = torch.arange(token.numel(), device=dev) - cstart[slot_expert] + pstart[slot_expert]
         src = torch.full((m_pad,), T, device=dev, dtype=torch.long).index_copy_(0, dest, token)
         pos = torch.empty_like(dest).index_copy_(0, slot_of_sorted, dest).view(T, k)
         dt = torch.get_autocast_dtype("cuda") if torch.is_autocast_enabled("cuda") else x2d.dtype
@@ -354,16 +368,16 @@ class MoE(nn.Module):
         flat = idx.reshape(-1)
         order = torch.argsort(flat, stable=True)  # (token, choice) slots grouped by expert
         token = order // k
-        counts = torch.bincount(flat, minlength=E)
-        host = counts.tolist()  # one host sync: the expert sizes
-        self.last_counts = host
+        # integer adds commute, so the scatter is deterministic (bincount's output size is data-dependent)
+        counts = torch.zeros(E, device=x.device, dtype=torch.long).scatter_add_(0, flat, torch.ones_like(flat))
+        self._counts = counts
         frac = counts.float() / max(1, T * k)
         self.aux_loss = E * (frac * probs.mean(0)).sum()
         if self.nvfp4 and not ops.high_precision() and x2d.is_cuda:
-            ys, pos = self._experts_grouped(x2d, token, flat.index_select(0, order), order, host)
-        else:
+            ys, pos = self._experts_grouped(x2d, token, flat.index_select(0, order), order, counts)
+        else:  # the BF16 loop splits the sorted rows: one host synchronization for the expert sizes
             pos = torch.empty_like(order).index_copy_(0, order, torch.arange(T * k, device=x.device)).view(T, k)
-            ys = self._experts_loop(_Dispatch.apply(x2d, token, pos), host)
+            ys = self._experts_loop(_Dispatch.apply(x2d, token, pos), counts.tolist())
         # combine: y[t] = sum_j w[t, j] ys[pos[t, j]], a gather and a k-term weighted sum (deterministic; the
         # gather's backward writes every row once)
         g = ys.index_select(0, pos.reshape(-1)).view(T, k, self.d)
