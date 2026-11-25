@@ -10,7 +10,7 @@ works and [RESULTS.md](RESULTS.md) what it measured.
 | GPU | compute capability **12.0** exactly: GeForce RTX 5090 / 5080 / 5070 Ti / 5070 / 5060 Ti / 5060 and their laptop parts. The kernels are built for the arch-specific target `sm_120a`, which runs on no other GPU (not on sm_100 B200, sm_121 GB10, or older GPUs). |
 | OS | Linux, WSL2 or native Windows (Visual Studio 2022 with the C++ workload). |
 | Toolkit | CUDA ≥ 12.8 (TMA descriptor API by version needs ≥ 12.5). Tested: 13.0 on Linux/WSL2, 12.9 on Windows. Driver tested: 595.79. |
-| PyTorch | a CUDA build ≥ 2.7, tested with 2.14.1+cu130 (WSL2) and 2.7.1+cu128 (Windows). The extension must be built against the same PyTorch it runs with. |
+| PyTorch | a CUDA build ≥ 2.7, tested with 2.14.1+cu130 (WSL2), 2.11.0+cu128 (Linux, Windows) and 2.7.1+cu128 (Windows). The extension must be built against the same PyTorch it runs with. |
 
 `nvfp4.available()` returns whether the extension is built and the current GPU is supported. Every op
 also checks its inputs and raises a clear error for CPU tensors or unsupported GPUs.
@@ -150,7 +150,7 @@ grows with the share of attention in the step (long context). Errors are those o
 forward (output ~1–3% relative to exact attention, vs ~0.2% for BF16 flash attention); validate on your
 model.
 
-### 3.4 Mixture of experts (v0.11; grouped GEMMs v0.12; sync-free v0.13; biases v0.14; capacity, shared expert, expert parallelism v0.15)
+### 3.4 Mixture of experts (v0.11; grouped GEMMs v0.12; sync-free v0.13; biases v0.14; capacity, shared expert, expert parallelism v0.15; dropless expert parallelism v0.16)
 
 ```python
 from nvfp4.moe import MoE
@@ -170,15 +170,21 @@ loss = loss + 0.01 * moe.aux_loss             # Switch load-balancing loss (1.0 
   token goes through with weight 1, added to the routed output (DeepSeek-MoE). n shared experts of hidden
   h are one of hidden n h. Parameters `shared_w_*` [1, ., .] and `shared_b_*`, `moe.shared_weights()`.
   It runs in NVFP4 with the experts, through the same grouped kernels.
-- **Expert parallelism** (`ep_group=group`, v0.15): rank r of a W-rank process group holds experts
-  [r E/W, (r+1) E/W); `w_*` / `b_*` have E/W rows, while the router and the shared expert are replicated.
-  - The routed slots go to their expert's rank and back by two fixed-size all-to-alls of [W, E/W, C, d]
-    rows, so a capacity is required. Nothing is read on the host.
+- **Expert parallelism** (`ep_group=group`, v0.15; dropless v0.16): rank r of a W-rank process group
+  holds experts [r E/W, (r+1) E/W); `w_*` / `b_*` have E/W rows, while the router and the shared expert
+  are replicated. The routed slots go to their expert's rank and back by two all-to-alls.
+  - With a capacity the exchanges have a fixed size ([W, E/W, C, d] rows) and nothing is read on the
+    host, so a step stays CUDA-graph capturable.
+  - Dropless (no `capacity_factor`, v0.16) the row counts are exchanged first and read on the host once
+    per forward, and the rows travel in variable-size all-to-alls (as Megatron-LM's dropless
+    dispatcher does). Such a step cannot be captured in a CUDA graph.
+  - The shared expert runs while the expert outputs travel back, and its backward while their gradients
+    go out (v0.16; `moe.ep_overlap = False` runs it after the exchange).
   - The local experts' gradients already sum every rank's tokens: keep the expert parameters out of
     data-parallel gradient averaging over the same ranks (for example DDP's
     `_set_params_and_buffers_to_ignore_for_model`, or a separate group).
-  - Tested for correctness with two processes on one GPU. Speed across GPUs is unmeasured: there is no
-    overlap of the exchange with computation.
+  - Tested with two processes on one GPU (gloo) and over NCCL on two RTX 5090s; speed across GPUs in
+    RESULTS.md §8 (`bench/bench_moe_ep.py`).
 - **Parameters.** Expert weights are stacked: `w_gate`, `w_up` [E, d_ff, d] and `w_down` [E, d, d_ff]
   (SwiGLU), or `w_fc1` [E, d_ff, d] and `w_fc2` [E, d, d_ff] (GELU). With `bias=True` every projection
   has per-expert biases, `b_gate`, `b_up` [E, d_ff] and `b_down` [E, d] (`b_fc1`, `b_fc2`;

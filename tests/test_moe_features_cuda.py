@@ -8,7 +8,7 @@ import pytest
 import torch
 import torch.nn.functional as F
 
-from conftest import requires_sm120
+from conftest import HAS_TRITON, requires_sm120
 from nvfp4 import convert_linears
 from nvfp4.moe import MoE
 
@@ -58,6 +58,8 @@ def _moe(activation="swiglu", E=4, k=2, d=256, d_ff=256, seed=0, **kw):
 @pytest.mark.parametrize("activation", ["swiglu", "gelu_tanh"])
 @pytest.mark.parametrize("cf,shared,bias", [(0.5, 0, False), (1.0, 384, True), (None, 128, False)])
 def test_capacity_and_shared_match_per_token_reference(impl, activation, cf, shared, bias):
+    if impl == "grouped" and not HAS_TRITON:
+        pytest.skip("needs Triton")
     """fp32 experts: the capacity rule (first C slots per expert in token order; dropped slots add nothing)
     and the shared expert (a dense MLP added with weight 1), both high-precision paths."""
     moe = _moe(activation, capacity_factor=cf, shared_d_ff=shared, bias=bias)
@@ -148,7 +150,6 @@ def _ep_pair(world, rank, group, fp4, cf, seed=3):
             q = dict(ref.named_parameters())[n]
             p.copy_(q[rank * El:(rank + 1) * El] if n.startswith(("w_", "b_")) else q)
     for m in (ref, ep):
-        m.bf16_impl = "grouped"
         if fp4:
             convert_linears(m)
     return ref, ep
@@ -187,7 +188,9 @@ def _check_ep(rank, world, group, cf, overlap=True):
     assert ep.last_dropped == dropped and (dropped > 0) == (cf is not None)
     if cf is None:  # skewed routing: the two ranks' experts get different numbers of rows
         c = torch.tensor(ep.last_counts, device=DEV)
-        dist.all_reduce(c, group=group)
+        both = torch.empty(world * c.numel(), device=DEV, dtype=c.dtype)
+        dist.all_to_all_single(both, c.repeat(world), group=group)  # (all_reduce of CUDA tensors crashes
+        c = both.view(world, -1).sum(0)                              # gloo on PyTorch 2.11 Windows)
         assert c[:2].sum() != c[2:].sum()
     torch.testing.assert_close(ye, y_want, rtol=1e-4, atol=1e-5)
     torch.testing.assert_close(xe.grad, dx_want, rtol=1e-4, atol=1e-5)
@@ -285,11 +288,10 @@ def test_expert_parallel_overlap_order(monkeypatch, cf):
                 events.append(_name)
                 return _orig(ctx, *a)
             monkeypatch.setattr(cls, fn, staticmethod(wrapped))
-    store = dist.TCPStore("127.0.0.1", _free_port(), 1, True)
+    store = dist.TCPStore("127.0.0.1", _free_port(), 1, True, use_libuv=False)
     dist.init_process_group("gloo", store=store, rank=0, world_size=1)
     try:
         m = MoE(256, 256, 4, capacity_factor=cf, shared_d_ff=256, ep_group=dist.group.WORLD).to(DEV)
-        m.bf16_impl = "grouped"
         orig_shared = m._shared
 
         def shared(x):

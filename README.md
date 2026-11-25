@@ -73,7 +73,7 @@ Requirements:
 
 - an `sm_120` GPU: RTX 5090 / 5080 / 5070 Ti / 5070 / 5060 Ti / 5060, or the laptop parts;
 - CUDA ≥ 12.8 (tested with 13.0, and 12.9 on Windows);
-- a CUDA build of PyTorch (tested with 2.14.1+cu130 and 2.11 on Linux, 2.7.1+cu128 on Windows);
+- a CUDA build of PyTorch (tested with 2.14.1+cu130 and 2.11 on Linux, 2.11.0+cu128 and 2.7.1+cu128 on Windows);
 - Python ≥ 3.10.
 
 ```bash
@@ -242,7 +242,7 @@ nvfp4/fused.py          fused transformer sub-blocks (autograd functions)
 nvfp4/attention.py      attention() with both backwards and the SDPA fallback
 nvfp4/moe.py            MoE layer: routing, deterministic dispatch / combine, grouped NVFP4 expert MLPs
 nvfp4/_bf16_grouped.py  grouped BF16 GEMMs (Triton) for the MoE layer's high-precision path
-tests/                  989 tests: bit-exact vs spec, autograd, compile / graphs, DDP / FSDP, MoE, attention
+tests/                  999 tests: bit-exact vs spec, autograd, compile / graphs, DDP / FSDP, MoE, attention
 bench/, experiments/    benchmarks and pretraining runs, each with results/ (raw JSON / JSONL)
 tools/                  build, check, guard, sanitize, soak, WSL setup, Runpod session script
 docs/                   USAGE.md, DESIGN.md, RESULTS.md, research/ (survey of open problems, Nov 2026)
@@ -258,9 +258,10 @@ The full list is in [DESIGN.md §6](docs/DESIGN.md#6-known-limitations-and-next-
   BF16 speed, and P·V needs two e4m3 terms. Coverage is causal or full masks and head dims 64 / 128;
   everything else falls back to SDPA.
 - **MoE coverage.** Top-k routing, dropless or with a capacity; SwiGLU / GELU experts with or without
-  biases; a shared expert; expert parallelism. Expert parallelism is tested for correctness on one GPU
-  (two processes), not for speed across GPUs, and needs a capacity. Without Triton (PyTorch's native
-  Windows wheels) the BF16 experts run as a loop that reads the expert sizes on the host.
+  biases; a shared expert; expert parallelism, dropless or with a capacity. On two PCIe RTX 5090s expert
+  parallelism is slower per step than data parallelism (the exchanges are not hidden, except behind the
+  shared expert); it saves memory (RESULTS.md §8.1). Without Triton (PyTorch's native Windows wheels)
+  the BF16 experts run as a loop that reads the expert sizes on the host.
 - **Stochastic rounding is software** (no `cvt.rs` on sm_120a), at about 12 extra instructions per
   element.
 - **Hardware coverage.** Tested on the RTX 5090 Laptop and the desktop RTX 5090 (two over NCCL), not yet

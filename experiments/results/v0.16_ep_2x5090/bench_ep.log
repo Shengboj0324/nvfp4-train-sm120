@@ -1,0 +1,13 @@
+W1125 21:46:44.456000 5698 torch/distributed/run.py:851] 
+W1125 21:46:44.456000 5698 torch/distributed/run.py:851] *****************************************
+W1125 21:46:44.456000 5698 torch/distributed/run.py:851] Setting OMP_NUM_THREADS environment variable for each process to be 1 in default, to avoid your system being overloaded, please further tune the variable for optimal performance in your application as needed. 
+W1125 21:46:44.456000 5698 torch/distributed/run.py:851] *****************************************
+/workspace/venv/lib/python3.10/site-packages/torch/autograd/graph.py:869: UserWarning: Attempting to run cuBLAS, but there was no current CUDA context! Attempting to set the primary context... (Triggered internally at /pytorch/aten/src/ATen/cuda/CublasHandlePool.cpp:335.)
+  return Variable._execution_engine.run_backward(  # Calls into the C++ engine to run the backward pass
+d=1024 d_ff=2816 E=8 k=2 T=16384 shared=0 bf16  local 12.86 ms  ep cap 1.25 30.26 ms  ep dropless 25.73 ms
+d=1024 d_ff=2816 E=8 k=2 T=16384 shared=0 nvfp4 local 7.35 ms  ep cap 1.25 19.20 ms  ep dropless 15.76 ms
+  a2a of 80 MiB: 2.63 ms (14.9 GiB/s sent per GPU); all-reduce of 132 MiB expert gradients: 5.60 ms
+d=2048 d_ff=1408 E=32 k=4 T=16384 shared=2816 bf16  local 39.07 ms  ep cap 1.25 96.81 ms  ep cap serial 104.89 ms  ep dropless 81.19 ms
+d=2048 d_ff=1408 E=32 k=4 T=16384 shared=2816 nvfp4 local 21.76 ms  ep cap 1.25 64.99 ms  ep cap serial 66.14 ms  ep dropless 52.84 ms
+  a2a of 320 MiB: 10.12 ms (15.4 GiB/s sent per GPU); all-reduce of 528 MiB expert gradients: 23.94 ms
+[guard] elapsed 52s | peak GPU temp 49C, power 389W, GPU mem 14606MB | min host mem avail 842631MB | cooldown 0s

@@ -657,16 +657,26 @@ The MoE layer around it (`nvfp4/moe.py`):
     small integer all-to-all. The receiving rank plans its E / W experts over the W C rows per expert,
     marking unused rows −1. It runs them like any other layout, and the outputs return by the reverse
     all-to-all (a differentiable wrapper: its backward is the reverse exchange).
-  - The fixed sizes are why expert parallelism needs a capacity: dropless expert parallelism must
-    exchange counts and size its buffers on the host (the dropless paths of Megatron and DeepSpeed
-    synchronize).
+  - **Dropless expert parallelism (v0.16)**: without a capacity a rank may receive up to W T k rows, so
+    a worst-case buffer would cost W times the memory. Instead the counts go first (an integer
+    all-to-all) and are read on the host once per forward, and the rows, sorted by expert and so by
+    destination rank, travel in variable-size all-to-alls; the receiver plans its E / W experts over
+    exactly the rows it got. This is what the dropless dispatchers of Megatron-LM and DeepSpeed do, and
+    like them it cannot be captured in a CUDA graph.
   - What we gain: the layer reads nothing on the host; with NCCL a step stays capturable. With fp32
     experts the result equals the single-process layer on each rank's tokens, and the local experts'
     gradients equal the sum over every rank's tokens (tested with two processes over gloo on one GPU).
     With NVFP4 experts the activation's tensor scale spans every source rank's rows, so the numerics are
     equivalent, not bitwise.
-  - Not done: overlapping the exchange with computation, and hierarchical (intra- / inter-node)
-    all-to-alls; they need multi-GPU hardware to tune.
+  - **Overlap (v0.16)**: an exchange is two autograd functions, one that starts the all-to-all
+    (`async_op`) and one that waits for it. Whatever runs between them overlaps with the transfer in the
+    forward. In the backward the waiting function's backward starts the reverse exchange and the starting
+    function's backward waits for it; autograd runs ready nodes with the highest sequence number first,
+    so the nodes created between the two in the forward run, in reverse, while the gradients travel.
+    The layer puts the shared expert there, during the return of the expert outputs (a test checks the
+    call order). Without a shared expert there is nothing independent to overlap at this level; splitting
+    the tokens into chunks to pipeline the exchange against the experts is not done.
+  - Not done: hierarchical (intra- / inter-node) all-to-alls; they need a multi-node machine.
 
 ## 5. Verification
 
@@ -696,6 +706,9 @@ Every benchmark checks correctness against the reference before it times anythin
 
 ## 6. Known limitations and next steps
 
+Done in v0.16: dropless expert parallelism, the shared expert overlapped with the expert parallel
+exchange, expert parallelism measured over NCCL on two RTX 5090s, and native Windows tests on PyTorch 2.11
+(§4.5, items 5 and 7).
 Done in v0.15: capacity-limited routing, a shared expert and expert parallelism in the MoE layer
 (§4.5, item 5).
 Done in v0.14: per-expert biases in the MoE layer (added in the grouped GEMM's store; §4.5) and
@@ -762,9 +775,9 @@ accumulation.
    norm-free MLPs) post-norm, with biases anywhere. Mixture-of-experts MLPs (`nvfp4.moe.MoE`, dropless
    top-k; v0.11, grouped GEMMs since v0.12, sync-free since v0.13, biases and a sync-free BF16 path since
    v0.14, capacity, shared expert and expert parallelism since v0.15, §4.5) cover SwiGLU and GELU experts.
-   Expert parallelism is verified for correctness on one GPU (two gloo processes), not for speed: the
-   all-to-all is not overlapped with computation, and dropless expert parallelism is not offered (it
-   needs host-side buffer sizes).
+   Expert parallelism, with a capacity or dropless (v0.16), is verified on one GPU (two gloo processes)
+   and over NCCL on two RTX 5090s (RESULTS.md §8). Only the shared expert overlaps with the exchange;
+   the routed experts wait for their rows.
 6. **Framework coverage.** DDP, FSDP1 and FSDP2 are tested with two ranks on one GPU over gloo and
    (v0.8) with NCCL across two physical RTX 5090s, bit-identical to a single process. Data-parallel
    *speed* depends on the host: on the rented two-GPU machine all-reduce ran at 2 GB/s (no P2P), so DDP
@@ -778,7 +791,12 @@ accumulation.
    and five RTX 5080 hosts whose containers never started; a second one later that day found none of the
    four available on Runpod's Secure or Community cloud). The attention kernels need nothing
    SM-count specific: two forward CTAs per SM fit the 100 KB of shared memory every sm_120 SM has. On
-   Windows, inductor needs Triton, which PyTorch's Windows wheels don't include.
+   Windows, inductor needs Triton, which PyTorch's Windows wheels don't include. v0.16 reran the suite
+   natively on Windows with PyTorch 2.11.0+cu128 and CUDA 12.9 (919 passed). That wheel has no flash
+   attention: the 8-bit attention's BF16 backward then runs the same math in fp32, a block of query rows
+   at a time (tested against the flash backward on Linux). Its gloo crashes on all_reduce of CUDA
+   tensors (an access violation, even with one rank; all_to_all works), so DDP / FSDP over gloo on
+   Windows with that PyTorch is unusable and those tests skip (they passed with 2.7.1).
 
 ## 7. 8-bit attention (`csrc/attention.cu`, `nvfp4/attention.py`, v0.9)
 

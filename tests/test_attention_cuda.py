@@ -263,3 +263,30 @@ def test_scale_and_no_grad():
     with torch.no_grad():
         o = attention(q, k, v, scale=0.5 / math.sqrt(128))
     assert _rel(o, _exact(q, k, v, False, 0.5 / math.sqrt(128))) < 0.05
+
+
+@pytest.mark.parametrize("B,H,Hk,N,D,causal", CASES)
+def test_math_backward_matches_flash_backward(B, H, Hk, N, D, causal, monkeypatch):
+    """PyTorch builds without flash attention (its Windows wheels) get the backward's math in fp32, block by
+    block of query rows: the same gradients as the flash backward, to its bf16 level."""
+    import sys
+    attn_mod = sys.modules["nvfp4.attention"]  # (nvfp4.attention, the attribute, is the function)
+    q, k, v = _qkv(B, H, Hk, N, D)
+    torch.manual_seed(1)
+    do = torch.randn_like(q)
+    grads = []
+    for flash in (None, False):
+        monkeypatch.setattr(attn_mod, "_FLASH_BWD", flash)
+        if flash is False:  # smaller row blocks, so that several blocks and the causal edges are exercised
+            monkeypatch.setattr(attn_mod, "_math_backward",
+                                lambda *a, _f=attn_mod._math_backward: _f(*a, rows=64))
+        ts = [t.detach().clone().requires_grad_() for t in (q, k, v)]
+        attention(*ts, causal=causal, backward="bf16").backward(do)
+        grads.append([t.grad for t in ts])
+    if torch.backends.cuda.is_flash_attention_available():
+        for name, a, b in zip("qkv", *grads):
+            assert a.dtype == b.dtype and a.shape == b.shape and b.isfinite().all()
+            if a.float().norm() < 0.01 * do.float().norm():  # N == 1: zero analytically for q and k
+                assert b.float().norm() < 0.01 * do.float().norm(), name
+            else:
+                assert _rel(b, a) < 0.01, name

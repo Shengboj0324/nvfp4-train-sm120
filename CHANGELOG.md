@@ -1,5 +1,26 @@
 # Changelog
 
+## 0.16.0 — MoE: dropless expert parallelism, overlapped exchange, measured on two GPUs; native Windows rerun (2026-11-25)
+
+- **Dropless expert parallelism** (`MoE(..., ep_group=g)` without `capacity_factor`): the row counts go
+  first (an integer all-to-all) and are read on the host once per forward; the rows, sorted by expert,
+  travel in variable-size all-to-alls (as Megatron-LM's dropless dispatcher). Not CUDA-graph capturable;
+  the capacity variant still is.
+- **Overlap:** an exchange is now a start and a wait (async all-to-all). The shared expert runs during
+  the return of the expert outputs, and autograd's ordering runs its backward during the reverse
+  exchange (a test checks the call order). `moe.ep_overlap = False` runs it after.
+- **Measured on 2× RTX 5090 (PCIe, NCCL)**, `bench/bench_moe_ep.py`, RESULTS.md §8.1: the MoE tests pass
+  across the two GPUs. The exchange runs at about 15 GiB/s per GPU and is not hidden: expert parallelism is
+  2.0–3.0× the local step and slower than data parallelism with an expert-gradient all-reduce. Dropless
+  beats capacity 1.25 by 15–19%; the overlap saves 8% (BF16) / 2% (NVFP4). Its gain on such machines is
+  memory.
+- **Native Windows** (PyTorch 2.11.0+cu128, CUDA 12.9): 919 passed, 80 skipped.
+  - That wheel has no flash attention, so the 8-bit attention's default BF16 backward falls back to the
+    same math in fp32, query block by block (`_math_backward`, tested against flash on Linux).
+  - Its gloo crashes on all_reduce of CUDA tensors, so the multi-process DDP / FSDP tests skip there
+    (probed once per session); tests that need Triton skip on Windows.
+- `tools/pod_session.sh`: `BRANCH`, and an `ep` phase (MoE tests, expert-parallel and MoE benchmarks).
+
 ## 0.15.0 — MoE: capacity-limited routing, a shared expert, expert parallelism (2026-11-25)
 
 - **Capacity** (`MoE(..., capacity_factor=1.25)`): each expert keeps the first C = ⌈cf·T k / E⌉ of its

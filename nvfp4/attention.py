@@ -73,6 +73,31 @@ class _AttentionFn(torch.autograd.Function):
 
 
 _LN2 = 0.6931471805599453
+_FLASH_BWD: bool | None = None  # PyTorch's flash-attention backward is available (None: not tried yet)
+
+
+def _math_backward(do, q, k, v, o, lse, causal: bool, scale: float, rows: int = 512):
+    """The flash-attention backward's math, for PyTorch builds without flash attention: in fp32, one block of
+    query rows at a time (scores [B, H, rows, N]), P recomputed from the forward's natural-log lse.
+    dV = P^T dO, dS = P (dO V^T - rowsum(dO O)), dQ = scale dS K, dK = scale dS^T Q (deterministic)."""
+    B, H, N, D = q.shape
+    qf, kf, vf = q.float(), k.float(), v.float()
+    delta = (do.float() * o.float()).sum(-1)
+    dq = torch.empty_like(qf)
+    dk, dv = torch.zeros_like(kf), torch.zeros_like(vf)
+    cols = torch.arange(N, device=q.device)
+    for r0 in range(0, N, rows):
+        r1 = min(N, r0 + rows)
+        s = torch.matmul(qf[:, :, r0:r1], kf.transpose(-1, -2)) * scale
+        if causal:
+            s.masked_fill_(cols[None, :] > torch.arange(r0, r1, device=q.device)[:, None], float("-inf"))
+        p = torch.exp(s - lse[:, :, r0:r1, None])
+        g = do[:, :, r0:r1].float()
+        dv += torch.matmul(p.transpose(-1, -2), g)
+        ds = p * (torch.matmul(g, vf.transpose(-1, -2)) - delta[:, :, r0:r1, None])
+        dq[:, :, r0:r1] = torch.matmul(ds, kf) * scale
+        dk += torch.matmul(ds.transpose(-1, -2), qf[:, :, r0:r1]) * scale
+    return dq.to(q.dtype), dk.to(k.dtype), dv.to(v.dtype)
 
 
 class _AttentionBf16BwdFn(torch.autograd.Function):
@@ -100,14 +125,26 @@ class _AttentionBf16BwdFn(torch.autograd.Function):
 
     @staticmethod
     def backward(ctx, do):
+        global _FLASH_BWD
         qd, kd, vd, o, lse = ctx.saved_tensors
         causal, scale = ctx.cfg
         rep = qd.shape[1] // kd.shape[1]
         ke, ve = (kd.repeat_interleave(rep, 1), vd.repeat_interleave(rep, 1)) if rep > 1 else (kd, vd)
-        zero = torch.zeros((), dtype=torch.uint64, device=qd.device)
-        dq, dk, dv = torch.ops.aten._scaled_dot_product_flash_attention_backward(
-            do.to(qd.dtype), qd, ke, ve, o, lse, None, None, qd.shape[2], kd.shape[2], 0.0, causal,
-            torch.zeros(2, dtype=torch.uint64, device=qd.device), zero, scale=scale)
+        do = do.to(qd.dtype)
+        dq = None
+        if _FLASH_BWD is not False:
+            zero = torch.zeros((), dtype=torch.uint64, device=qd.device)
+            try:
+                dq, dk, dv = torch.ops.aten._scaled_dot_product_flash_attention_backward(
+                    do, qd, ke, ve, o, lse, None, None, qd.shape[2], kd.shape[2], 0.0, causal,
+                    torch.zeros(2, dtype=torch.uint64, device=qd.device), zero, scale=scale)
+                _FLASH_BWD = True
+            except RuntimeError as e:  # PyTorch built without flash attention (its Windows wheels)
+                if _FLASH_BWD or "FLASH" not in str(e).upper():
+                    raise
+                _FLASH_BWD = False
+        if dq is None:
+            dq, dk, dv = _math_backward(do, qd, ke, ve, o, lse, causal, scale)
         if rep > 1:
             B, Hk, N, D = kd.shape
             dk = dk.view(B, Hk, rep, N, D).sum(2)
@@ -124,7 +161,8 @@ def attention(q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, *, causal: bool
 
     backward="bf16" (default): the exact gradient of the 8-bit forward, from PyTorch's flash-attention backward
     in the input precision (as fast as BF16 attention's backward; not bitwise deterministic unless
-    torch.use_deterministic_algorithms is on). backward="8bit": this package's 8-bit backward (deterministic,
+    torch.use_deterministic_algorithms is on; PyTorch builds without flash attention, such as its Windows wheels,
+    get the same math in fp32, a block of query rows at a time). backward="8bit": this package's 8-bit backward (deterministic,
     2-4x larger dK / dV errors) with a slightly faster forward (P V in one e4m3 term)."""
     if backward not in ("bf16", "8bit"):
         raise ValueError(f"backward must be 'bf16' or '8bit', got {backward!r}")

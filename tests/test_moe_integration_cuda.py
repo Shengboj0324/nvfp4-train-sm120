@@ -33,6 +33,9 @@ def _moe(variant="swiglu", fuse=False, E=4, k=2, d=256, d_ff=256, seed=0):
     m = MoE(d, d_ff, E, top_k=k, activation=act, bias="bias" in opts, capacity_factor=1.0 if "cap" in opts else None,
             shared_d_ff=256 if "shared" in opts else 0).to(DEV)
     if "bf16" in opts:
+        from conftest import HAS_TRITON
+        if not HAS_TRITON:  # the sync-free BF16 experts are Triton kernels
+            pytest.skip("needs Triton")
         m.bf16_impl = "grouped"
     else:
         convert_linears(m, fuse_wgrad_accumulation=fuse)
@@ -314,6 +317,9 @@ def test_two_process_data_parallel(mode, variant):
     from test_integration_cuda import _free_port
     if not dist.is_available() or not dist.is_gloo_available():
         pytest.skip("gloo not available")
+    from conftest import gloo_cuda_reductions_ok
+    if not gloo_cuda_reductions_ok():
+        pytest.skip("gloo all_reduce of CUDA tensors crashes in this PyTorch build")
     os.environ.setdefault("OMP_NUM_THREADS", "2")
     mp.spawn(_moe_dist_worker, args=(2, _free_port(), mode, variant), nprocs=2, join=True)
 

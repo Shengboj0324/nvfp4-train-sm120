@@ -10,7 +10,7 @@ import pytest
 import torch
 import torch.nn.functional as F
 
-from conftest import requires_sm120
+from conftest import HAS_TRITON, requires_sm120, requires_triton
 from nvfp4 import convert_linears, ops
 from nvfp4 import moe as moe_mod
 from nvfp4.moe import MoE
@@ -40,6 +40,8 @@ def _expert(moe, e, x):
 @pytest.mark.parametrize("k", [1, 2])
 @pytest.mark.parametrize("impl,bias", [("loop", False), ("grouped", False), ("grouped", True), ("loop", True)])
 def test_routing_matches_per_token_loop(activation, k, impl, bias):
+    if impl == "grouped" and not HAS_TRITON:
+        pytest.skip("needs Triton")
     """fp32 experts (the grouped path: Triton with IEEE fp32 products)."""
     moe = _moe(activation, k=k, bias=bias)
     moe.bf16_impl = impl
@@ -190,6 +192,7 @@ def test_validation():
         m(torch.randn(8, 256, device="cuda"))
 
 
+@requires_triton
 @pytest.mark.parametrize("activation", ["swiglu", "gelu_tanh"])
 @pytest.mark.parametrize("bias", [False, True])
 def test_bf16_grouped_matches_loop(activation, bias):

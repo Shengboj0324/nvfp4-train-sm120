@@ -530,6 +530,9 @@ def test_two_process_data_parallel(mode):
     import torch.multiprocessing as mp
     if not dist.is_available() or not dist.is_gloo_available():
         pytest.skip("gloo not available")
+    from conftest import gloo_cuda_reductions_ok
+    if not gloo_cuda_reductions_ok():
+        pytest.skip("gloo all_reduce of CUDA tensors crashes in this PyTorch build")
     os.environ.setdefault("OMP_NUM_THREADS", "2")  # inherited by the spawned ranks
     mp.spawn(_dist_worker, args=(2, _free_port(), mode), nprocs=2, join=True)
 

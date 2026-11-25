@@ -510,7 +510,7 @@ on the activations of a model trained at 4096 tokens (`bench/attention_real_erro
 [0.7–2.3%], dQ 0.4–2.0% [0.3–0.6%; v0.9.0: 0.4–24%], dK 1.2–6.9% [2.8–7.1%], dV 0.2–2.1% [2.5–3.1%].
 GPT-124M (attention a small share of the step) trains at the same speed with either.
 
-## 8. Mixture of experts (v0.11–v0.14, `bench/results/moe.json`, `experiments/results/v0.12_moe/`, `…/v0.13_moe/`, `…/v0.14_moe/`)
+## 8. Mixture of experts (v0.11–v0.16, `bench/results/moe.json`, `experiments/results/v0.12_moe/`, `…/v0.13_moe/`, `…/v0.14_moe/`, `…/v0.16_ep_2x5090/`)
 
 `nvfp4.moe.MoE` layer, one training step (forward + backward, autocast BF16, 16,384 tokens), BF16 experts
 vs the same experts converted to NVFP4 (`bench/bench_moe.py`). v0.11 ran each expert's fused MLP in turn;
@@ -600,7 +600,48 @@ another order), against a BF16 run at 1.4830.
   spread. One seed cannot tell whether the early drops cost anything. The gap (+0.96%) is in the dropless
   range. The dropless layer's worst-case buffer was not a
   speed problem here, so the capacity buys nothing at this scale. Its uses are bounding memory and
-  expert parallelism, which needs it.
+  a CUDA-graph-capturable expert parallelism (dropless expert parallelism reads the counts on the host).
+
+### 8.1 Expert parallelism on two desktop RTX 5090s (v0.16, `experiments/results/v0.16_ep_2x5090/`)
+
+A rented Community-Cloud machine (2026-11-25): 2× GeForce RTX 5090, PCIe 5.0 x16 each, on different NUMA
+nodes (`nvidia-smi topo`: SYS, no NVLink), PyTorch 2.11.0+cu128, CUDA 12.8, NCCL. The MoE tests passed there
+(65), including expert parallelism over NCCL across the two GPUs (capacity and dropless; fp32 outputs
+and gradients equal to the single-process layer, NVFP4 by cosine).
+
+`bench/bench_moe_ep.py`: one training step (forward + backward, autocast BF16) of a layer on each GPU with
+16,384 tokens per GPU. *local*: every GPU holds all experts and runs its own tokens (no communication).
+*EP*: each GPU holds half the experts, and the routed rows go to their expert's GPU and back. *DP* is
+local plus an all-reduce of the expert gradients in bf16, what data parallelism would add (measured
+separately). Milliseconds per step:
+
+| layer | experts | local | EP, capacity 1.25 | EP, capacity, shared expert after the exchange | EP, dropless | DP (local + all-reduce) |
+|---|---|---|---|---|---|---|
+| d 1024, d_ff 2816, 8 experts, top-2 | BF16 (grouped) | 12.86 | 30.26 | – | 25.73 | 18.46 |
+| | NVFP4 | 7.35 | 19.20 | – | 15.76 | 12.95 |
+| d 2048, d_ff 1408, 32 experts, top-4, shared 2816 | BF16 (grouped) | 39.07 | 96.81 | 104.89 | 81.19 | 63.01 |
+| | NVFP4 | 21.76 | 64.99 | 66.14 | 52.84 | 45.70 |
+
+- **The exchange dominates.** An all-to-all moved 14.9–15.4 GiB/s per GPU (80 MiB in 2.63 ms, 320 MiB in
+  10.1 ms). A step makes four exchanges (rows out and back, their gradients back and out). The dropless
+  NVFP4 step of the first layer is 7.35 ms of compute plus 4 × 32 MiB at 15 GiB/s ≈ 8.4 ms, which is
+  the 15.76 ms measured: no exchange is hidden except where the shared expert runs.
+- **Overlap:** running the shared expert during the return exchange (and its backward during the
+  gradients' exchange) saves 8% of the BF16 step and 2% of the NVFP4 step. The NVFP4 shared expert is
+  short next to a 10 ms exchange.
+- **Dropless beats capacity 1.25** by 15–19%: the capacity layout sends E·C rows, 1.25× the routed rows,
+  padded slots included, while dropless sends exactly the routed rows. It costs one host read per forward.
+- **Data parallelism is faster on this machine** (all-reduce at about 24 GB/s bus bandwidth): the
+  expert gradients are smaller than four exchanges of 16k tokens. Expert parallelism's gain here is
+  memory: each GPU holds half the experts (for the second layer, 138M expert parameters fewer per GPU,
+  about 2.2 GB with fp32 weights, gradients and Adam states). With NVLink or larger expert counts the balance shifts. Fewer tokens per step
+  shrink the exchanges, not the gradients.
+- **NVFP4 makes the exchange a larger share** (the experts are 1.8× faster): sending the rows in NVFP4
+  (4.5 bits instead of 16) would cut the traffic about 3.5×; not done (the experts' column quantization
+  for the weight gradient needs the bf16 rows, so the receiver would need both).
+
+The same machine's single-GPU MoE benchmark (`moe.json`): NVFP4 is 1.47–2.36× the grouped BF16 experts
+and 1.84–3.79× the BF16 loop (the laptop: 1.54–2.55× and 1.64–2.65×; the desktop GPU gains more over the BF16 loop).
 
 ## Reproduce
 
