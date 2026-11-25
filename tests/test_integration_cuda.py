@@ -353,16 +353,21 @@ def _check_ddp(rank, world, bucket_view):
 def _gather_dim0(shard):
     """Concatenate the ranks' dim-0 shards. (DTensor.full_tensor() over gloo with CUDA tensors crashes
     in PyTorch 2.14 even for plain nn.Linear, so gloo gathers through CPU tensors; NCCL gathers on
-    the GPU.)"""
+    the GPU.) Shards may be uneven (FSDP2 gives a dim 0 smaller than the world size empty shards): each is
+    padded to the largest and trimmed after the gather."""
     import torch.distributed as dist
     shard = shard.contiguous()
-    if dist.get_backend() == "nccl":
-        parts = [torch.empty_like(shard) for _ in range(dist.get_world_size())]
-        dist.all_gather(parts, shard)
-        return torch.cat(parts)
-    parts = [torch.empty_like(shard, device="cpu") for _ in range(dist.get_world_size())]
-    dist.all_gather(parts, shard.cpu())
-    return torch.cat(parts).to(shard.device)
+    world = dist.get_world_size()
+    dev = shard.device if dist.get_backend() == "nccl" else "cpu"
+    n = torch.tensor([shard.shape[0]], device=dev)
+    sizes = [torch.empty_like(n) for _ in range(world)]
+    dist.all_gather(sizes, n)
+    sizes = [int(s) for s in sizes]
+    padded = shard.new_zeros((max(sizes), *shard.shape[1:]), device=dev)
+    padded[:shard.shape[0]] = shard.to(dev)
+    parts = [torch.empty_like(padded) for _ in range(world)]
+    dist.all_gather(parts, padded)
+    return torch.cat([p[:s] for p, s in zip(parts, sizes)]).to(shard.device)
 
 
 def _fsdp2_reduction_scale(mesh, world):

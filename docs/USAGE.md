@@ -150,7 +150,7 @@ grows with the share of attention in the step (long context). Errors are those o
 forward (output ~1–3% relative to exact attention, vs ~0.2% for BF16 flash attention); validate on your
 model.
 
-### 3.4 Mixture of experts (v0.11; grouped GEMMs since v0.12; sync-free since v0.13; biases since v0.14)
+### 3.4 Mixture of experts (v0.11; grouped GEMMs v0.12; sync-free v0.13; biases v0.14; capacity, shared expert, expert parallelism v0.15)
 
 ```python
 from nvfp4.moe import MoE
@@ -160,7 +160,25 @@ y = moe(x)                                    # x [..., d]
 loss = loss + 0.01 * moe.aux_loss             # Switch load-balancing loss (1.0 when balanced)
 ```
 
-- **Routing.** Dropless top-k (softmax in fp32, weights renormalized over the k choices).
+- **Routing.** Top-k (softmax in fp32, weights renormalized over the k choices), dropless by default.
+- **Capacity** (`capacity_factor=1.25`, v0.15): each expert takes at most C = ⌈cf·T k / E⌉ of a forward's
+  T k slots, the first in token order (Switch Transformer). A dropped slot adds nothing to its token's
+  output (the residual carries the token); the kept weights are not renormalized. `moe.capacity(T)` gives
+  C. `moe.last_dropped` gives the number dropped (it synchronizes). `aux_loss` and `last_counts` count
+  routed slots, before dropping.
+- **Shared expert** (`shared_d_ff=2816`, v0.15): a dense MLP with the experts' activation, which every
+  token goes through with weight 1, added to the routed output (DeepSeek-MoE). n shared experts of hidden
+  h are one of hidden n h. Parameters `shared_w_*` [1, ., .] and `shared_b_*`, `moe.shared_weights()`.
+  It runs in NVFP4 with the experts, through the same grouped kernels.
+- **Expert parallelism** (`ep_group=group`, v0.15): rank r of a W-rank process group holds experts
+  [r E/W, (r+1) E/W); `w_*` / `b_*` have E/W rows, while the router and the shared expert are replicated.
+  - The routed slots go to their expert's rank and back by two fixed-size all-to-alls of [W, E/W, C, d]
+    rows, so a capacity is required. Nothing is read on the host.
+  - The local experts' gradients already sum every rank's tokens: keep the expert parameters out of
+    data-parallel gradient averaging over the same ranks (for example DDP's
+    `_set_params_and_buffers_to_ignore_for_model`, or a separate group).
+  - Tested for correctness with two processes on one GPU. Speed across GPUs is unmeasured: there is no
+    overlap of the exchange with computation.
 - **Parameters.** Expert weights are stacked: `w_gate`, `w_up` [E, d_ff, d] and `w_down` [E, d, d_ff]
   (SwiGLU), or `w_fc1` [E, d_ff, d] and `w_fc2` [E, d, d_ff] (GELU). With `bias=True` every projection
   has per-expert biases, `b_gate`, `b_up` [E, d_ff] and `b_down` [E, d] (`b_fc1`, `b_fc2`;

@@ -525,8 +525,9 @@ graphs:
 | 2048 | 5632 | 8 | 2 | SwiGLU | 110.7 | 108.4 (108.7) | 42.8 (41.7) | **2.59×** | 2.54× (2.60×) | 2.15× |
 | 2048 | 1408 | 32 | 4 | SwiGLU | 77.3 | 72.1 (71.9) | 34.9 (32.4) | **2.21×** | 2.07× (2.22×) | 1.25× |
 | 768 | 1536 | 8 | 2 | GELU (tanh) | 10.9 | 10.1 (10.2) | 6.9 (6.3) | **1.58×** | 1.47× (1.61×) | 1.27× |
+| 2048 | 1408 | 32 + shared 2816 | 4, capacity 1.25 | SwiGLU | 108.6 | 99.7 (97.3) | 45.8 (43.0) | **2.37×** | 2.18× (2.26×) | |
 
-(ms; v0.14 numbers. v0.13 measured 14.7 / 42.4 / 36.5 / 6.3 ms NVFP4 eager and 14.2 / 41.8 / 32.3 / 5.9
+(ms; v0.14 numbers; the last row, a DeepSeek-style layer with a shared expert and a capacity, v0.15. v0.13 measured 14.7 / 42.4 / 36.5 / 6.3 ms NVFP4 eager and 14.2 / 41.8 / 32.3 / 5.9
 captured. The last row is the most sensitive to the laptop's clocks: it runs after the others, and run
 alone it measures 6.33–6.42 ms eager, 5.88–5.90 captured, as in v0.13. The worst-case buffer of the
 sync-free layer costs nothing measurable: the unused tail tiles are zero stores. A captured step saves
@@ -585,6 +586,21 @@ another order), against a BF16 run at 1.4830.
   **+1.12%**, close to the dense model's +1.32% ± 0.16. End to end, NVFP4 is +23% tokens/s against the
   grouped BF16 baseline (v0.12, both with the loop in their BF16 parts: +25%; dense: +32%): routing, the
   gathers and the combine run at the same speed in both precisions.
+- **v0.15: capacity factor 1.25** (`--moe-capacity 1.25`, seed 0, `experiments/results/v0.15_moe/`). The same
+  model, each expert limited to 1.25× its balanced share of slots per micro-batch:
+
+  | run | val loss | dropped slots (step 25 → mean over training) | tokens/s |
+  |---|---|---|---|
+  | BF16 | 1.4923 | 12.0% → 0.33% | 50.8k |
+  | NVFP4 | 1.5066 (+0.96%) | 11.4% → 0.31% | 62.3k (+23%) |
+
+  Drops happen while the router is still unbalanced: by mid-training the load-balancing loss has evened
+  out the load and almost nothing is dropped. Both losses sit slightly above the dropless runs (BF16
+  1.4831 ± 0.0049, +0.6%; NVFP4 1.4997 ± 0.0026, +0.5%), within about two standard deviations of their
+  spread. One seed cannot tell whether the early drops cost anything. The gap (+0.96%) is in the dropless
+  range. The dropless layer's worst-case buffer was not a
+  speed problem here, so the capacity buys nothing at this scale. Its uses are bounding memory and
+  expert parallelism, which needs it.
 
 ## Reproduce
 

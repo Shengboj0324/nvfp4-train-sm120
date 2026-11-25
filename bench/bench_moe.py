@@ -20,11 +20,12 @@ from bench_gemm import timeit  # noqa: E402
 from nvfp4 import convert_linears  # noqa: E402
 from nvfp4.moe import MoE  # noqa: E402
 
-CONFIGS = [  # d, d_ff, experts, top_k, activation, tokens
-    (1024, 2816, 8, 2, "swiglu", 16384),
-    (2048, 5632, 8, 2, "swiglu", 16384),
-    (2048, 1408, 32, 4, "swiglu", 16384),
-    (768, 1536, 8, 2, "gelu_tanh", 16384),
+CONFIGS = [  # d, d_ff, experts, top_k, activation, tokens, extra MoE options
+    (1024, 2816, 8, 2, "swiglu", 16384, {}),
+    (2048, 5632, 8, 2, "swiglu", 16384, {}),
+    (2048, 1408, 32, 4, "swiglu", 16384, {}),
+    (768, 1536, 8, 2, "gelu_tanh", 16384, {}),
+    (2048, 1408, 32, 4, "swiglu", 16384, {"capacity_factor": 1.25, "shared_d_ff": 2816}),  # DeepSeek-style
 ]
 
 
@@ -68,9 +69,9 @@ def main():
     ap.add_argument("--out", default="bench/results/moe.json")
     a = ap.parse_args()
     rows = []
-    for d, d_ff, E, k, act, T in CONFIGS:
+    for d, d_ff, E, k, act, T, opt in CONFIGS:
         torch.manual_seed(0)
-        bf16 = MoE(d, d_ff, E, top_k=k, activation=act).cuda()
+        bf16 = MoE(d, d_ff, E, top_k=k, activation=act, **opt).cuda()
         bf16.bf16_impl = "loop"
         grouped = copy.deepcopy(bf16)
         grouped.bf16_impl = "grouped"
@@ -79,7 +80,7 @@ def main():
         x = torch.randn(T, d, device="cuda", requires_grad=True)
         tb, tbg, tbgg = step_ms(bf16, x), step_ms(grouped, x), graph_step_ms(grouped, x)
         tf, tg = step_ms(fp4, x), graph_step_ms(fp4, x)
-        r = {"d": d, "d_ff": d_ff, "experts": E, "top_k": k, "activation": act, "tokens": T,
+        r = {"d": d, "d_ff": d_ff, "experts": E, "top_k": k, "activation": act, "tokens": T, **opt,
              "bf16_ms": tb, "bf16_grouped_ms": tbg, "bf16_grouped_graph_ms": tbgg,
              "nvfp4_ms": tf, "nvfp4_graph_ms": tg, "speedup": tb / tf, "speedup_graph": tb / tg,
              "speedup_vs_grouped": tbg / tf, "speedup_graph_vs_grouped": tbgg / tg}

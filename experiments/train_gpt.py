@@ -37,8 +37,9 @@ class Block(nn.Module):
         self.proj = nn.Linear(d, d, bias=False)
         self.ln2 = nn.LayerNorm(d)
         self.moe = None
-        if moe is not None:  # (experts, top_k, d_ff): a mixture-of-experts MLP (nvfp4.moe)
-            self.moe = MoE(d, moe[2], moe[0], top_k=moe[1], activation="gelu_tanh")
+        if moe is not None:  # (experts, top_k, d_ff, capacity factor, shared d_ff): a mixture-of-experts MLP
+            self.moe = MoE(d, moe[2], moe[0], top_k=moe[1], activation="gelu_tanh", capacity_factor=moe[3] or None,
+                           shared_d_ff=moe[4])
         else:
             self.fc1 = nn.Linear(d, 4 * d, bias=False)
             self.fc2 = nn.Linear(4 * d, d, bias=False)
@@ -109,7 +110,8 @@ class GPT(nn.Module):
         self.head.weight = self.wte.weight  # tied
         self.apply(self._init)
         for name, p in self.named_parameters():  # residual projections, incl. the MoE's stacked w_fc2 / w_down
-            if name.endswith(("proj.weight", "fc2.weight", "moe.w_fc2", "moe.w_down")):
+            if name.endswith(("proj.weight", "fc2.weight", "moe.w_fc2", "moe.w_down", "shared_w_fc2",
+                              "shared_w_down")):
                 nn.init.normal_(p, 0.0, 0.02 / math.sqrt(2 * layers))
 
     @staticmethod
@@ -117,7 +119,7 @@ class GPT(nn.Module):
         if isinstance(m, (nn.Linear, nn.Embedding)):
             nn.init.normal_(m.weight, 0.0, 0.02)
         elif isinstance(m, MoE):  # stacked expert weights: the same init as the dense layers' nn.Linear
-            for w in m.experts_weights():
+            for w in m.experts_weights() + m.shared_weights():
                 nn.init.normal_(w, 0.0, 0.02)
 
     def forward(self, idx, targets=None):
@@ -190,6 +192,8 @@ def main():
     ap.add_argument("--moe-topk", type=int, default=2)
     ap.add_argument("--moe-dff", type=int, default=0, help="expert hidden size (default 4 d / top_k: compute-matched)")
     ap.add_argument("--moe-aux", type=float, default=0.01, help="load-balancing loss coefficient")
+    ap.add_argument("--moe-capacity", type=float, default=0.0, help="expert capacity factor (0: dropless)")
+    ap.add_argument("--moe-shared", type=int, default=0, help="hidden size of a shared expert (0: none)")
     ap.add_argument("--bf16-tail", type=float, default=0.0,
                     help="train the last FRAC of the steps with the NVFP4 layers in BF16 (ops.set_high_precision)")
     ap.add_argument("--hp-modules", default="",
@@ -216,7 +220,7 @@ def main():
     val = np.memmap(os.path.join(a.data, "val.bin"), dtype=np.uint16, mode="r")
     moe = None
     if a.moe_experts:
-        moe = (a.moe_experts, a.moe_topk, a.moe_dff or 4 * a.d // a.moe_topk)
+        moe = (a.moe_experts, a.moe_topk, a.moe_dff or 4 * a.d // a.moe_topk, a.moe_capacity, a.moe_shared)
     model = GPT(50304, a.d, a.layers, a.heads, a.ctx, moe=moe, moe_aux=a.moe_aux).cuda()
     converted = []
     if a.precision == "nvfp4":
@@ -303,6 +307,9 @@ def main():
             rec = {"step": step, "loss": loss.item(), "grad_norm": gn.item(), "lr": a.lr * sched(step),
                    "tok_per_s": tokens_window / (now - t_last) if step else None,
                    "max_mem_gb": torch.cuda.max_memory_allocated() / 2**30}
+            if a.moe_capacity:  # fraction of the last micro-batch's routed slots dropped, over the blocks
+                blocks = [b.moe for b in model.blocks]
+                rec["moe_dropped"] = sum(m.last_dropped for m in blocks) / sum(sum(m.last_counts) for m in blocks)
             log.write(json.dumps(rec) + "\n")
             if step % 100 == 0 and rank == 0:
                 print(rec, flush=True)

@@ -6,7 +6,10 @@
     y = moe(x)                               # x [..., d]; moe.aux_loss: Switch load-balancing loss
 
 Routing: softmax over the router logits (fp32), top-k experts per token, weights renormalized over the k
-choices. The (token, expert) pairs are sorted by expert (stable). No tokens are dropped (no capacity factor).
+choices. The (token, expert) pairs are sorted by expert (stable). Dropless by default; with
+``capacity_factor`` each expert keeps its first C = ceil(capacity_factor T k / E) slots in token order. Options:
+a shared expert (``shared_d_ff``: a dense MLP every token goes through, added to the routed output) and
+expert parallelism (``ep_group``: each rank holds E / W experts; slots travel by fixed-size all-to-alls).
 The layer never reads the expert sizes on the host: its buffers have the worst-case size for the number of
 tokens, and the layout is computed on the GPU, so a training step with MoE layers can be captured in a CUDA
 graph and traced by ``torch.compile`` without graph breaks. That holds for the NVFP4 experts and for the
@@ -40,6 +43,7 @@ import math
 from typing import NamedTuple
 
 import torch
+import torch.distributed as dist
 import torch.nn as nn
 import torch.nn.functional as F
 
@@ -261,44 +265,143 @@ class _GroupedGelu(torch.autograd.Function):
 
 
 class _Layout(NamedTuple):
-    """Where the routed slots go in the expert buffer, computed on the GPU (MoE._layout)."""
+    """Where a set of slots goes in an expert buffer, computed on the GPU (_plan)."""
     tiles: torch.Tensor      # int32 [M / 128]: expert of each 128-row tile, -1 for unused tiles
     tile_rows: torch.Tensor  # int32 [M / 128]: real (not padding) rows of each tile
     segs_d: torch.Tensor     # int32 [E, 3]: (first row, padded rows, e d) per expert (ragged-K GEMMs)
-    segs_f: torch.Tensor     # int32 [E, 3]: (first row, padded rows, e d_ff)
-    src: torch.Tensor        # int64 [M]: token of each buffer row (T: a zero row)
-    pos: torch.Tensor        # int64 [T, k]: buffer row of each (token, choice) slot
+    segs_f: torch.Tensor     # int32 [E, 3]: (first row, padded rows, e f)
+    src: torch.Tensor        # int64 [M]: source row of each buffer row (n_src: a zero row)
+    pos: torch.Tensor        # int64 [S / k, k]: buffer row of each slot (a dropped slot: the zero row M - 1)
+
+
+def _plan(slot_expert: torch.Tensor, slot_src: torch.Tensor, n_src: int, n_experts: int, k: int, d: int, f: int,
+          max_rows: int, drops: bool) -> tuple[_Layout, torch.Tensor]:
+    """(layout, rows per expert) of S slots: slot i reads source row slot_src[i] and goes to expert
+    slot_expert[i] (-1: dropped). The slots are grouped by expert (stable: in slot order), each expert's rows
+    padded to a multiple of 128. Nothing is read on the host: the buffer has the worst-case size for at most
+    ``max_rows`` kept slots, M = max_rows + E (128 - 1) (+ 1 with ``drops``: a row that is always zero, where
+    dropped slots point) rounded up to 256 (also the column operands' K, a multiple of 256). Tiles past the
+    used rows are tagged -1 (the grouped GEMMs store zeros there without loading anything), and the
+    ragged-K segments of experts without rows are empty."""
+    dev, E, S = slot_expert.device, n_experts, slot_expert.numel()
+    key = torch.where(slot_expert >= 0, slot_expert, E) if drops else slot_expert
+    order = torch.argsort(key, stable=True)
+    # integer adds commute, so the scatter is deterministic (bincount's output size is data-dependent)
+    counts = torch.zeros(E + 1, device=dev, dtype=torch.long).scatter_add_(0, key, torch.ones_like(key))[:E]
+    m_pad = (max_rows + E * (_ROWS - 1) + int(drops) + 255) // 256 * 256
+    padded = (counts + _ROWS - 1) // _ROWS * _ROWS
+    pend = torch.cumsum(padded, 0)
+    pstart = pend - padded
+    cstart = torch.cumsum(counts, 0) - counts
+    ks = key.index_select(0, order)
+    kc = ks.clamp(max=E - 1)
+    dest = torch.arange(S, device=dev) - cstart[kc] + pstart[kc]
+    src_of = slot_src.index_select(0, order)
+    if drops:
+        kept = ks < E
+        dest = torch.where(kept, dest, m_pad - 1)
+        src_of = torch.where(kept, src_of, n_src)
+    src = torch.full((m_pad,), n_src, device=dev, dtype=torch.long).index_copy_(0, dest, src_of)
+    pos = torch.empty_like(dest).index_copy_(0, order, dest).view(-1, k)
+    tile_row = torch.arange(0, m_pad, _ROWS, device=dev)
+    t = torch.searchsorted(pend, tile_row, right=True)
+    used = t < E
+    te = t.clamp(max=E - 1)
+    tile_rows = torch.where(used, (pstart[te] + counts[te] - tile_row).clamp(0, _ROWS), 0).to(torch.int32)
+    tiles = torch.where(used, t, -1).to(torch.int32)
+    experts = torch.arange(E, device=dev)
+    segs_d = torch.stack([pstart, padded, experts * d], 1).to(torch.int32)
+    segs_f = torch.stack([pstart, padded, experts * f], 1).to(torch.int32)
+    return _Layout(tiles, tile_rows, segs_d, segs_f, src, pos), counts
+
+
+class _AllToAll(torch.autograd.Function):
+    """all_to_all_single with equal splits along dim 0; the backward is the reverse exchange."""
+
+    @staticmethod
+    def forward(ctx, x, group):
+        ctx.group = group
+        out = torch.empty_like(x)
+        dist.all_to_all_single(out, x.contiguous(), group=group)
+        return out
+
+    @staticmethod
+    def backward(ctx, g):
+        out = torch.empty_like(g)
+        dist.all_to_all_single(out, g.contiguous(), group=ctx.group)
+        return out, None
+
+
+def _combine(ys: torch.Tensor, pos: torch.Tensor, w: torch.Tensor) -> torch.Tensor:
+    """y[t] = sum_j w[t, j] ys[pos[t, j]]: a gather and a k-term weighted sum (deterministic; the gather's
+    backward writes every row once, except the always-zero row dropped slots point to, which gets zeros)."""
+    T, k = pos.shape
+    g = ys.index_select(0, pos.reshape(-1)).view(T, k, ys.shape[1])
+    return torch.bmm(w.to(g.dtype).unsqueeze(1), g).squeeze(1)
+
+
+def _names(activation: str, d: int, f: int):
+    return (("gate", f, d), ("up", f, d), ("down", d, f)) if activation == "swiglu" else \
+        (("fc1", f, d), ("fc2", d, f))
 
 
 class MoE(nn.Module):
-    """Dropless top-k mixture-of-experts MLP (see the module docstring).
+    """Top-k mixture-of-experts MLP (see the module docstring).
 
     d, d_ff: model and expert hidden sizes (multiples of 128 for NVFP4 experts); activation: "swiglu",
-    "gelu_tanh" or "gelu"; bias: per-expert biases on every expert projection. After forward, ``aux_loss``
-    holds the Switch Transformer load-balancing loss E * sum_e f_e P_e (f_e: fraction of routed slots, P_e:
-    mean router probability of expert e), 1.0 when balanced; add ``coef * moe.aux_loss`` to the training loss.
-    ``last_counts``: tokens per expert. ``bf16_impl``: how the high-precision experts run, "auto" (grouped
-    Triton GEMMs on CUDA when Triton is installed, else the loop), "grouped" or "loop" (one expert after
-    another, reading the expert sizes on the host)."""
+    "gelu_tanh" or "gelu"; bias: biases on every expert projection.
+
+    capacity_factor (None: dropless): each expert takes at most C = ceil(capacity_factor * T k / E) of a
+    forward's T k (token, choice) slots, in token order (Switch Transformer); the other slots are dropped (they
+    contribute nothing to the token's output).
+    shared_d_ff (0: none): a shared expert, a dense MLP of that hidden size (the same activation) that every
+    token goes through with weight 1, its output added to the routed experts' (n shared experts of hidden h
+    are one of hidden n h). Parameters ``shared_w_*`` [1, ., .] (and ``shared_b_*``).
+    ep_group (None: every expert on this process): expert parallelism over a torch.distributed process group
+    of W ranks: this rank holds experts [r E / W, (r + 1) E / W) (the stacked parameters have E / W rows), and
+    the routed slots travel to their expert's rank and back by two fixed-size all-to-alls, one per direction.
+    Needs ``capacity_factor`` (C slots per expert and source rank). The router and the shared expert are
+    replicated; gradients of the local experts already include every rank's tokens.
+
+    After forward, ``aux_loss`` holds the Switch Transformer load-balancing loss E * sum_e f_e P_e (f_e:
+    fraction of routed slots, P_e: mean router probability of expert e; before dropping; this rank's tokens),
+    1.0 when balanced; add ``coef * moe.aux_loss`` to the training loss. ``last_counts``: slots routed to each
+    expert (before dropping); ``last_dropped``: slots dropped. ``bf16_impl``: how the high-precision experts
+    run, "auto" (grouped Triton GEMMs on CUDA when Triton is installed, else the loop), "grouped" or "loop" (one
+    expert after another, reading the expert sizes on the host)."""
 
     def __init__(self, d: int, d_ff: int, n_experts: int, top_k: int = 2, activation: str = "swiglu",
-                 normalize_weights: bool = True, bias: bool = False, device=None, dtype=None):
+                 normalize_weights: bool = True, bias: bool = False, capacity_factor: float | None = None,
+                 shared_d_ff: int = 0, ep_group=None, device=None, dtype=None):
         super().__init__()
         if activation not in ("swiglu", "gelu_tanh", "gelu"):
             raise ValueError(f"activation must be swiglu, gelu_tanh or gelu, got {activation!r}")
         if not 1 <= top_k <= n_experts:
             raise ValueError(f"top_k must be in [1, n_experts], got {top_k}")
+        if capacity_factor is not None and not capacity_factor > 0:
+            raise ValueError(f"capacity_factor must be positive, got {capacity_factor}")
+        if shared_d_ff < 0:
+            raise ValueError(f"shared_d_ff must be >= 0, got {shared_d_ff}")
+        self.ep_group, self.ep_size, self.ep_rank = ep_group, 1, 0
+        if ep_group is not None:
+            self.ep_size, self.ep_rank = dist.get_world_size(ep_group), dist.get_rank(ep_group)
+            if n_experts % self.ep_size:
+                raise ValueError(f"{n_experts} experts do not split over {self.ep_size} ranks")
+            if capacity_factor is None:
+                raise ValueError("expert parallelism needs a capacity_factor (fixed-size all-to-alls)")
         self.d, self.d_ff, self.n_experts, self.top_k = d, d_ff, n_experts, top_k
         self.activation, self.normalize_weights = activation, normalize_weights
+        self.capacity_factor, self.shared_d_ff = capacity_factor, shared_d_ff
+        self.n_local = n_experts // self.ep_size
         self.router = nn.Linear(d, n_experts, bias=False, device=device, dtype=dtype)
         kw = dict(device=device, dtype=dtype)
-        names = (("gate", d_ff, d), ("up", d_ff, d), ("down", d, d_ff)) if activation == "swiglu" else \
-            (("fc1", d_ff, d), ("fc2", d, d_ff))
-        for name, n, k in names:
-            self.register_parameter("w_" + name, nn.Parameter(torch.empty(n_experts, n, k, **kw)))
-            self.register_parameter("b_" + name, nn.Parameter(torch.empty(n_experts, n, **kw)) if bias else None)
-        self._names = tuple("w_" + n for n, _, _ in names)
-        self._bias_names = tuple("b_" + n for n, _, _ in names)
+        groups = [("", self.n_local, d_ff)] + ([("shared_", 1, shared_d_ff)] if shared_d_ff else [])
+        for prefix, n_e, f in groups:
+            for name, n, k in _names(activation, d, f):
+                self.register_parameter(f"{prefix}w_{name}", nn.Parameter(torch.empty(n_e, n, k, **kw)))
+                self.register_parameter(f"{prefix}b_{name}", nn.Parameter(torch.empty(n_e, n, **kw)) if bias else None)
+        self._names = tuple("w_" + n for n, _, _ in _names(activation, d, d_ff))
+        self._bias_names = tuple("b_" + n for n, _, _ in _names(activation, d, d_ff))
         self.has_bias = bias
         self.reset_parameters()
         self.nvfp4 = False
@@ -307,13 +410,16 @@ class MoE(nn.Module):
         self.fuse_wgrad_accumulation = False
         self.cache_weight_quantization = False
         self._caches = tuple(WeightQuantCache() for _ in self._names)
+        self._shared_caches = tuple(WeightQuantCache() for _ in self._names)
         self.aux_loss: torch.Tensor | None = None
         self._counts: torch.Tensor | None = None
+        self._dropped: torch.Tensor | None = None
 
     def reset_parameters(self) -> None:
         """nn.Linear's default initialization for every expert matrix and bias (uniform, bound 1/sqrt(fan_in))."""
         with torch.no_grad():
-            for w, b in zip(self.experts_weights(), self.experts_biases()):
+            for w, b in zip(self.experts_weights() + self.shared_weights(),
+                            self.experts_biases() + self.shared_biases()):
                 bound = 1 / math.sqrt(w.shape[-1])
                 w.uniform_(-bound, bound)
                 if b is not None:
@@ -321,9 +427,11 @@ class MoE(nn.Module):
 
     def to_nvfp4(self, *, wgrad_rht: bool = True, fuse_wgrad_accumulation: bool = False,
                  cache_weight_quantization: bool = False, backend: str = "cuda") -> "MoE":
-        """Run the experts in NVFP4 (``convert_linears`` calls this with its keyword arguments)."""
-        if self.d % ALIGN or self.d_ff % ALIGN:
-            raise ValueError(f"NVFP4 experts need d and d_ff divisible by {ALIGN}, got {self.d}, {self.d_ff}")
+        """Run the experts (and the shared expert) in NVFP4 (``convert_linears`` calls this with its keyword
+        arguments)."""
+        if self.d % ALIGN or self.d_ff % ALIGN or self.shared_d_ff % ALIGN:
+            raise ValueError(f"NVFP4 experts need d, d_ff and shared_d_ff divisible by {ALIGN}, got {self.d}, "
+                             f"{self.d_ff}, {self.shared_d_ff}")
         if backend != "cuda":
             raise ValueError("NVFP4 experts need the CUDA backend")
         self.nvfp4 = True
@@ -332,24 +440,37 @@ class MoE(nn.Module):
         return self
 
     def experts_weights(self):
+        """The routed experts' stacked weights ([E / W, ., .] under expert parallelism)."""
         return tuple(getattr(self, n) for n in self._names)
 
     def experts_biases(self):
         """The expert biases in the order of experts_weights (None each without ``bias``)."""
         return tuple(getattr(self, n) for n in self._bias_names)
 
+    def shared_weights(self):
+        """The shared expert's weights [1, ., .] (empty without ``shared_d_ff``)."""
+        return tuple(getattr(self, "shared_" + n) for n in self._names) if self.shared_d_ff else ()
+
+    def shared_biases(self):
+        return tuple(getattr(self, "shared_" + n) for n in self._bias_names) if self.shared_d_ff else ()
+
     def __getstate__(self):
         """Copies and pickles leave out the last forward's outputs (``aux_loss`` is a non-leaf tensor, which
-        deepcopy refuses; neither belongs to the module's state)."""
+        deepcopy refuses; none belongs to the module's state) and the process group (not copyable)."""
         state = self.__dict__.copy()
-        state["aux_loss"] = None
-        state["_counts"] = None
+        state["aux_loss"] = state["_counts"] = state["_dropped"] = None
+        state["ep_group"] = None
         return state
 
     @property
     def last_counts(self) -> list[int] | None:
-        """Tokens routed to each expert in the last forward (read from the GPU: synchronizes)."""
+        """Slots routed to each expert in the last forward, before dropping (read from the GPU: synchronizes)."""
         return None if self._counts is None else self._counts.tolist()
+
+    @property
+    def last_dropped(self) -> int | None:
+        """Slots dropped for capacity in the last forward (0 when dropless; synchronizes)."""
+        return None if self._dropped is None else int(self._dropped)
 
     def route(self, x2d: torch.Tensor):
         """(weights [T, k] fp32, experts [T, k] int64, router probabilities [T, E] fp32)."""
@@ -358,6 +479,13 @@ class MoE(nn.Module):
         if self.normalize_weights and self.top_k > 1:
             w = w / w.sum(-1, keepdim=True)
         return w, idx, probs
+
+    def capacity(self, tokens: int) -> int | None:
+        """Slots each expert takes per forward of ``tokens`` tokens (per source rank under expert
+        parallelism); None when dropless."""
+        if self.capacity_factor is None:
+            return None
+        return max(1, math.ceil(self.capacity_factor * tokens * self.top_k / self.n_experts))
 
     def _bf16_grouped(self, x: torch.Tensor) -> bool:
         if self.bf16_impl not in ("auto", "grouped", "loop"):
@@ -370,10 +498,13 @@ class MoE(nn.Module):
             return False
         return True
 
-    def _experts_loop(self, xs: torch.Tensor, counts: list[int]) -> torch.Tensor:
-        """Reference path: each expert's slice of the sorted tokens, one after another."""
-        ws = [w.unbind(0) for w in self.experts_weights()]  # unbind: one stacked gradient, not E zero-fills
-        bs = [(b.unbind(0) if b is not None else (None,) * self.n_experts) for b in self.experts_biases()]
+    # --- the experts on a buffer of rows ---------------------------------------------------------------
+
+    def _mlp_loop(self, xs: torch.Tensor, counts: list[int], ws, bs) -> torch.Tensor:
+        """Reference path: each expert's slice of the sorted rows, one after another."""
+        E = ws[0].shape[0]
+        ws = [w.unbind(0) for w in ws]  # unbind: one stacked gradient, not E zero-fills
+        bs = [(b.unbind(0) if b is not None else (None,) * E) for b in bs]
         outs = []
         for e, part in enumerate(xs.split(counts)):
             if not counts[e]:
@@ -385,43 +516,16 @@ class MoE(nn.Module):
                 approx = "tanh" if self.activation == "gelu_tanh" else "none"
                 h = F.gelu(F.linear(part, ws[0][e], bs[0][e]), approximate=approx)
                 outs.append(F.linear(h, ws[1][e], bs[1][e]))
-        return torch.cat(outs, 0)
+        return torch.cat(outs, 0) if outs else xs[:0]
 
-    def _layout(self, token, slot_expert, slot_of_sorted, counts: torch.Tensor, T: int) -> _Layout:
-        """The padded buffer's layout, computed on the GPU from the device-side counts (no host
-        synchronization). The buffer has the worst-case size for T tokens, M = T k + E (128 - 1) rounded up to
-        256 (every expert's rows padded to 128; also the column operands' K, a multiple of 256). Tiles past the
-        used rows are tagged -1 (the grouped GEMMs store zeros there without loading anything), and the
-        ragged-K segments of experts without tokens are empty."""
-        dev, E, k = counts.device, self.n_experts, self.top_k
-        m_pad = (T * k + E * (_ROWS - 1) + 255) // 256 * 256
-        padded = (counts + _ROWS - 1) // _ROWS * _ROWS
-        pend = torch.cumsum(padded, 0)
-        pstart = pend - padded
-        cstart = torch.cumsum(counts, 0) - counts
-        tile_row = torch.arange(0, m_pad, _ROWS, device=dev)
-        t = torch.searchsorted(pend, tile_row, right=True)
-        used = t < E
-        te = t.clamp(max=E - 1)
-        tile_rows = torch.where(used, (pstart[te] + counts[te] - tile_row).clamp(0, _ROWS), 0).to(torch.int32)
-        tiles = torch.where(used, t, -1).to(torch.int32)
-        experts = torch.arange(E, device=dev)
-        segs_d = torch.stack([pstart, padded, experts * self.d], 1).to(torch.int32)
-        segs_f = torch.stack([pstart, padded, experts * self.d_ff], 1).to(torch.int32)
-        dest = torch.arange(token.numel(), device=dev) - cstart[slot_expert] + pstart[slot_expert]
-        src = torch.full((m_pad,), T, device=dev, dtype=torch.long).index_copy_(0, dest, token)
-        pos = torch.empty_like(dest).index_copy_(0, slot_of_sorted, dest).view(T, k)
-        return _Layout(tiles, tile_rows, segs_d, segs_f, src, pos)
-
-    def _experts_nvfp4(self, x2d, lay: _Layout):
-        dt = torch.get_autocast_dtype("cuda") if torch.is_autocast_enabled("cuda") else x2d.dtype
-        xs = _Dispatch.apply(x2d.to(BF16), lay.src, lay.pos)  # bf16 first: the quantizer reads bf16 (as NVFP4Linear)
+    def _mlp_nvfp4(self, x, lay: _Layout, ws, bs, caches):
+        dt = torch.get_autocast_dtype("cuda") if torch.is_autocast_enabled("cuda") else x.dtype
+        xs = _Dispatch.apply(x.to(BF16), lay.src, lay.pos)  # bf16 first: the quantizer reads bf16 (as NVFP4Linear)
         grad = torch.is_grad_enabled()
-        ws, bs = self.experts_weights(), self.experts_biases()
         need_w = grad and any(w.requires_grad for w in ws)
         need_b = grad and any(b is not None and b.requires_grad for b in bs)
         need_dx = grad and xs.requires_grad
-        caches = self._caches if self.cache_weight_quantization else (None,) * len(ws)
+        caches = caches if self.cache_weight_quantization else (None,) * len(ws)
         if self.activation == "swiglu":
             return _GroupedSwiGLU.apply(xs, *ws, *bs, lay.tiles, lay.tile_rows, lay.segs_d, lay.segs_f, caches,
                                         (self.wgrad_rht, need_dx, need_w, need_b, self.fuse_wgrad_accumulation, dt))
@@ -429,15 +533,15 @@ class MoE(nn.Module):
         return _GroupedGelu.apply(xs, *ws, *bs, lay.tiles, lay.tile_rows, lay.segs_d, lay.segs_f, caches,
                                   (self.wgrad_rht, need_dx, need_w, need_b, self.fuse_wgrad_accumulation, dt, approx))
 
-    def _experts_bf16_grouped(self, x2d, lay: _Layout):
+    def _mlp_bf16_grouped(self, x, lay: _Layout, ws, bs):
         """The high-precision experts on the padded buffer with grouped Triton GEMMs (autocast honoured as
         F.linear would: inputs, weights and biases in the autocast dtype)."""
-        dt = torch.get_autocast_dtype("cuda") if torch.is_autocast_enabled("cuda") else x2d.dtype
-        xs = _Dispatch.apply(x2d, lay.src, lay.pos)
+        dt = torch.get_autocast_dtype("cuda") if torch.is_autocast_enabled("cuda") else x.dtype
+        xs = _Dispatch.apply(x, lay.src, lay.pos)
         with torch.autocast("cuda", enabled=False):
             xs = xs.to(dt)
-            ws = [w.to(dt) for w in self.experts_weights()]
-            bs = [None if b is None else b.to(dt) for b in self.experts_biases()]
+            ws = [w.to(dt) for w in ws]
+            bs = [None if b is None else b.to(dt) for b in bs]
             lin = lambda a, i, segs: GroupedLinear.apply(a, ws[i], bs[i], lay.tiles, lay.tile_rows, segs)  # noqa: E731
             if self.activation == "swiglu":
                 a = F.silu(lin(xs, 0, lay.segs_f)) * lin(xs, 1, lay.segs_f)
@@ -445,37 +549,111 @@ class MoE(nn.Module):
             approx = "tanh" if self.activation == "gelu_tanh" else "none"
             return lin(F.gelu(lin(xs, 0, lay.segs_f), approximate=approx), 1, lay.segs_d)
 
+    def _mlp(self, x, slot_expert, slot_src, k: int, n_experts: int, f: int, max_rows: int, drops: bool,
+             ws, bs, caches):
+        """(rows [?, d], pos [S / k, k]): slot i of x's row slot_src[i] through expert slot_expert[i] (-1:
+        dropped, a zero row); row pos[s // k, s % k] of the result is slot s's output."""
+        nvfp4 = self.nvfp4 and not ops.high_precision() and x.is_cuda
+        if nvfp4 or self._bf16_grouped(x):
+            lay, _ = _plan(slot_expert, slot_src, x.shape[0], n_experts, k, self.d, f, max_rows, drops)
+            ys = self._mlp_nvfp4(x, lay, ws, bs, caches) if nvfp4 else self._mlp_bf16_grouped(x, lay, ws, bs)
+            return ys, lay.pos
+        # the loop splits the sorted rows: one host synchronization for the expert sizes
+        key = torch.where(slot_expert >= 0, slot_expert, n_experts)
+        order = torch.argsort(key, stable=True)
+        S = key.numel()
+        pos = torch.empty_like(order).index_copy_(0, order, torch.arange(S, device=x.device)).view(-1, k)
+        counts = torch.zeros(n_experts + 1, device=x.device, dtype=torch.long).scatter_add_(
+            0, key, torch.ones_like(key)).tolist()
+        src = slot_src.index_select(0, order)
+        ys = self._mlp_loop(_Dispatch.apply(x, src, pos)[:S - counts[-1]], counts[:-1], ws, bs)
+        return torch.cat([ys, ys.new_zeros(counts[-1], self.d)]), pos  # dropped slots: zero rows
+
+    # --- forward ---------------------------------------------------------------------------------------
+
+    def _shared(self, x2d):
+        T = x2d.shape[0]
+        zeros = torch.zeros(T, device=x2d.device, dtype=torch.long)
+        ys, pos = self._mlp(x2d, zeros, torch.arange(T, device=x2d.device), 1, 1, self.shared_d_ff, T, False,
+                            self.shared_weights(), self.shared_biases(), self._shared_caches)
+        return ys.index_select(0, pos.view(-1))
+
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         lead = x.shape[:-1]
         x2d = x.reshape(-1, self.d)
         T, k, E = x2d.shape[0], self.top_k, self.n_experts
+        dev = x2d.device
         w, idx, probs = self.route(x2d)
         flat = idx.reshape(-1)
-        order = torch.argsort(flat, stable=True)  # (token, choice) slots grouped by expert
-        token = order // k
-        # integer adds commute, so the scatter is deterministic (bincount's output size is data-dependent)
-        counts = torch.zeros(E, device=x.device, dtype=torch.long).scatter_add_(0, flat, torch.ones_like(flat))
+        S = T * k
+        counts = torch.zeros(E, device=dev, dtype=torch.long).scatter_add_(0, flat, torch.ones_like(flat))
         self._counts = counts
-        frac = counts.float() / max(1, T * k)
+        frac = counts.float() / max(1, S)
         self.aux_loss = E * (frac * probs.mean(0)).sum()
-        nvfp4 = self.nvfp4 and not ops.high_precision() and x2d.is_cuda
-        if nvfp4 or self._bf16_grouped(x2d):
-            lay = self._layout(token, flat.index_select(0, order), order, counts, T)
-            ys = self._experts_nvfp4(x2d, lay) if nvfp4 else self._experts_bf16_grouped(x2d, lay)
-            pos = lay.pos
-        else:  # the loop splits the sorted rows: one host synchronization for the expert sizes
-            pos = torch.empty_like(order).index_copy_(0, order, torch.arange(T * k, device=x.device)).view(T, k)
-            ys = self._experts_loop(_Dispatch.apply(x2d, token, pos), counts.tolist())
-        # combine: y[t] = sum_j w[t, j] ys[pos[t, j]], a gather and a k-term weighted sum (deterministic; the
-        # gather's backward writes every row once)
-        g = ys.index_select(0, pos.reshape(-1)).view(T, k, self.d)
-        y = torch.bmm(w.to(g.dtype).unsqueeze(1), g).squeeze(1)
+        C = self.capacity(T)
+        slot_expert, rank = flat, None
+        if C is not None:  # keep each expert's first C slots (in token order)
+            order = torch.argsort(flat, stable=True)
+            cstart = torch.cumsum(counts, 0) - counts
+            rank_sorted = torch.arange(S, device=dev) - cstart.index_select(0, flat.index_select(0, order))
+            rank = torch.empty_like(rank_sorted).index_copy_(0, order, rank_sorted)
+            keep = rank < C
+            slot_expert = torch.where(keep, flat, -1)
+            w = w * keep.view(T, k)
+            self._dropped = (~keep).sum()
+        else:
+            self._dropped = torch.zeros((), device=dev, dtype=torch.long)
+        slot_src = torch.arange(S, device=dev) // k
+        if self.ep_group is None:
+            max_rows = S if C is None else min(S, E * C)
+            ys, pos = self._mlp(x2d, slot_expert, slot_src, k, E, self.d_ff, max_rows, C is not None,
+                                self.experts_weights(), self.experts_biases(), self._caches)
+            y = _combine(ys, pos, w)
+        else:
+            y = self._forward_ep(x2d, slot_expert, slot_src, rank, counts, w, C)
+        if self.shared_d_ff:
+            y = y + self._shared(x2d).to(y.dtype)
         return y.reshape(*lead, self.d)
+
+    def _forward_ep(self, x2d, slot_expert, slot_src, rank, counts, w, C: int):
+        """Expert parallelism: send buffer [W, E/W, C, d] (expert e's kept slots in rows e C + rank), an
+        all-to-all, the local experts on the received [W, E/W, C] rows (each source's first count rows of
+        each expert are real), the reverse all-to-all, and the combine."""
+        T, k, E, W, El = x2d.shape[0], self.top_k, self.n_experts, self.ep_size, self.n_local
+        dev, S = x2d.device, T * k
+        kept = slot_expert >= 0
+        send_pos = torch.where(kept, slot_expert * C + rank, E * C)  # E C: a zero row, not sent
+        send_src = torch.full((E * C + 1,), T, device=dev, dtype=torch.long).index_copy_(
+            0, send_pos, torch.where(kept, slot_src, T))
+        nvfp4 = self.nvfp4 and not ops.high_precision() and x2d.is_cuda
+        xin = x2d.to(BF16) if nvfp4 else x2d
+        xs = _Dispatch.apply(xin, send_src, send_pos.view(T, k))[:E * C]
+        kept_counts = torch.minimum(counts, torch.full_like(counts, C))
+        recv_counts = torch.empty_like(kept_counts)
+        dist.all_to_all_single(recv_counts, kept_counts, group=self.ep_group)  # [W, E/W]: per source rank
+        xr = _AllToAll.apply(xs, self.ep_group)  # [W, E/W, C, d] from every source rank
+        n = W * El * C
+        cpos = torch.arange(n, device=dev)
+        e_loc = (cpos // C) % El
+        valid = (cpos % C) < recv_counts.view(-1).repeat_interleave(C)
+        ys, pos = self._mlp(xr, torch.where(valid, e_loc, -1), cpos, 1, El, self.d_ff, n, True,
+                            self.experts_weights(), self.experts_biases(), self._caches)
+        yr = ys.index_select(0, pos.view(-1))  # [W, E/W, C, d]; invalid rows are zero
+        yb = _AllToAll.apply(yr, self.ep_group)  # back to the source: rows e C + c
+        return _combine(torch.cat([yb, yb.new_zeros(1, self.d)]), send_pos.view(T, k), w)
 
     def extra_repr(self) -> str:
         r = f"d={self.d}, d_ff={self.d_ff}, n_experts={self.n_experts}, top_k={self.top_k}, " \
             f"activation={self.activation}"
-        return r + (", bias=True" if self.has_bias else "") + (", nvfp4=True" if self.nvfp4 else "")
+        if self.has_bias:
+            r += ", bias=True"
+        if self.capacity_factor is not None:
+            r += f", capacity_factor={self.capacity_factor}"
+        if self.shared_d_ff:
+            r += f", shared_d_ff={self.shared_d_ff}"
+        if self.ep_group is not None:
+            r += f", expert_parallel={self.ep_size} (local experts {self.n_local})"
+        return r + (", nvfp4=True" if self.nvfp4 else "")
 
 
 __all__ = ["MoE"]

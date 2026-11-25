@@ -20,15 +20,18 @@ from nvfp4.moe import MoE
 
 pytestmark = requires_sm120
 DEV = "cuda"
-# activation[-bias][-bf16]: NVFP4 experts unless "bf16" (the grouped high-precision path)
-VARIANTS = ["swiglu", "gelu_tanh", "swiglu-bias", "gelu_tanh-bias", "swiglu-bf16", "gelu_tanh-bias-bf16"]
-DIST_VARIANTS = ["swiglu", "gelu_tanh", "swiglu-bias", "gelu_tanh-bias-bf16"]
+# activation[-cap][-shared][-bias][-bf16]: NVFP4 experts unless "bf16" (the grouped high-precision path)
+# "cap": capacity factor 1 (token dropping); "shared": a shared expert
+VARIANTS = ["swiglu", "gelu_tanh", "swiglu-bias", "gelu_tanh-bias", "swiglu-bf16", "gelu_tanh-bias-bf16",
+            "swiglu-cap-shared", "gelu_tanh-cap-shared-bias-bf16"]
+DIST_VARIANTS = ["swiglu", "gelu_tanh", "swiglu-bias", "gelu_tanh-bias-bf16", "swiglu-cap-shared"]
 
 
 def _moe(variant="swiglu", fuse=False, E=4, k=2, d=256, d_ff=256, seed=0):
     act, *opts = variant.split("-")
     torch.manual_seed(seed)
-    m = MoE(d, d_ff, E, top_k=k, activation=act, bias="bias" in opts).to(DEV)
+    m = MoE(d, d_ff, E, top_k=k, activation=act, bias="bias" in opts, capacity_factor=1.0 if "cap" in opts else None,
+            shared_d_ff=256 if "shared" in opts else 0).to(DEV)
     if "bf16" in opts:
         m.bf16_impl = "grouped"
     else:
@@ -160,7 +163,7 @@ def test_compile_fullgraph_matches_eager(variant):
     torch._dynamo.reset()
     with inductor_config.patch(fallback_random=True, emulate_precision_casts=True):
         compiled = run(torch.compile(f, fullgraph=True, backend=COMPILE_BACKEND))
-    bf16_weights = {i + 3 for i, (n, _) in enumerate(m.named_parameters()) if not m.nvfp4 and n.startswith("w_")}
+    bf16_weights = {i + 3 for i, (n, _) in enumerate(m.named_parameters()) if not m.nvfp4 and "w_" in n}
     for i, (a, b) in enumerate(zip(eager, compiled)):
         if i == 1:  # aux loss
             assert ((a - b).norm() / a.norm()).item() < 1e-6
@@ -251,7 +254,7 @@ def _check_ddp(rank, world, variant):
                 _step(ddp, rank, mb, ddp.no_sync if mb < N_MB - 1 else contextlib.nullcontext)
             for i, (a, b) in enumerate(zip(_grads(m), expected)):
                 assert torch.equal(a, b), (rank, variant, fuse, i, (a - b).abs().max().item())
-        n_w = len(m.experts_weights()) if m.nvfp4 else 0
+        n_w = len(m.experts_weights() + m.shared_weights()) if m.nvfp4 else 0
         assert hits[0] == (2 * (N_MB - 1) * n_w if fuse else 0), hits[0]  # x micro-batches after the first x steps
 
 

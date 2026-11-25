@@ -150,9 +150,11 @@ layernorm_mlp(xg, ln, fc1, fc2).float().mean().backward()
 ops.set_high_precision(False)
 from nvfp4 import convert_linears  # noqa: E402
 from nvfp4.moe import MoE  # noqa: E402
-for act, bias, fp4 in (("swiglu", False, True), ("gelu_tanh", False, True), ("swiglu", True, True),
-                       ("gelu_tanh", True, True), ("swiglu", True, False)):  # (fp4=False: the Triton BF16 path)
-    moe = MoE(128, 256, 4, top_k=2, activation=act, bias=bias).to(d)
+for act, bias, fp4, cf, sh in (("swiglu", False, True, None, 0), ("gelu_tanh", False, True, None, 0),
+                               ("swiglu", True, True, None, 0), ("gelu_tanh", True, True, None, 0),
+                               ("swiglu", True, False, None, 0),  # (fp4=False: the Triton BF16 path)
+                               ("swiglu", True, True, 0.5, 256), ("gelu_tanh", False, False, 0.5, 128)):
+    moe = MoE(128, 256, 4, top_k=2, activation=act, bias=bias, capacity_factor=cf, shared_d_ff=sh).to(d)
     if fp4:
         convert_linears(moe)
     xm = torch.randn(150, 128, device=d, requires_grad=True)

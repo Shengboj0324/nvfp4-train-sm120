@@ -1,5 +1,38 @@
 # Changelog
 
+## 0.15.0 — MoE: capacity-limited routing, a shared expert, expert parallelism (2026-11-25)
+
+- **Capacity** (`MoE(..., capacity_factor=1.25)`): each expert keeps the first C = ⌈cf·T k / E⌉ of its
+  slots in token order (Switch Transformer).
+  - Dropped slots add nothing and point at an always-zero buffer row. The buffer shrinks to
+    min(T k, E C) + E·127 rows.
+  - Nothing is read on the host: CUDA graphs and compile still work.
+  - `moe.capacity(T)` gives C; `moe.last_dropped` counts the dropped slots.
+- **Shared expert** (`shared_d_ff=...`): a dense MLP that every token goes through, added to the routed
+  output (DeepSeek-MoE; n shared experts of hidden h = one of hidden n h). Parameters `shared_w_*` /
+  `shared_b_*`. It runs through the same grouped NVFP4 kernels (or Triton / the loop in high precision).
+- **Expert parallelism** (`ep_group=...`, needs a capacity): each of W ranks holds E/W experts.
+  - Slots travel by two fixed-size all-to-alls ([W, E/W, C, d] rows plus a small count exchange), with
+    a differentiable wrapper.
+  - The local experts run as in any other layout.
+  - Tested with two processes over gloo on one GPU: in fp32 the output equals the single-process layer
+    on each rank's tokens, and the local expert gradients equal the sum over the ranks. NVFP4 is
+    checked by cosine.
+  - Not measured for speed: no multi-GPU machine, no overlap of exchange and compute.
+- **Internal:** one GPU-side planner (`_plan`) serves routing, capacity, the shared expert and the
+  expert-parallel receive side. The dropless layout is unchanged (same buffer size: v0.14 numerics).
+- **Training:** `experiments/train_gpt.py --moe-capacity`, `--moe-shared`; with a capacity it logs the
+  dropped fraction.
+  - The capacity-1.25 MoE GPT drops 12% of slots at step 25 and almost none after balancing.
+  - It ends at BF16 1.4923 and NVFP4 1.5066 (+0.96%), 62.3k vs 50.8k tokens/s (RESULTS.md §8).
+- **Tests:** `tests/test_moe_features_cuda.py`; capacity / shared variants in the CUDA-graph, compile,
+  checkpointing and DDP / FSDP1 / FSDP2 tests. The test gather helper handles FSDP2's uneven shards (the
+  shared expert's dim 0 is 1). The sanitizer driver covers capacity and the shared expert.
+- **Layer benchmark:** 32 experts, top-4, capacity 1.25 and a shared expert of 2816. NVFP4 is 2.37× the
+  BF16 loop and 2.18× the grouped BF16 path, 2.26× with both in CUDA graphs.
+- **Checks:** 989 tests (968 pass on the laptop, 21 skip); memcheck / racecheck / synccheck / initcheck
+  clean; 5-minute soak OK.
+
 ## 0.14.0 — MoE expert biases; grouped BF16 experts without host synchronization (2026-11-25)
 
 - **Expert biases:** `MoE(..., bias=True)` gives every expert projection a per-expert bias: `b_gate`,
