@@ -53,7 +53,8 @@ std::vector<torch::Tensor> nvfp4_norm_backward(torch::Tensor dy, torch::Tensor x
 torch::Tensor nvfp4_gemm_grouped(torch::Tensor a, torch::Tensor sfa, torch::Tensor gdec_a, torch::Tensor b,
                                  torch::Tensor sfb, torch::Tensor gdec_b, int64_t mode, torch::Tensor meta,
                                  int64_t group_rows, c10::ScalarType out_dtype, c10::optional<torch::Tensor> out,
-                                 bool accumulate);
+                                 bool accumulate, c10::optional<torch::Tensor> bias,
+                                 c10::optional<torch::Tensor> tile_rows, bool bias_round);
 torch::Tensor nvfp4_gemm(torch::Tensor a, torch::Tensor sfa, torch::Tensor gdec_a, torch::Tensor b, torch::Tensor sfb,
                          torch::Tensor gdec_b, c10::ScalarType out_dtype, c10::optional<torch::Tensor> out,
                          bool accumulate, int64_t impl, int64_t splits, c10::optional<torch::Tensor> bias,
@@ -140,7 +141,8 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
   m.def("gemm_grouped", &nvfp4_gemm_grouped, "grouped NVFP4 GEMMs (mixture of experts)", py::arg("a"),
         py::arg("sfa"), py::arg("gdec_a"), py::arg("b"), py::arg("sfb"), py::arg("gdec_b"), py::arg("mode"),
         py::arg("meta"), py::arg("group_rows"), py::arg("out_dtype"), py::arg("out") = py::none(),
-        py::arg("accumulate") = false);
+        py::arg("accumulate") = false, py::arg("bias") = py::none(), py::arg("tile_rows") = py::none(),
+        py::arg("bias_round") = false);
   m.def("gemm", &nvfp4_gemm, "NVFP4 TN GEMM: D = A @ B^T", py::arg("a"), py::arg("sfa"), py::arg("gdec_a"),
         py::arg("b"), py::arg("sfb"), py::arg("gdec_b"), py::arg("out_dtype"), py::arg("out") = py::none(),
         py::arg("accumulate") = false, py::arg("impl") = 0, py::arg("splits") = 0, py::arg("bias") = py::none(),

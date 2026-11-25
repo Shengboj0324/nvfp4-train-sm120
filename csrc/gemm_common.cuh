@@ -69,18 +69,23 @@ struct Args {
   int groups;              // mode 2: groups (work)
   int a_rows;              // mode 2: rows of A (= D rows per group, a multiple of BM)
   int sf_ld;               // scale row stride in bytes for the tensor maps (0: K / 16)
+  // Mode 1 with `bias` ([groups, N] fp32): tile t of group g >= 0 adds bias[g, col] to its first tile_rows[t]
+  // rows (all BM rows if tile_rows is null); the other rows (an expert's padding) and unused tiles get none.
+  const int* tile_rows;
 };
 
 __device__ __forceinline__ float bf16_round(float v) { return __bfloat162float(__float2bfloat16_rn(v)); }
 
 // The epilogue above for the pair D[row, col], D[row, col + 1] (row < M; col + 1 may be >= N).
-__device__ __forceinline__ void linear_epilogue(const Args& p, int row, int col, float& v0, float& v1) {
+// `bias`: p.bias, offset to the tile's group in grouped GEMMs, or null for rows that get no bias.
+__device__ __forceinline__ void linear_epilogue(const Args& p, const float* bias, int row, int col, float& v0,
+                                                float& v1) {
   const bool c1 = col + 1 < p.N;
   v0 = bf16_round(v0);
   v1 = bf16_round(v1);
-  if (p.bias != nullptr) {
-    v0 = __fadd_rn(v0, __ldg(p.bias + col));
-    if (c1) v1 = __fadd_rn(v1, __ldg(p.bias + col + 1));
+  if (bias != nullptr) {
+    v0 = __fadd_rn(v0, __ldg(bias + col));
+    if (c1) v1 = __fadd_rn(v1, __ldg(bias + col + 1));
     if (p.bias_round) {
       v0 = bf16_round(v0);
       v1 = bf16_round(v1);
@@ -248,11 +253,18 @@ __device__ __forceinline__ void store_tile(const Args& p, float (&acc)[MI][NI][4
                      __fadd_rn(old[i][j][h].y, __fmul_rn(acc[i][j][2 * h + 1], alpha)));
         }
   } else {
-    const bool epi = p.bias != nullptr || p.res != nullptr;
+    const float* bias = p.bias;
+    int bias_end = p.M;  // rows >= bias_end get no bias
+    if (p.group_mode == 1 && bias != nullptr) {  // per-group bias rows (mixture of experts)
+      const int t = m0 / BM, g = __ldg(p.tile_group + t);
+      bias = g < 0 ? nullptr : bias + static_cast<int64_t>(g) * p.N;
+      bias_end = m0 + (p.tile_rows != nullptr ? __ldg(p.tile_rows + t) : BM);
+    }
+    const bool epi = bias != nullptr || p.res != nullptr;
     for_each_pair(m0, n0, wm, wn, lane, [&](int i, int j, int h, int row, int col) {
       if (row >= p.M || col >= p.N) return;
       float v0 = acc[i][j][2 * h] * alpha, v1 = acc[i][j][2 * h + 1] * alpha;
-      if (epi) linear_epilogue(p, row, col, v0, v1);
+      if (epi) linear_epilogue(p, row < bias_end ? bias : nullptr, row, col, v0, v1);
       OutT* out = reinterpret_cast<OutT*>(p.d) + static_cast<int64_t>(row) * p.N + col;
       if constexpr (std::is_same_v<OutT, float>) {
         if (col + 1 < p.N && (p.N % 2 == 0)) {

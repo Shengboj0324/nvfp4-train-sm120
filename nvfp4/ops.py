@@ -200,7 +200,8 @@ def quantize_dual(x: torch.Tensor | list[torch.Tensor] | tuple[torch.Tensor, ...
     ``x`` may also be a list of 1-3 same-shaped tensors: the input is then their concatenation along
     dim 1, read in place (e.g. the q / k / v gradients of a fused qkv projection; not with ``block_2d``).
     ``bias_grad=True`` also returns the column sums of ``x`` (fp32 [C], the gradient of a bias added to the
-    layer output ``x`` is the gradient of), from the same read: ``(row, col, bias_grad)``.
+    layer output ``x`` is the gradient of), from the same read: ``(row, col, bias_grad)``;
+    ``bias_grad="tiles"`` returns the per-64-row-tile sums instead (see _colsums).
     """
     if isinstance(x, (list, tuple)) or bias_grad:
         parts = list(x) if isinstance(x, (list, tuple)) else [x]
@@ -210,10 +211,21 @@ def quantize_dual(x: torch.Tensor | list[torch.Tensor] | tuple[torch.Tensor, ...
                                         int(col_pad), *_seed_tensors(row_sr_seed, col_sr_seed, rht_seed),
                                         bool(bias_grad))
         pair = _pair(outs[:6], row, col)
-        return (*pair, outs[6].sum(0)) if bias_grad else pair
+        return (*pair, _colsums(outs[6], bias_grad)) if bias_grad else pair
     outs = _lib.quantize_dual(x, row, col, block_2d, *_seed_flags(row_sr_seed, col_sr_seed, rht_seed), int(col_pad),
                               *_seed_tensors(row_sr_seed, col_sr_seed, rht_seed))
     return _pair(outs, row, col)
+
+
+def _colsums(partial: torch.Tensor, bias_grad) -> torch.Tensor:
+    """The quantizers' column sums: summed over rows (``bias_grad=True``), or ``bias_grad="tiles"``: the
+    per-tile partial sums, fp32 [ceil(R / 64), C] (tile i covers rows [64 i, 64 i + 64)), e.g. for the
+    per-expert bias gradients of a mixture of experts."""
+    if bias_grad == "tiles":
+        return partial
+    if bias_grad is not True:
+        raise ValueError(f"bias_grad must be True, False or 'tiles', got {bias_grad!r}")
+    return partial.sum(0)
 
 
 def _seed_flags(row_sr_seed: Seed, col_sr_seed: Seed, rht_seed: Seed):
@@ -280,7 +292,7 @@ def gelu_backward_quantize_dual(dy: torch.Tensor, h: torch.Tensor, *, bias: torc
                                             int(col_pad), *_seed_tensors(row_sr_seed, col_sr_seed, rht_seed), bias,
                                             _exact(approximate), bool(bias_grad))
     pair = _pair(outs[:6], row, col)
-    return (*pair, outs[6].sum(0)) if bias_grad else pair
+    return (*pair, _colsums(outs[6], bias_grad)) if bias_grad else pair
 
 
 def rmsnorm_quantize_dual(x: torch.Tensor, weight: torch.Tensor, eps: float, *, row: bool = True, col: bool = True,
@@ -321,7 +333,7 @@ def swiglu_backward_quantize_dual(dy: torch.Tensor, g: torch.Tensor, u: torch.Te
                                               *_seed_tensors(row_sr_seed, col_sr_seed, rht_seed), bias_g, bias_u,
                                               bool(bias_grad))
     pair = _pair(outs[:6], row, col)
-    return (*pair, outs[6].sum(0)) if bias_grad else pair
+    return (*pair, _colsums(outs[6], bias_grad)) if bias_grad else pair
 
 
 def norm_backward(dy: torch.Tensor, x: torch.Tensor, mean: torch.Tensor | None, rstd: torch.Tensor,
@@ -383,7 +395,8 @@ def _scales_ld16(t: torch.Tensor) -> torch.Tensor:
 
 def gemm_grouped(a: NVFP4Tensor, b: NVFP4Tensor, mode: str, meta: torch.Tensor, *, group_rows: int = 0,
                  out_dtype: torch.dtype = torch.bfloat16, out: torch.Tensor | None = None,
-                 accumulate: bool = False) -> torch.Tensor:
+                 accumulate: bool = False, bias: torch.Tensor | None = None,
+                 tile_rows: torch.Tensor | None = None) -> torch.Tensor:
     """Grouped NVFP4 GEMMs on the TMA main loop (mixture of experts; K a multiple of 128).
 
     ``mode="m"`` (ragged M: forward and input gradient): A [M, K] holds the groups' rows back to back, each
@@ -396,6 +409,11 @@ def gemm_grouped(a: NVFP4Tensor, b: NVFP4Tensor, mode: str, meta: torch.Tensor, 
     k0 and length multiples of 128 (length 0: the group's output tiles get zeros, or are left unchanged with
     ``accumulate``); ``out[out_row0 + i, j] (+)= sum_{k0 <= k < k0 + length} A[i, k] B[j, k]``
     for i < A's rows. ``out`` is required; with ``accumulate`` (fp32) it is added to.
+
+    ``bias`` ([G, group_rows], mode "m", no ``out``): the groups' biases, added in the store as in ``gemm``
+    (bit-identical to ``D_bf16.to(out_dtype) + bias[g].to(out_dtype)``; as there, every row of the output is
+    then based on the bf16 product ``D_bf16``). ``tile_rows`` (int32, one per tile) limits the bias to each
+    tile's first ``tile_rows[t]`` rows, so a group's padding rows stay zero; unused tiles get no bias.
     """
     m = {"m": 1, "k": 2}[mode]
     sfa, sfb = _scales_ld16(a.scales), _scales_ld16(b.scales)
@@ -403,6 +421,14 @@ def gemm_grouped(a: NVFP4Tensor, b: NVFP4Tensor, mode: str, meta: torch.Tensor, 
         raise ValueError("A and B must have the same K")
     if out is not None and out.dtype != out_dtype:
         raise RuntimeError(f"out is {out.dtype}, out_dtype {out_dtype}")
+    if bias is not None:
+        if m != 1 or out is not None:
+            raise ValueError("bias needs mode 'm' and no `out`")
+        if out_dtype not in (torch.bfloat16, torch.float32):
+            raise ValueError(f"unsupported epilogue dtype {out_dtype}")
+        b32 = bias.reshape(-1).to(out_dtype).float().contiguous()
+        return _lib.gemm_grouped(a.data, sfa, a.gdec, b.data, sfb, b.gdec, m, meta, int(group_rows), out_dtype,
+                                 b32, tile_rows, out_dtype == torch.bfloat16)
     if out is None:
         return _lib.gemm_grouped(a.data, sfa, a.gdec, b.data, sfb, b.gdec, m, meta, int(group_rows), out_dtype)
     _lib.gemm_grouped_out(a.data, sfa, a.gdec, b.data, sfb, b.gdec, m, meta, int(group_rows), out, accumulate)

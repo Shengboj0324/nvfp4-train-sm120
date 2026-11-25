@@ -150,11 +150,11 @@ grows with the share of attention in the step (long context). Errors are those o
 forward (output ~1–3% relative to exact attention, vs ~0.2% for BF16 flash attention); validate on your
 model.
 
-### 3.4 Mixture of experts (v0.11; grouped GEMMs since v0.12; sync-free since v0.13)
+### 3.4 Mixture of experts (v0.11; grouped GEMMs since v0.12; sync-free since v0.13; biases since v0.14)
 
 ```python
 from nvfp4.moe import MoE
-moe = MoE(d=1024, d_ff=2816, n_experts=8, top_k=2, activation="swiglu")   # or "gelu_tanh", "gelu"
+moe = MoE(d=1024, d_ff=2816, n_experts=8, top_k=2, activation="swiglu")   # or "gelu_tanh", "gelu"; bias=True
 nvfp4.convert_linears(moe, fuse_wgrad_accumulation=True)   # = moe.to_nvfp4(...); the router stays BF16
 y = moe(x)                                    # x [..., d]
 loss = loss + 0.01 * moe.aux_loss             # Switch load-balancing loss (1.0 when balanced)
@@ -162,7 +162,11 @@ loss = loss + 0.01 * moe.aux_loss             # Switch load-balancing loss (1.0 
 
 - **Routing.** Dropless top-k (softmax in fp32, weights renormalized over the k choices).
 - **Parameters.** Expert weights are stacked: `w_gate`, `w_up` [E, d_ff, d] and `w_down` [E, d, d_ff]
-  (SwiGLU), or `w_fc1` [E, d_ff, d] and `w_fc2` [E, d, d_ff] (GELU). There are no expert biases.
+  (SwiGLU), or `w_fc1` [E, d_ff, d] and `w_fc2` [E, d, d_ff] (GELU). With `bias=True` every projection
+  has per-expert biases, `b_gate`, `b_up` [E, d_ff] and `b_down` [E, d] (`b_fc1`, `b_fc2`;
+  `moe.experts_biases()`), initialized like nn.Linear's. On the NVFP4 path the GEMM's store adds them, to
+  an expert's real rows only, so the padding rows stay zero and never reach a quantization block's scale;
+  their gradients come from the column sums the gradient quantizers compute anyway (no extra pass).
   `convert_linears` / `to_nvfp4` take NVFP4Linear's keywords: `wgrad_rht`, `fuse_wgrad_accumulation`,
   `cache_weight_quantization`.
 - **NVFP4 path** (DESIGN.md §4.5):
@@ -171,27 +175,36 @@ loss = loss + 0.01 * moe.aux_loss             # Switch load-balancing loss (1.0 
   - Each projection of all experts is one grouped GEMM (`ops.gemm_grouped`), and the weight gradients of
     all experts are one more.
   - The activation and its backward are fused into the quantizers, as in the dense MLPs.
-- **BF16 path** (before conversion, or under `ops.set_high_precision`): the experts run one after another.
+- **BF16 path** (before conversion, or under `ops.set_high_precision`, e.g. a BF16 tail; v0.14): the same
+  buffer and tile table, with grouped BF16 GEMMs written in Triton (`nvfp4/_bf16_grouped.py`), one launch per
+  projection and per gradient. fp32 experts (no autocast) use IEEE fp32 products. Without Triton (PyTorch's
+  native Windows wheels) the experts run one after another, reading the expert sizes on the host; set
+  `moe.bf16_impl = "loop"` to force that, `"grouped"` to require Triton (default `"auto"`).
+  (`torch._grouped_mm` would do the same job, but on sm_120 PyTorch 2.14 runs it as a loop that
+  synchronizes.)
 - **Determinism.** Dispatch and combine are gathers (no scatter-add atomics), so both paths are
   deterministic.
-- **No host sync on the NVFP4 path (v0.13).** The expert sizes stay on the GPU:
+- **No host sync (NVFP4 path since v0.13, BF16 path since v0.14).** The expert sizes stay on the GPU:
   - The token buffer has the worst-case size for the step's tokens (T k + E·127 rows, rounded up to 256),
     and its layout tables are computed on the GPU.
   - The grouped GEMMs skip the unused tail tiles and the experts that got no tokens.
   - A training step with NVFP4 MoE layers can therefore be captured in a CUDA graph. One graph serves any
     routing of the same number of tokens.
   - It also compiles with `torch.compile(fullgraph=True)`.
-  - The BF16 loop still reads the sizes once per call.
+  - Only the BF16 loop (no Triton, or `bf16_impl="loop"`) reads the sizes, once per call.
   - `moe.last_counts` reads them on demand (that read synchronizes).
 - **Compiled vs eager.** By default inductor keeps fp32 intermediates inside its fused kernels where eager
   rounds to bf16. A slightly different bf16 gradient moves an NVFP4 tensor scale, and every rounding after
   it. Compiled MoE training is then statistically the same as eager, not bit-identical. With
   `torch._inductor.config.emulate_precision_casts = True` (and `fallback_random = True` for the seeds),
-  the outputs and the expert weight gradients are bit-identical to eager (tested).
+  the outputs, the bias gradients and the NVFP4 expert weight gradients are bit-identical to eager (tested;
+  the input gradient, and on the BF16 path the weight gradients behind the activation's backward, have
+  under 1% of their elements a bf16 step or two apart).
 - **Scripts.** `experiments/train_gpt.py --moe-experts 8` trains a GPT with MoE MLPs; `bench/bench_moe.py`
   times a layer (RESULTS.md §8).
-- **Changed in 0.12:** the per-expert `experts` ModuleList and the `bias` argument are gone. To load a
-  0.11 state dict, stack its `experts.{e}.gate.weight` etc. along a new dim 0. The stacked weights are
+- **Changed in 0.12:** the per-expert `experts` ModuleList is gone (and the `bias` argument, back in 0.14
+  with stacked biases). To load a 0.11 state dict, stack its `experts.{e}.gate.weight` etc. along a new
+  dim 0 (`experts.{e}.gate.bias` into `b_gate`). The stacked weights are
   parameters, not `nn.Linear` modules, so a model-level init that matches `isinstance(m, nn.Linear)` (GPT's
   N(0, 0.02) with scaled residual projections, for example) no longer reaches them: initialize
   `moe.experts_weights()` explicitly, as `experiments/train_gpt.py` does. Left at their default (uniform,

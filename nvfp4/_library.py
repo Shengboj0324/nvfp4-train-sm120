@@ -175,9 +175,12 @@ def _gemm_out_impl(a: Tensor, sfa: Tensor, gdec_a: Tensor, b: Tensor, sfb: Tenso
 # (`group_mode`, not `mode`: auto_functionalized, which wraps the mutating op under torch.compile, has a
 # `mode` parameter of its own)
 def _gemm_grouped_impl(a: Tensor, sfa: Tensor, gdec_a: Tensor, b: Tensor, sfb: Tensor, gdec_b: Tensor,
-                       group_mode: int, meta: Tensor, group_rows: int, out_dtype: torch.dtype) -> Tensor:
+                       group_mode: int, meta: Tensor, group_rows: int, out_dtype: torch.dtype,
+                       bias: Optional[Tensor] = None, tile_rows: Optional[Tensor] = None,
+                       bias_round: bool = False) -> Tensor:
     require(a)
-    return _C.gemm_grouped(a, sfa, gdec_a, b, sfb, gdec_b, group_mode, meta, group_rows, out_dtype, None, False)
+    return _C.gemm_grouped(a, sfa, gdec_a, b, sfb, gdec_b, group_mode, meta, group_rows, out_dtype, None, False,
+                           bias, tile_rows, bias_round)
 
 
 def _gemm_grouped_out_impl(a: Tensor, sfa: Tensor, gdec_a: Tensor, b: Tensor, sfb: Tensor, gdec_b: Tensor,
@@ -325,7 +328,8 @@ def _(a, sfa, gdec_a, b, sfb, gdec_b, out, accumulate, impl, splits):
 
 
 @_gemm_grouped_op.register_fake
-def _(a, sfa, gdec_a, b, sfb, gdec_b, group_mode, meta, group_rows, out_dtype):
+def _(a, sfa, gdec_a, b, sfb, gdec_b, group_mode, meta, group_rows, out_dtype, bias=None, tile_rows=None,
+      bias_round=False):
     return a.new_empty((a.shape[0], group_rows), dtype=out_dtype)
 
 

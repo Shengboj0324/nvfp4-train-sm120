@@ -117,6 +117,35 @@ def test_unused_tiles_and_empty_segments(accumulate):
             _close(got, _ref(sl(a2), sl(b2)))
 
 
+@pytest.mark.parametrize("out_dtype", [torch.bfloat16, torch.float32])
+def test_ragged_m_bias_epilogue(out_dtype):
+    """Per-group bias in the store: bit-identical to ``D_bf16.to(out_dtype) + bias[g].to(out_dtype)`` on the
+    first tile_rows[t] rows of every used tile; the other rows (padding) and unused tiles get no bias (they
+    are ``D_bf16.to(out_dtype)``, as every row of the epilogue); tiles of one group may have different row
+    counts (0 and 128 included)."""
+    torch.manual_seed(8)
+    K, N, G, tiles = 256, 384, 3, 40
+    aq, _ = ops.quantize_dual(torch.randn(128 * tiles, K, device="cuda"), col=False)
+    bq, _ = ops.quantize_dual(torch.randn(G * N, K, device="cuda"), col=False)
+    tg = torch.tensor([(t % G) if t % 5 else -1 for t in range(tiles)], device="cuda", dtype=torch.int32)
+    rows = torch.tensor([(37 * t) % 129 for t in range(tiles)], device="cuda", dtype=torch.int32)
+    bias = torch.randn(G, N, device="cuda")
+    got = ops.gemm_grouped(aq, bq, "m", tg, group_rows=N, out_dtype=out_dtype, bias=bias, tile_rows=rows)
+    d = ops.gemm_grouped(aq, bq, "m", tg, group_rows=N)  # bf16
+    want = d.to(out_dtype).clone()
+    for t, (g, n) in enumerate(zip(tg.tolist(), rows.tolist())):
+        if g >= 0:
+            sl = slice(128 * t, 128 * t + n)
+            want[sl] = d[sl].to(out_dtype) + bias[g].to(out_dtype)
+    assert torch.equal(got, want)
+    full = ops.gemm_grouped(aq, bq, "m", tg, group_rows=N, out_dtype=out_dtype, bias=bias)  # every row
+    assert torch.equal(full[:128], d[:128].to(out_dtype))  # tile 0 is unused (-1): no bias
+    t1 = slice(128, 256)
+    assert torch.equal(full[t1], d[t1].to(out_dtype) + bias[1].to(out_dtype))
+    with pytest.raises(ValueError):
+        ops.gemm_grouped(aq, bq, "k", tg, out=torch.empty(1, device="cuda"), out_dtype=torch.float32, bias=bias)
+
+
 def test_stack_transposed_matches_per_group_transpose():
     torch.manual_seed(2)
     G, N, K = 3, 256, 384

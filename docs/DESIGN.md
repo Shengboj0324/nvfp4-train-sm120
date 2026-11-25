@@ -615,6 +615,31 @@ The MoE layer around it (`nvfp4/moe.py`):
   - With that, a step is capturable in a CUDA graph, and one graph serves any routing of the same token
     count. The layer also traces under `torch.compile(fullgraph=True)`: `gemm_grouped` is a
     `torch.library` custom op like the others.
+- **Expert biases (v0.14).** The store of a ragged-M unit adds `bias[g, col]` when the layer passes one:
+  the epilogue of the dense linear layers (v0.8, `linear_epilogue`), with the bias row taken from the tile's
+  group. A second int32 table gives each tile's real (non-padding) rows, and only those get the bias.
+  Biased padding rows would be harmless in the forward (their outputs are never gathered) but not in the
+  wgrad: the column operands are quantized in 16-token blocks and rotated by the RHT along the tokens, so
+  a nonzero padding row would share a block scale with, and be mixed into, an expert's real tokens. The
+  check costs nothing in the dense kernel (it is inside the epilogue's bias branch, taken once per tile:
+  457–463 TFLOPS at 8192³). Bias gradients are per-expert row sums of the gradients the quantizers read
+  anyway: they already write per-64-row column sums for the dense layers' biases (§3.6); here those
+  partial sums stay per tile (`bias_grad="tiles"`) and a one-hot [E, tiles] product in fp64 adds them per
+  expert. That is deterministic and reads nothing on the host. Padding rows and unused tiles carry zero
+  gradient, since nothing downstream reads their outputs. When the weights are frozen, the quantizers
+  still run for those sums.
+- **High-precision experts without host synchronization (v0.14).** Before conversion, or under
+  `ops.set_high_precision` (a BF16 tail), the experts used to run one after another, which reads the
+  expert sizes on the host. `torch._grouped_mm` would avoid that on Hopper; on sm_120 PyTorch 2.14 runs it
+  as a loop that synchronizes. So the layer has its own grouped BF16 GEMMs, written in Triton
+  (`nvfp4/_bf16_grouped.py`) because they need no FP4 machinery. They work on the same padded buffer and
+  the same tables: a ragged-M kernel (one program per 128-row tile and 128 columns; unused tiles store
+  zeros, the bias is added in fp32 with one rounding to the tile's real rows) for the forward and the input
+  gradient, and a ragged-K kernel for the weight gradients. Both have no atomics and a fixed reduction
+  order, so they are deterministic, and both are `torch.library` custom ops. On the benchmarked layers
+  they are 2–7% faster than the loop (RESULTS.md §8). The point is not speed: a model with MoE layers is now
+  CUDA-graph capturable and compiles without graph breaks in BF16 too, including the BF16 blocks of an
+  NVFP4 model and a BF16 tail. Without Triton (native Windows) the loop remains.
 
 ## 5. Verification
 
@@ -633,7 +658,7 @@ The MoE layer around it (`nvfp4/moe.py`):
 | Robustness | `tests/test_robustness_cuda.py` | NaN / ±inf anywhere → non-finite outputs (quantize, dual, fused producers, GEMM, layers, gradients); clear errors on misuse; any leading shape incl. empty; fp32/bf16/fp16 and non-contiguous inputs; bf16 weights; state dict ↔ `nn.Linear`; activation checkpointing bit-exact; `torch.compile` == eager; CUDA-graph replay == eager; concurrent streams with split-K; DDP |
 | Integration | `tests/test_integration_cuda.py` | GPU seed tensors == integer seeds bit for bit (all four quantizers); no host sync in a training step; `torch.compile(fullgraph=True)` with no graph breaks, bit-identical to eager; CUDA-graph capture of fwd+bwd (fresh seeds per replay, noise averages out) and of a full Adam step (loss falls); fused accumulation in place with hooks firing, and under `torch.autograd.grad`; outputs not views; **two-process DDP (plain and bucket views), FSDP1 (flat and `use_orig_params`) and FSDP2** over gloo, fused and unfused, bit-exact vs a single-process reference; deterministic mode + flash attention reproduces a block's gradients bit for bit |
 | 8-bit attention (v0.9) | `tests/test_attention_cuda.py` | operand quantizer **bit-exact** vs `reference.int8_token_quantize` / `mxfp8_quantize` (both layouts, σ order, scale layout, mean subtraction, padding, strided inputs, Delta); forward vs `reference.attention_8bit` (< 3%) and exact attention (< 5%); gradients vs exact attention (< 7%) for causal / full, GQA, N = 1…2048, D = 64 / 128, bf16 / fp16; backward bitwise deterministic; gradient layouts; NaN propagation; SDPA fallback; `torch.compile(fullgraph=True)` |
-| Grouped GEMMs, MoE (v0.12–v0.13) | `tests/test_grouped_gemm_cuda.py`, `tests/test_moe_cuda.py`, `tests/test_moe_integration_cuda.py` | ragged M / K vs fp64 and bit-identical to the per-group dense TMA GEMM; unused tiles and empty segments store zeros (or leave accumulated outputs unchanged) between real units; MoE vs a per-token loop, BF16 experts and a per-group fp64 GEMM; no host sync in forward + backward; CUDA-graph forward replays == eager bit for bit under changing routing; captured Adam steps learn; `torch.compile(fullgraph=True)` == eager (bit-identical with `emulate_precision_casts`); checkpointing bit-exact; **two-process DDP, FSDP1, FSDP2** bit-exact, fused and unfused |
+| Grouped GEMMs, MoE (v0.12–v0.14) | `tests/test_grouped_gemm_cuda.py`, `tests/test_moe_cuda.py`, `tests/test_moe_integration_cuda.py` | ragged M / K vs fp64 and bit-identical to the per-group dense TMA GEMM; unused tiles and empty segments store zeros (or leave accumulated outputs unchanged) between real units; per-group bias epilogue == `D_bf16 + bias[g]` bit for bit on each tile's real rows; MoE (with and without biases, NVFP4 / grouped BF16 / loop) vs a per-token loop, BF16 experts and a per-group fp64 GEMM; bias gradients == routed gradient sums, bias-only training bit-identical; grouped BF16 == loop at bf16 level, deterministic; no host sync in forward + backward; CUDA-graph forward replays == eager bit for bit under changing routing; captured Adam steps learn; `torch.compile(fullgraph=True)` == eager (bit-identical outputs, bias and NVFP4 weight gradients with `emulate_precision_casts`); checkpointing bit-exact; **two-process DDP, FSDP1, FSDP2** bit-exact, fused and unfused |
 | Memory / race safety | `tools/sanitize.sh` | compute-sanitizer memcheck, racecheck, synccheck, initcheck over every kernel variant (ragged shapes, TMA and cp.async loops, persistent grids with more units than SMs, split-K, accumulate, the bias / residual epilogue, all producer ops, multi-part inputs, the norm backward, GPU-resident seeds, layer and v0.8 block forward + backward, 8-bit attention forward + backward): 0 findings |
 | Long-run stability | `tools/soak.py` | 8 minutes (v0.7): 18,401 fused + unfused training iterations, 3,682 bit-exact gradient replays, 92,005 GEMMs re-checked bit for bit; 5 minutes (v0.8, residual-fused blocks): 14,474 iterations, 2,896 replays, 72,370 GEMMs; no non-finite values, no hang |
 | Packaging | wheel built and installed into an isolated directory | imports and trains from outside the repository |
@@ -644,6 +669,8 @@ Every benchmark checks correctness against the reference before it times anythin
 
 ## 6. Known limitations and next steps
 
+Done in v0.14: per-expert biases in the MoE layer (added in the grouped GEMM's store; §4.5) and
+grouped BF16 experts without host synchronization (Triton), so every MoE path is capturable (item 5).
 Done in v0.13: the NVFP4 MoE layer without host synchronization (CUDA-graph capturable, `torch.compile`
 without graph breaks; §4.5, item 5), and MoE under DDP / FSDP1 / FSDP2, compile and activation
 checkpointing tested.
@@ -704,9 +731,9 @@ accumulation.
    the same address within a step (the allocator's choice; correct either way).
 5. **Fused sub-blocks** cover GPT / BERT / ViT-style and Llama-style blocks, pre-norm or (via the
    norm-free MLPs) post-norm, with biases anywhere. Mixture-of-experts MLPs (`nvfp4.moe.MoE`, dropless
-   top-k; v0.11, grouped GEMMs since v0.12, sync-free since v0.13, §4.5) cover SwiGLU and GELU experts
-   without biases. Only the NVFP4 path is sync-free: the BF16 expert loop (before conversion, or during a
-   BF16 tail) still reads the expert sizes on the host.
+   top-k; v0.11, grouped GEMMs since v0.12, sync-free since v0.13, biases and a sync-free BF16 path since
+   v0.14, §4.5) cover SwiGLU and GELU experts. Not covered: capacity-limited (token-dropping) routing,
+   shared experts and expert parallelism across GPUs.
 6. **Framework coverage.** DDP, FSDP1 and FSDP2 are tested with two ranks on one GPU over gloo and
    (v0.8) with NCCL across two physical RTX 5090s, bit-identical to a single process. Data-parallel
    *speed* depends on the host: on the rented two-GPU machine all-reduce ran at 2 GB/s (no P2P), so DDP

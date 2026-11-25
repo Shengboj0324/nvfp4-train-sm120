@@ -1,4 +1,5 @@
-"""nvfp4.moe.MoE with NVFP4 experts in the training stack: no host synchronization in a forward + backward,
+"""nvfp4.moe.MoE in the training stack, with NVFP4 experts and with the grouped BF16 (Triton) experts, with
+and without expert biases: no host synchronization in a forward + backward,
 CUDA-graph capture (forward replays bit-identical to eager under changing routing; whole training steps with
 a capturable optimizer learn), torch.compile with fullgraph=True (no graph breaks; bit-identical to eager),
 activation checkpointing (bit-identical gradients), and real two-process DDP / FSDP1 / FSDP2 over gloo
@@ -19,13 +20,19 @@ from nvfp4.moe import MoE
 
 pytestmark = requires_sm120
 DEV = "cuda"
-ACTS = ["swiglu", "gelu_tanh"]
+# activation[-bias][-bf16]: NVFP4 experts unless "bf16" (the grouped high-precision path)
+VARIANTS = ["swiglu", "gelu_tanh", "swiglu-bias", "gelu_tanh-bias", "swiglu-bf16", "gelu_tanh-bias-bf16"]
+DIST_VARIANTS = ["swiglu", "gelu_tanh", "swiglu-bias", "gelu_tanh-bias-bf16"]
 
 
-def _moe(activation="swiglu", fuse=False, E=4, k=2, d=256, d_ff=256, seed=0):
+def _moe(variant="swiglu", fuse=False, E=4, k=2, d=256, d_ff=256, seed=0):
+    act, *opts = variant.split("-")
     torch.manual_seed(seed)
-    m = MoE(d, d_ff, E, top_k=k, activation=activation).to(DEV)
-    convert_linears(m, fuse_wgrad_accumulation=fuse)
+    m = MoE(d, d_ff, E, top_k=k, activation=act, bias="bias" in opts).to(DEV)
+    if "bf16" in opts:
+        m.bf16_impl = "grouped"
+    else:
+        convert_linears(m, fuse_wgrad_accumulation=fuse)
     return m
 
 
@@ -33,9 +40,9 @@ def _grads(m):
     return [p.grad.clone() for p in m.parameters()]
 
 
-@pytest.mark.parametrize("activation", ACTS)
-def test_forward_backward_has_no_host_sync(activation):
-    m = _moe(activation)
+@pytest.mark.parametrize("variant", VARIANTS)
+def test_forward_backward_has_no_host_sync(variant):
+    m = _moe(variant)
     x = torch.randn(300, 256, device=DEV, requires_grad=True)
     m(x)  # warm-up (kernel attributes, tensor-map encoder lookup)
     torch.cuda.synchronize()
@@ -58,12 +65,12 @@ def _warmup(fn, n=3):
     torch.cuda.current_stream().wait_stream(s)
 
 
-@pytest.mark.parametrize("activation", ACTS)
-def test_cuda_graph_forward_replays_match_eager_under_changing_routing(activation):
+@pytest.mark.parametrize("variant", VARIANTS)
+def test_cuda_graph_forward_replays_match_eager_under_changing_routing(variant):
     """The captured forward serves any routing of the same number of tokens: each replay reads new inputs
     (a different split over the experts, including experts without tokens) and equals eager bit for bit
     (the forward has no stochastic rounding)."""
-    m = _moe(activation, E=8)
+    m = _moe(variant, E=8)
     static_x = torch.randn(512, 256, device=DEV)
 
     def fwd():
@@ -90,9 +97,9 @@ def test_cuda_graph_forward_replays_match_eager_under_changing_routing(activatio
     assert any(0 in c for c in counts)
 
 
-@pytest.mark.parametrize("activation", ACTS)
-def test_cuda_graph_full_training_step_learns(activation):
-    m = _moe(activation, fuse=True)
+@pytest.mark.parametrize("variant", VARIANTS)
+def test_cuda_graph_full_training_step_learns(variant):
+    m = _moe(variant, fuse=True)
     opt = torch.optim.Adam(m.parameters(), lr=1e-3, capturable=True)
     torch.manual_seed(1)
     teacher = torch.nn.Linear(256, 256, bias=False).to(DEV)
@@ -122,15 +129,18 @@ def test_cuda_graph_full_training_step_learns(activation):
     assert losses[-1] < 0.5 * losses[0], (losses[0], losses[-1])
 
 
-@pytest.mark.parametrize("activation", ACTS)
-def test_compile_fullgraph_matches_eager(activation):
+@pytest.mark.parametrize("variant", VARIANTS)
+def test_compile_fullgraph_matches_eager(variant):
     """No graph breaks (fullgraph=True raises on one). With inductor drawing random numbers like eager
     (fallback_random) and rounding at every bf16 cast like eager (emulate_precision_casts: by default its fused
     kernels keep fp32 intermediates, and a slightly different bf16 gradient moves the NVFP4 tensor scale and with
-    it every rounding downstream), the output and the expert weight gradients are bit-identical to eager; the
-    load-balancing loss and the input gradient differ by fp32 summation order only (inductor's reductions)."""
+    it every rounding downstream), the output, the bias gradients and the NVFP4 expert weight gradients are
+    bit-identical to eager; the load-balancing loss differs by fp32 summation order (inductor's reductions).
+    The input gradient (and on the BF16 path the weight gradient behind the activation's backward) has a few
+    elements (under 1%) a bf16 step or two apart: inductor evaluates the activation backward and the k-way
+    sums of the dispatch in its own order, and a near-tie rounds the other way."""
     import torch._inductor.config as inductor_config
-    m = _moe(activation)
+    m = _moe(variant)
     x = torch.randn(300, 256, device=DEV)
 
     def f(mod, xg):
@@ -150,18 +160,26 @@ def test_compile_fullgraph_matches_eager(activation):
     torch._dynamo.reset()
     with inductor_config.patch(fallback_random=True, emulate_precision_casts=True):
         compiled = run(torch.compile(f, fullgraph=True, backend=COMPILE_BACKEND))
+    bf16_weights = {i + 3 for i, (n, _) in enumerate(m.named_parameters()) if not m.nvfp4 and n.startswith("w_")}
     for i, (a, b) in enumerate(zip(eager, compiled)):
-        if i in (1, 2):  # aux loss, input gradient (a few elements one bf16 step apart after a near-tie)
-            assert ((a - b).norm() / a.norm()).item() < 1e-5, i
+        if i == 1:  # aux loss
+            assert ((a - b).norm() / a.norm()).item() < 1e-6
+        elif i == 2 or i in bf16_weights:
+            d = (a - b).abs()
+            differ = d > 0
+            assert differ.float().mean().item() < 0.01, i
+            # within two bf16 steps of the gradient's typical magnitude (an element can be a small difference of
+            # larger terms, so not of its own)
+            assert d.max() <= 2 ** -6 * a.square().mean().sqrt(), i
         else:
             assert torch.equal(a, b), i
 
 
-@pytest.mark.parametrize("activation", ACTS)
-def test_activation_checkpointing_gives_identical_gradients(activation):
+@pytest.mark.parametrize("variant", VARIANTS)
+def test_activation_checkpointing_gives_identical_gradients(variant):
     """torch.utils.checkpoint recomputes the layer in the backward with the forward's RNG state, so the
     rounding seeds, the routing and therefore every gradient match the plain run bit for bit."""
-    m = _moe(activation)
+    m = _moe(variant)
     x = torch.randn(300, 256, device=DEV)
 
     def run(ckpt):
@@ -195,11 +213,11 @@ def _step(net, rank, mb, act_ctx=contextlib.nullcontext):
         net(x).backward(dy)
 
 
-def _expected(world, activation):
+def _expected(world, variant):
     """Average over ranks of each rank's locally accumulated gradient (single process, no fusion)."""
     per_rank = []
     for r in range(world):
-        m = _moe(activation)
+        m = _moe(variant)
         for mb in range(N_MB):
             _step(m, r, mb)
         per_rank.append(_grads(m))
@@ -219,59 +237,59 @@ def _count_fusions():
     return hits
 
 
-def _check_ddp(rank, world, activation):
+def _check_ddp(rank, world, variant):
     from torch.nn.parallel import DistributedDataParallel as DDP
-    expected = _expected(world, activation)
+    expected = _expected(world, variant)
     hits = _count_fusions()
     for fuse in (False, True):
         hits[0] = 0
-        m = _moe(activation, fuse)
+        m = _moe(variant, fuse)
         ddp = DDP(m)
         for _ in range(2):
             m.zero_grad(set_to_none=True)
             for mb in range(N_MB):
                 _step(ddp, rank, mb, ddp.no_sync if mb < N_MB - 1 else contextlib.nullcontext)
             for i, (a, b) in enumerate(zip(_grads(m), expected)):
-                assert torch.equal(a, b), (rank, activation, fuse, i, (a - b).abs().max().item())
-        n_w = len(m.experts_weights())
+                assert torch.equal(a, b), (rank, variant, fuse, i, (a - b).abs().max().item())
+        n_w = len(m.experts_weights()) if m.nvfp4 else 0
         assert hits[0] == (2 * (N_MB - 1) * n_w if fuse else 0), hits[0]  # x micro-batches after the first x steps
 
 
-def _check_fsdp2(rank, world, activation):
+def _check_fsdp2(rank, world, variant):
     import torch.distributed as dist
     from torch.distributed.device_mesh import DeviceMesh
     from torch.distributed.fsdp import fully_shard
     from test_integration_cuda import _fsdp2_reduction_scale, _gather_dim0
     mesh = DeviceMesh.from_group(dist.group.WORLD, "cuda")
     scale = _fsdp2_reduction_scale(mesh, world)
-    expected = [e * scale for e in _expected(world, activation)]
+    expected = [e * scale for e in _expected(world, variant)]
     for fuse in (False, True):
-        m = _moe(activation, fuse)
+        m = _moe(variant, fuse)
         fully_shard(m, mesh=mesh)  # stacked experts and the router sharded along dim 0
         for mb in range(N_MB):
             m.set_requires_gradient_sync(mb == N_MB - 1)
             _step(m, rank, mb)
         got = [_gather_dim0(p.grad.to_local()) for p in m.parameters()]
         for i, (a, b) in enumerate(zip(got, expected)):
-            assert torch.equal(a, b), (rank, activation, fuse, i, (a - b).abs().max().item())
+            assert torch.equal(a, b), (rank, variant, fuse, i, (a - b).abs().max().item())
 
 
-def _check_fsdp1(rank, world, activation):
+def _check_fsdp1(rank, world, variant):
     from torch.distributed.fsdp import FullyShardedDataParallel as FSDP
-    expected = _expected(world, activation)
-    names = [n for n, _ in _moe(activation).named_parameters()]
+    expected = _expected(world, variant)
+    names = [n for n, _ in _moe(variant).named_parameters()]
     for fuse in (False, True):
-        m = _moe(activation, fuse)
+        m = _moe(variant, fuse)
         fsdp = FSDP(m, device_id=torch.cuda.current_device(), use_orig_params=True)
         for mb in range(N_MB):
             _step(fsdp, rank, mb, fsdp.no_sync if mb < N_MB - 1 else contextlib.nullcontext)
         with FSDP.summon_full_params(fsdp, with_grads=True):
             got = {n.replace("_fsdp_wrapped_module.", ""): p.grad.clone() for n, p in fsdp.named_parameters()}
         for n, b in zip(names, expected):
-            assert torch.equal(got[n], b), (rank, activation, fuse, n, (got[n] - b).abs().max().item())
+            assert torch.equal(got[n], b), (rank, variant, fuse, n, (got[n] - b).abs().max().item())
 
 
-def _moe_dist_worker(rank, world, port, mode, activation):
+def _moe_dist_worker(rank, world, port, mode, variant):
     import datetime
 
     import torch.distributed as dist
@@ -280,21 +298,21 @@ def _moe_dist_worker(rank, world, port, mode, activation):
     torch.cuda.set_device(0)
     dist.init_process_group("gloo", rank=rank, world_size=world, timeout=datetime.timedelta(minutes=3))
     try:
-        {"ddp": _check_ddp, "fsdp1": _check_fsdp1, "fsdp2": _check_fsdp2}[mode](rank, world, activation)
+        {"ddp": _check_ddp, "fsdp1": _check_fsdp1, "fsdp2": _check_fsdp2}[mode](rank, world, variant)
     finally:
         dist.destroy_process_group()
 
 
 @pytest.mark.parametrize("mode", ["ddp", "fsdp1", "fsdp2"])
-@pytest.mark.parametrize("activation", ACTS)
-def test_two_process_data_parallel(mode, activation):
+@pytest.mark.parametrize("variant", DIST_VARIANTS)
+def test_two_process_data_parallel(mode, variant):
     import torch.distributed as dist
     import torch.multiprocessing as mp
     from test_integration_cuda import _free_port
     if not dist.is_available() or not dist.is_gloo_available():
         pytest.skip("gloo not available")
     os.environ.setdefault("OMP_NUM_THREADS", "2")
-    mp.spawn(_moe_dist_worker, args=(2, _free_port(), mode, activation), nprocs=2, join=True)
+    mp.spawn(_moe_dist_worker, args=(2, _free_port(), mode, variant), nprocs=2, join=True)
 
 
 def test_deepcopy_and_state_dict_roundtrip():

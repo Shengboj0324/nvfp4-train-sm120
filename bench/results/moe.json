@@ -6,11 +6,15 @@
   "top_k": 2,
   "activation": "swiglu",
   "tokens": 16384,
-  "bf16_ms": 31.684799194335938,
-  "nvfp4_ms": 14.737132263183595,
-  "speedup": 2.149997613408894,
-  "nvfp4_graph_ms": 14.232325744628907,
-  "speedup_graph": 2.2262559024334703
+  "bf16_ms": 31.632467651367186,
+  "bf16_grouped_ms": 30.692703247070312,
+  "bf16_grouped_graph_ms": 30.44784545898437,
+  "nvfp4_ms": 14.82552947998047,
+  "nvfp4_graph_ms": 14.27484130859375,
+  "speedup": 2.133648426795267,
+  "speedup_graph": 2.2159593208453945,
+  "speedup_vs_grouped": 2.0702601744184546,
+  "speedup_graph_vs_grouped": 2.1329726054925837
  },
  {
   "d": 2048,
@@ -19,11 +23,15 @@
   "top_k": 2,
   "activation": "swiglu",
   "tokens": 16384,
-  "bf16_ms": 110.908740234375,
-  "nvfp4_ms": 42.37252502441406,
-  "speedup": 2.6174682809313814,
-  "nvfp4_graph_ms": 41.75927734375,
-  "speedup_graph": 2.655906598225039
+  "bf16_ms": 110.69757080078124,
+  "bf16_grouped_ms": 108.44932861328124,
+  "bf16_grouped_graph_ms": 108.694140625,
+  "nvfp4_ms": 42.783111572265625,
+  "nvfp4_graph_ms": 41.74698181152343,
+  "speedup": 2.5874128068922766,
+  "speedup_graph": 2.651630513088382,
+  "speedup_vs_grouped": 2.5348630482403736,
+  "speedup_graph_vs_grouped": 2.6036406922954396
  },
  {
   "d": 2048,
@@ -32,11 +40,15 @@
   "top_k": 4,
   "activation": "swiglu",
   "tokens": 16384,
-  "bf16_ms": 77.25996704101563,
-  "nvfp4_ms": 36.4942138671875,
-  "speedup": 2.1170470289395995,
-  "nvfp4_graph_ms": 32.27487487792969,
-  "speedup_graph": 2.3938115123057466
+  "bf16_ms": 77.30033569335939,
+  "bf16_grouped_ms": 72.1335693359375,
+  "bf16_grouped_graph_ms": 71.92037963867188,
+  "nvfp4_ms": 34.93056640625,
+  "nvfp4_graph_ms": 32.435986328125,
+  "speedup": 2.212971149518157,
+  "speedup_graph": 2.383165873588153,
+  "speedup_vs_grouped": 2.065055816645186,
+  "speedup_graph_vs_grouped": 2.217302070333846
  },
  {
   "d": 768,
@@ -45,10 +57,14 @@
   "top_k": 2,
   "activation": "gelu_tanh",
   "tokens": 16384,
-  "bf16_ms": 10.784172821044923,
-  "nvfp4_ms": 6.304716873168946,
-  "speedup": 1.7104928005473563,
-  "nvfp4_graph_ms": 5.914054489135743,
-  "speedup_graph": 1.8234821543926762
+  "bf16_ms": 10.859737396240234,
+  "bf16_grouped_ms": 10.123046112060548,
+  "bf16_grouped_graph_ms": 10.168370819091797,
+  "nvfp4_ms": 6.890694427490235,
+  "nvfp4_graph_ms": 6.3066558837890625,
+  "speedup": 1.5760004322518804,
+  "speedup_graph": 1.7219486200530834,
+  "speedup_vs_grouped": 1.46908939564566,
+  "speedup_graph_vs_grouped": 1.6123237110857873
  }
 ]

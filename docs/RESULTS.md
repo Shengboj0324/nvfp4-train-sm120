@@ -510,23 +510,29 @@ on the activations of a model trained at 4096 tokens (`bench/attention_real_erro
 [0.7–2.3%], dQ 0.4–2.0% [0.3–0.6%; v0.9.0: 0.4–24%], dK 1.2–6.9% [2.8–7.1%], dV 0.2–2.1% [2.5–3.1%].
 GPT-124M (attention a small share of the step) trains at the same speed with either.
 
-## 8. Mixture of experts (v0.11–v0.13, `bench/results/moe.json`, `experiments/results/v0.12_moe/`, `…/v0.13_moe/`)
+## 8. Mixture of experts (v0.11–v0.14, `bench/results/moe.json`, `experiments/results/v0.12_moe/`, `…/v0.13_moe/`, `…/v0.14_moe/`)
 
 `nvfp4.moe.MoE` layer, one training step (forward + backward, autocast BF16, 16,384 tokens), BF16 experts
 vs the same experts converted to NVFP4 (`bench/bench_moe.py`). v0.11 ran each expert's fused MLP in turn;
 v0.12 runs each projection of all experts as one grouped GEMM (DESIGN.md §4.5), and both precisions got
-the dispatch / combine rewrite (one gather each way, no scatter-add, no per-expert slicing):
+the dispatch / combine rewrite (one gather each way, no scatter-add, no per-expert slicing). v0.14 adds
+grouped BF16 experts (Triton, on the same padded buffer), so both precisions can also be timed as CUDA
+graphs:
 
-| d | expert d_ff | experts | top-k | activation | BF16 ms | NVFP4 ms | speedup | NVFP4, CUDA graph (v0.13) | speedup v0.11 |
-|---|---|---|---|---|---|---|---|---|---|
-| 1024 | 2816 | 8 | 2 | SwiGLU | 31.7 | 14.7 | **2.15×** | 14.2 ms (2.23×) | 1.74× |
-| 2048 | 5632 | 8 | 2 | SwiGLU | 110.9 | 42.4 | **2.62×** | 41.8 ms (2.66×) | 2.15× |
-| 2048 | 1408 | 32 | 4 | SwiGLU | 77.3 | 36.5 | **2.12×** | 32.3 ms (**2.39×**) | 1.25× |
-| 768 | 1536 | 8 | 2 | GELU (tanh) | 10.8 | 6.3 | **1.71×** | 5.9 ms (1.82×) | 1.27× |
+| d | expert d_ff | experts | top-k | act. | BF16 loop | BF16 grouped (graph) | NVFP4 (graph) | speedup vs loop | vs grouped (graphs) | v0.11 |
+|---|---|---|---|---|---|---|---|---|---|---|
+| 1024 | 2816 | 8 | 2 | SwiGLU | 31.6 | 30.7 (30.4) | 14.8 (14.3) | **2.13×** | 2.07× (2.13×) | 1.74× |
+| 2048 | 5632 | 8 | 2 | SwiGLU | 110.7 | 108.4 (108.7) | 42.8 (41.7) | **2.59×** | 2.54× (2.60×) | 2.15× |
+| 2048 | 1408 | 32 | 4 | SwiGLU | 77.3 | 72.1 (71.9) | 34.9 (32.4) | **2.21×** | 2.07× (2.22×) | 1.25× |
+| 768 | 1536 | 8 | 2 | GELU (tanh) | 10.9 | 10.1 (10.2) | 6.9 (6.3) | **1.58×** | 1.47× (1.61×) | 1.27× |
 
-(v0.13 numbers; v0.12 measured 14.9 / 42.6 / 36.2 / 6.6 ms eager. The worst-case buffer of the sync-free
-layer costs nothing measurable: the unused tail tiles are zero stores. A captured step saves the launch
-and Python overhead of its 258 kernels, 3–12%, most with 32 experts.)
+(ms; v0.14 numbers. v0.13 measured 14.7 / 42.4 / 36.5 / 6.3 ms NVFP4 eager and 14.2 / 41.8 / 32.3 / 5.9
+captured. The last row is the most sensitive to the laptop's clocks: it runs after the others, and run
+alone it measures 6.33–6.42 ms eager, 5.88–5.90 captured, as in v0.13. The worst-case buffer of the
+sync-free layer costs nothing measurable: the unused tail tiles are zero stores. A captured step saves
+the launch and Python overhead of its 258 kernels, 3–12%, most with 32 experts. The grouped BF16 GEMMs
+gain 2–7% over the loop, most with 32 experts; their point is that the BF16 path no longer reads the
+expert sizes on the host.)
 
 With per-expert launches the speedup followed the per-expert GEMM size: 32 small experts (≈2,000 tokens ×
 1,408 each) ran 1,903 kernels per step and got 1.25×. Grouped, the kernel count is fixed (258) whatever
@@ -539,9 +545,13 @@ load-balancing loss 0.01; NVFP4 run with the standard recipe (last 2 blocks BF16
 
 | run | val loss (s0, s1) | gap (s0, s1) | tokens/s | peak memory |
 |---|---|---|---|---|
-| BF16 | 1.4875, 1.4844 | | 49.1k | 13.6 GB |
-| NVFP4, grouped experts (v0.12) | 1.5006, 1.4973 | **+0.88%, +0.87%** | 61.3k (+25%) | 12.7 GB |
+| BF16, expert loop (v0.12) | 1.4875, 1.4844 | | 49.1k | 13.6 GB |
+| NVFP4, grouped experts (v0.12) | 1.5006, 1.4973 | +0.88%, +0.87% | 61.3k (+25%) | 12.7 GB |
 | NVFP4, per-expert (v0.11.0, same seeds) | 1.4943¹, 1.4957 | +0.76%¹ | 53.8k (+20%) | 13.0 GB |
+| NVFP4, sync-free (v0.13) | 1.5033, 1.4965 | | | |
+| BF16, grouped Triton experts (v0.14) | 1.4761, 1.4842 | | 51.7k | 13.6 GB |
+| NVFP4 (v0.14; its 2 BF16 blocks grouped) | 1.4993, 1.5012 | +1.57%, +1.14% | 63.5k (+23%) | 12.7 GB |
+| **pooled: BF16 (4 runs) vs NVFP4 (6 runs)** | 1.4831 ± 0.0049 vs 1.4997 ± 0.0026 | **+1.12%** | | |
 
 ¹ v0.11's seed 0 started from different initial weights (its experts were `nn.Linear` modules, drawn in
 another order), against a BF16 run at 1.4830.
@@ -559,9 +569,22 @@ another order), against a BF16 run at 1.4830.
   1.4973). The rows, scales and reduction ranges are v0.12's; the wider buffer only changes the
   stochastic-rounding bits of the weight-gradient operands (their counter is column × padded rows), so the
   runs differ by rounding noise (+0.17%, −0.05%).
-- The NVFP4 gap (+0.88%) is below the dense model's +1.32% ± 0.16 but within reach of its seed range.
-  End to end, NVFP4 is +25% tokens/s (dense: +32%): routing, the gathers and the per-layer host
-  synchronization run at the same speed in both precisions.
+- **v0.14 (grouped BF16 experts).** The BF16 baseline now runs its experts as grouped Triton GEMMs, and
+  so do the NVFP4 model's two BF16 blocks. Seed 0's BF16 run ended at 1.4761, 0.77% below v0.12's 1.4875
+  with the same configuration, while seed 1 matched (1.4842 vs 1.4844). Nothing changed in the math:
+  from the same initial weights, one batch's gradients of the loop and the grouped path are equally far
+  from an fp32 computation (relative errors 7.75e-2 vs 7.71e-2 for the expert input projections,
+  6.05e-2 vs 6.02e-2 for the output projections, 3.35e-2 vs 3.34e-2 elsewhere). The two runs differ in
+  summation order only, and PyTorch's flash-attention backward is not deterministic either. The router
+  amplifies such differences: a slightly different gradient flips routing decisions, and the trajectory
+  moves as far as a different seed. Single runs of this MoE model therefore vary more than two seeds had
+  shown (BF16: ±0.33% over four runs).
+- **The NVFP4 gap, corrected.** The v0.12 runs reported +0.88%, but the BF16 baselines behind that
+  number were on the high side. Pooled over every run of this configuration (4 BF16, 6 NVFP4: different
+  seeds and code versions whose math is the same up to summation order and rounding bits), the gap is
+  **+1.12%**, close to the dense model's +1.32% ± 0.16. End to end, NVFP4 is +23% tokens/s against the
+  grouped BF16 baseline (v0.12, both with the loop in their BF16 parts: +25%; dense: +32%): routing, the
+  gathers and the combine run at the same speed in both precisions.
 
 ## Reproduce
 

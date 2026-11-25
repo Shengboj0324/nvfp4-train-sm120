@@ -1,5 +1,54 @@
 # Changelog
 
+## 0.14.0 — MoE expert biases; grouped BF16 experts without host synchronization (2026-11-25)
+
+- **Expert biases:** `MoE(..., bias=True)` gives every expert projection a per-expert bias: `b_gate`,
+  `b_up` [E, d_ff] and `b_down` [E, d], or `b_fc1`, `b_fc2` (`moe.experts_biases()`). They are
+  initialized like nn.Linear's, and work on every path.
+  - **NVFP4:** the grouped GEMM's store adds the bias, as the dense layers' epilogue does. It goes only on
+    each tile's real rows, so an expert's padding rows stay zero: in the weight gradient they share
+    16-token quantization blocks and the RHT with real tokens.
+  - **Gradients:** per-expert sums of the per-tile column sums the gradient quantizers already compute.
+    One fp64 one-hot product does the sum: deterministic, nothing read on the host.
+  - **Frozen weights:** biases alone train too.
+- **`ops.gemm_grouped(..., bias=, tile_rows=)`:** the per-group bias epilogue (mode "m"), bit-identical
+  to `D_bf16.to(out_dtype) + bias[g]` on the first `tile_rows[t]` rows of each used tile.
+  `quantize_dual`, `gelu_backward_quantize_dual` and `swiglu_backward_quantize_dual` take
+  `bias_grad="tiles"`: the per-64-row partial column sums. The dense GEMM is unchanged (457–463 TFLOPS
+  at 8192³).
+- **The high-precision experts no longer synchronize with the host.** This covers BF16 experts before
+  conversion, the BF16 blocks of an NVFP4 model, and a BF16 tail under `ops.set_high_precision`.
+  - They run on the NVFP4 path's padded buffer and GPU-side tables, with grouped Triton GEMMs
+    (`nvfp4/_bf16_grouped.py`, `torch.library` custom ops): a ragged-M kernel for the forward and input
+    gradient, a ragged-K kernel for the weight gradients.
+  - The kernels are deterministic and work in fp32 too (IEEE products).
+  - So every MoE configuration is CUDA-graph capturable and compiles with `fullgraph=True`.
+    `torch._grouped_mm` is no alternative on sm_120: PyTorch 2.14 runs it as a synchronizing loop.
+  - Speed: 2–7% faster than the per-expert loop on the benchmarked layers. NVFP4 is 1.5–2.5× the
+    grouped BF16 path.
+  - `moe.bf16_impl`: "auto" (grouped when Triton is installed), "grouped" or "loop". Without Triton
+    (native Windows) the loop remains.
+- **MoE GPT gap corrected to +1.12%** (was +0.88%):
+  - The v0.14 runs train the BF16 baseline and the NVFP4 model's two BF16 blocks with the grouped experts.
+    Seeds 0 / 1 give BF16 1.4761 / 1.4842 and NVFP4 1.4993 / 1.5012, at 51.7k / 63.5k tokens/s (+23%).
+  - BF16 seed 0 ended 0.77% below v0.12's run, with the same math: one batch's gradients from the same
+    weights are equally close to fp32 on both paths. The router turns summation-order differences into
+    seed-sized trajectory changes.
+  - Pooled over all 4 BF16 and 6 NVFP4 runs of this configuration, the gap is +1.12%. That is close to
+    the dense model's +1.32%; the reported +0.88% rested on two high BF16 baselines (RESULTS.md §8).
+- **Tested:** both paths, with and without biases:
+  - vs per-token and per-group fp64 references;
+  - bias gradients against the routed gradient sums;
+  - grouped BF16 against the loop;
+  - no host sync, CUDA graphs and compile;
+  - checkpointing;
+  - two-process DDP / FSDP1 / FSDP2, bit-identical to a single process.
+  - Compiled vs eager (with `emulate_precision_casts`): outputs, bias gradients and NVFP4 weight gradients
+    are bit-identical. The input gradient is checked by a stated bound instead of an arbitrary 1e-5 norm:
+    under 1% of elements differ, by at most two bf16 steps of the gradient's RMS.
+- 959 tests (938 pass on the laptop, 21 skip); memcheck / racecheck / synccheck / initcheck clean
+  (the driver now covers the bias epilogue and the Triton path); 5-minute soak OK.
+
 ## 0.13.0 — MoE without host synchronization: CUDA graphs, torch.compile, data parallel (2026-11-24)
 
 - **The NVFP4 MoE layer never synchronizes with the host.**

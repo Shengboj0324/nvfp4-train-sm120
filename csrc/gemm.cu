@@ -301,7 +301,8 @@ torch::Tensor nvfp4_gemm(torch::Tensor a, torch::Tensor sfa, torch::Tensor gdec_
 torch::Tensor nvfp4_gemm_grouped(torch::Tensor a, torch::Tensor sfa, torch::Tensor gdec_a, torch::Tensor b,
                                  torch::Tensor sfb, torch::Tensor gdec_b, int64_t mode, torch::Tensor meta,
                                  int64_t group_rows, c10::ScalarType out_dtype, c10::optional<torch::Tensor> out,
-                                 bool accumulate) {
+                                 bool accumulate, c10::optional<torch::Tensor> bias,
+                                 c10::optional<torch::Tensor> tile_rows, bool bias_round) {
   using namespace nvfp4::gemm;
   for (auto* t : {&a, &b})
     TORCH_CHECK(t->is_cuda() && t->scalar_type() == at::kByte && t->dim() == 2 && t->is_contiguous(),
@@ -334,7 +335,22 @@ torch::Tensor nvfp4_gemm_grouped(torch::Tensor a, torch::Tensor sfa, torch::Tens
     p.tile_group = meta.data_ptr<int>();
     p.b_group_rows = static_cast<int>(N);
     units_per = ((M + BM - 1) / BM) * (N / BN);
+    if (bias.has_value()) {
+      TORCH_CHECK(!accumulate, "bias cannot be combined with accumulate");
+      TORCH_CHECK(bias->is_cuda() && bias->scalar_type() == at::kFloat && bias->is_contiguous() &&
+                      bias->numel() == b.size(0),
+                  "bias must be a contiguous fp32 [groups, group_rows] CUDA tensor");
+      p.bias = bias->data_ptr<float>();
+      p.bias_round = bias_round ? 1 : 0;
+      if (tile_rows.has_value()) {
+        TORCH_CHECK(tile_rows->is_cuda() && tile_rows->scalar_type() == at::kInt && tile_rows->is_contiguous() &&
+                        tile_rows->numel() == meta.size(0),
+                    "tile_rows must be int32 CUDA with one entry per 128-row tile");
+        p.tile_rows = tile_rows->data_ptr<int>();
+      }
+    }
   } else {
+    TORCH_CHECK(!bias.has_value(), "bias needs mode 1 (ragged M)");
     TORCH_CHECK(mode == 2, "mode must be 1 (ragged M) or 2 (ragged K)");
     TORCH_CHECK(out.has_value(), "ragged-K grouped GEMMs need `out`");
     TORCH_CHECK(meta.dim() == 2 && meta.size(1) == 3, "meta must be [groups, 3]");

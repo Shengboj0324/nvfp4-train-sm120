@@ -145,7 +145,7 @@ y = ops.gemm_grouped(qa, qw_stacked, "m", tile_group, group_rows=N)  # per-group
 | [`nvfp4.linear`](nvfp4/linear.py) | `NVFP4Linear`, `convert_linears`, `WeightQuantCache`, `invalidate_weight_caches` |
 | [`nvfp4.fused`](nvfp4/fused.py) | `layernorm_linear`, `layernorm_mlp`, `gelu_mlp`, `rmsnorm_linear`, `rmsnorm_swiglu_mlp`, `swiglu_mlp` |
 | [`nvfp4.attention`](nvfp4/attention.py) | `attention(q, k, v, *, causal, scale, smooth_k, backward)` (falls back to SDPA outside its coverage) |
-| [`nvfp4.moe`](nvfp4/moe.py) | `MoE(d, d_ff, n_experts, top_k, activation, normalize_weights)`, `.to_nvfp4(...)`, `.aux_loss`, `.last_counts` |
+| [`nvfp4.moe`](nvfp4/moe.py) | `MoE(d, d_ff, n_experts, top_k, activation, normalize_weights, bias)`, `.to_nvfp4(...)`, `.aux_loss`, `.last_counts`, `.bf16_impl` |
 | [`nvfp4.ops`](nvfp4/ops.py) | `quantize`, `quantize_dual` (+ `layernorm_` / `rmsnorm_` / `gelu_` / `swiglu_` fused variants and backwards), `gemm`, `gemm_grouped`, `stack_transposed`, `norm_backward`, recipe switches, `available` |
 | [`nvfp4.reference`](nvfp4/reference.py) | pure-PyTorch spec: `quantize`, `quantize_dual`, `dequantize`, `apply_rht`, `e2m1_round_stochastic`, ... |
 
@@ -153,8 +153,9 @@ y = ops.gemm_grouped(qa, qw_stacked, "m", tile_group, group_rows=N)  # per-group
 
 - **Reproducibility:** for a fixed seed, results are bit-reproducible run to run, and the same in eager,
   `torch.compile(fullgraph=True)` and CUDA-graph replay.
-- **No host synchronization** in the dense layers or the NVFP4 MoE layer. Rounding seeds and expert sizes
-  live on the GPU, so training steps (MoE included) can be captured in CUDA graphs.
+- **No host synchronization** in the dense layers or the MoE layer (NVFP4 experts, and the BF16 experts'
+  grouped Triton path). Rounding seeds and expert sizes live on the GPU, so training steps (MoE included)
+  can be captured in CUDA graphs.
 - **Distributed:** DDP, FSDP1 and FSDP2 produce gradients bit-identical to a single process (MoE included).
 
 ## Performance (RTX 5090 Laptop unless noted)
@@ -169,8 +170,8 @@ benchmark checks results against the reference before timing.
 | GPT block, fwd + bwd | 1.82× (d = 768) → 2.65× (d = 2048) → 3.22× (d = 4096) vs BF16; 3.50× with the weight cache |
 | Llama block (RMSNorm, SwiGLU) | 2.09× (d = 1024) → 3.32× (d = 4096) vs BF16; up to 3.64× cached |
 | 8-bit attention | forward 1.2–1.6× FlashAttention (SDPA), fwd + bwd 1.07–1.12× at BF16 quality; forward-only up to 2.1× (`backward="8bit"`) |
-| MoE layer, fwd + bwd (grouped GEMMs) | 2.15× (d = 1024, 8 experts) → 2.62× (d = 2048, 8 experts); 2.12× with 32 small experts, 2.39× captured in a CUDA graph |
-| End to end | GPT-124M +32% tokens/s, −22% GPU energy; GPT-507M 1.62× tokens/s, −39% energy; MoE GPT (8 experts) +25% tokens/s |
+| MoE layer, fwd + bwd (grouped GEMMs) | 2.13× (d = 1024, 8 experts) → 2.59× (d = 2048, 8 experts); 2.21× with 32 small experts; against grouped BF16 experts in CUDA graphs 2.13–2.60× |
+| End to end | GPT-124M +32% tokens/s, −22% GPU energy; GPT-507M 1.62× tokens/s, −39% energy; MoE GPT (8 experts) +23% tokens/s |
 
 ## Training quality
 
@@ -184,7 +185,7 @@ the last 2 of 12 blocks in BF16. Losses are final validation loss, with gaps rel
 | GPT-124M + **BF16 tail** (last 10% of steps in BF16), 3 seeds | **+0.62%** | +27% |
 | GPT-124M + MS-EDEN + Four Over Six, 3 seeds | +1.21% | +26% |
 | GPT-124M, 8-bit attention at 4096 tokens, 2 seeds | same as BF16 attention | |
-| MoE GPT (8 experts, 294M parameters), 2 seeds | +0.88% | +25% |
+| MoE GPT (8 experts, 294M parameters), pooled over 4 BF16 / 6 NVFP4 runs | +1.12% | +23% |
 
 The 2026 recipe options (Four Over Six, MS-EDEN on wgrad and dgrad, 1×16 weights) each lower the loss by only
 0.03–0.13% (about 0.2% in the best combinations) at this scale. Switching to BF16 for the last tenth of training removes about half of the gap
@@ -240,7 +241,8 @@ nvfp4/linear.py         NVFP4Linear autograd, weight-quantization cache, convert
 nvfp4/fused.py          fused transformer sub-blocks (autograd functions)
 nvfp4/attention.py      attention() with both backwards and the SDPA fallback
 nvfp4/moe.py            MoE layer: routing, deterministic dispatch / combine, grouped NVFP4 expert MLPs
-tests/                  900 tests: bit-exact vs spec, autograd, compile / graphs, DDP / FSDP, MoE, attention
+nvfp4/_bf16_grouped.py  grouped BF16 GEMMs (Triton) for the MoE layer's high-precision path
+tests/                  959 tests: bit-exact vs spec, autograd, compile / graphs, DDP / FSDP, MoE, attention
 bench/, experiments/    benchmarks and pretraining runs, each with results/ (raw JSON / JSONL)
 tools/                  build, check, guard, sanitize, soak, WSL setup, Runpod session script
 docs/                   USAGE.md, DESIGN.md, RESULTS.md, research/ (survey of open problems, Nov 2026)
@@ -255,8 +257,9 @@ The full list is in [DESIGN.md §6](docs/DESIGN.md#6-known-limitations-and-next-
 - **8-bit attention training speedup is small:** 1.07–1.12× at BF16 quality. The exact backward runs at
   BF16 speed, and P·V needs two e4m3 terms. Coverage is causal or full masks and head dims 64 / 128;
   everything else falls back to SDPA.
-- **MoE coverage.** Experts have no biases. The BF16 expert loop (before conversion, or in the BF16 tail)
-  reads the expert sizes on the host, so only the NVFP4 path is CUDA-graph capturable.
+- **MoE coverage.** Dropless top-k routing with SwiGLU / GELU experts, with or without biases. No
+  capacity-limited routing, shared experts or expert parallelism. Without Triton (PyTorch's native Windows
+  wheels) the BF16 experts run as a loop that reads the expert sizes on the host.
 - **Stochastic rounding is software** (no `cvt.rs` on sm_120a), at about 12 extra instructions per
   element.
 - **Hardware coverage.** Tested on the RTX 5090 Laptop and the desktop RTX 5090 (two over NCCL), not yet

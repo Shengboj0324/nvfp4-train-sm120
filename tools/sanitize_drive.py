@@ -131,6 +131,14 @@ qb, _ = ops.quantize_dual(torch.randn(256, 1024, device=d), col=False)
 seg = torch.tensor([[0, 0, 0], [0, 384, 128], [384, 0, 256], [512, 512, 384], [1024, 0, 512]], device=d,
                    dtype=torch.int32)
 ops.gemm_grouped(qa, qb, "k", seg, out_dtype=torch.float32, out=torch.zeros(640, 256, device=d))
+# v0.14: per-group bias in the store, limited to each tile's real rows, next to unused tiles
+qa, _ = ops.quantize_dual(torch.randn(1024, 256, device=d), col=False)
+qb, _ = ops.quantize_dual(torch.randn(256, 256, device=d), col=False)
+tg = torch.tensor([0, -1, 1, -1, -1, 0, 1, 1], device=d, dtype=torch.int32)
+tr = torch.tensor([128, 0, 5, 0, 0, 77, 128, 0], device=d, dtype=torch.int32)
+for odt in (torch.bfloat16, torch.float32):
+    ops.gemm_grouped(qa, qb, "m", tg, group_rows=128, out_dtype=odt, bias=torch.randn(2, 128, device=d),
+                     tile_rows=tr)
 ops.set_weight_blocks("1d")
 ops.set_four_six(True)
 lw = NVFP4Linear(128, 256, bias=False).to(d)
@@ -142,9 +150,11 @@ layernorm_mlp(xg, ln, fc1, fc2).float().mean().backward()
 ops.set_high_precision(False)
 from nvfp4 import convert_linears  # noqa: E402
 from nvfp4.moe import MoE  # noqa: E402
-for act in ("swiglu", "gelu_tanh"):
-    moe = MoE(128, 256, 4, top_k=2, activation=act).to(d)
-    convert_linears(moe)
+for act, bias, fp4 in (("swiglu", False, True), ("gelu_tanh", False, True), ("swiglu", True, True),
+                       ("gelu_tanh", True, True), ("swiglu", True, False)):  # (fp4=False: the Triton BF16 path)
+    moe = MoE(128, 256, 4, top_k=2, activation=act, bias=bias).to(d)
+    if fp4:
+        convert_linears(moe)
     xm = torch.randn(150, 128, device=d, requires_grad=True)
     with torch.autocast("cuda", dtype=torch.bfloat16):
         ym = moe(xm)

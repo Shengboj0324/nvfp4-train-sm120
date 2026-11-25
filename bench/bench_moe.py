@@ -1,5 +1,6 @@
-"""Training-step time (forward + backward) of an nvfp4.moe.MoE layer, BF16 experts vs NVFP4 experts (fused
-MLPs, fused wgrad accumulation), eager and captured in a CUDA graph, for a few expert configurations.
+"""Training-step time (forward + backward) of an nvfp4.moe.MoE layer for a few expert configurations: BF16
+experts one after another (the loop) and as grouped Triton GEMMs, vs NVFP4 experts (fused MLPs, fused wgrad
+accumulation); the grouped paths also captured in a CUDA graph.
 
     python bench/bench_moe.py [--out bench/results/moe.json]
 """
@@ -39,7 +40,7 @@ def step_ms(moe, x):
 
 
 def graph_step_ms(moe, x):
-    """The same step captured once in a CUDA graph and replayed (NVFP4 experts only: the BF16 loop reads
+    """The same step captured once in a CUDA graph and replayed (grouped paths only: the BF16 loop reads
     the expert sizes on the host). A fresh copy of the layer and input: autograd's gradient-accumulation
     nodes created by eager steps on the default stream must not leak into the capture."""
     moe = copy.deepcopy(moe)
@@ -70,15 +71,21 @@ def main():
     for d, d_ff, E, k, act, T in CONFIGS:
         torch.manual_seed(0)
         bf16 = MoE(d, d_ff, E, top_k=k, activation=act).cuda()
+        bf16.bf16_impl = "loop"
+        grouped = copy.deepcopy(bf16)
+        grouped.bf16_impl = "grouped"
         fp4 = copy.deepcopy(bf16)
         convert_linears(fp4, fuse_wgrad_accumulation=True)
         x = torch.randn(T, d, device="cuda", requires_grad=True)
-        tb, tf, tg = step_ms(bf16, x), step_ms(fp4, x), graph_step_ms(fp4, x)
+        tb, tbg, tbgg = step_ms(bf16, x), step_ms(grouped, x), graph_step_ms(grouped, x)
+        tf, tg = step_ms(fp4, x), graph_step_ms(fp4, x)
         r = {"d": d, "d_ff": d_ff, "experts": E, "top_k": k, "activation": act, "tokens": T,
-             "bf16_ms": tb, "nvfp4_ms": tf, "speedup": tb / tf, "nvfp4_graph_ms": tg, "speedup_graph": tb / tg}
+             "bf16_ms": tb, "bf16_grouped_ms": tbg, "bf16_grouped_graph_ms": tbgg,
+             "nvfp4_ms": tf, "nvfp4_graph_ms": tg, "speedup": tb / tf, "speedup_graph": tb / tg,
+             "speedup_vs_grouped": tbg / tf, "speedup_graph_vs_grouped": tbgg / tg}
         rows.append(r)
         print(json.dumps({k_: round(v, 3) if isinstance(v, float) else v for k_, v in r.items()}), flush=True)
-        del bf16, fp4, x
+        del bf16, grouped, fp4, x
         torch.cuda.empty_cache()
     os.makedirs(os.path.dirname(os.path.abspath(a.out)), exist_ok=True)
     json.dump(rows, open(a.out, "w"), indent=1)
