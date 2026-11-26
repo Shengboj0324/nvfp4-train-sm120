@@ -732,9 +732,13 @@ The MoE layer around it (`nvfp4/moe.py`):
     sub-groups (created once per (group, L), shared by all layers). Running both over the whole group's
     communicator instead, with zero-size splits to the other ranks, was tried and measured 3x slower on the
     four-GPU host (284 vs 96 ms per step; its 4-rank all-to-alls are slow even when half the pairs send
-    nothing). With chunks the two sub-groups' collectives are in flight at the same time next to the
-    persistent GEMMs; on the final measurement that was 2.4x slower than unchunked (233 vs 96 ms; an earlier
-    run with the unfused combine had it 8% faster), so `ep_chunks` stays at 1 with nodes. Tested with four
+    nothing). With chunks the two sub-groups' collectives were in flight at the same time next to the
+    persistent GEMMs, 2.4x slower than unchunked in v0.17 (233 vs 96 ms; an earlier run with the unfused
+    combine had it 8% faster). v0.18 issues every exchange from one side stream that waits for each
+    collective's end before the next (`ep_serial`, "auto" with nodes and chunks; the compute stream still
+    waits only through each exchange's work): chunks 2 are then 14–16% faster than none (RESULTS.md §8.8).
+    The side stream's wait releases the process group's references to the buffers, so they are recorded on
+    that stream (without it the compute stream reused a buffer NCCL was still reading: out-of-range ids). Tested with four
     processes as two nodes of two on one GPU (gloo) and over NCCL on four GPUs against the single-process
     layer. No multi-node machine was available; it was timed on one host whose GPUs sit in pairs behind
     separate PCIe host bridges, the pairs as nodes (RESULTS.md §8.2).
@@ -808,6 +812,7 @@ The MoE layer around it (`nvfp4/moe.py`):
 | 8-bit attention (v0.9) | `tests/test_attention_cuda.py` | operand quantizer **bit-exact** vs `reference.int8_token_quantize` / `mxfp8_quantize` (both layouts, σ order, scale layout, mean subtraction, padding, strided inputs, Delta); forward vs `reference.attention_8bit` (< 3%) and exact attention (< 5%); gradients vs exact attention (< 7%) for causal / full, GQA, N = 1…2048, D = 64 / 128, bf16 / fp16; backward bitwise deterministic; gradient layouts; NaN propagation; SDPA fallback; `torch.compile(fullgraph=True)` |
 | Grouped GEMMs, MoE (v0.12–v0.15) | `tests/test_grouped_gemm_cuda.py`, `tests/test_moe_cuda.py`, `tests/test_moe_integration_cuda.py` | ragged M / K vs fp64 and bit-identical to the per-group dense TMA GEMM; unused tiles and empty segments store zeros (or leave accumulated outputs unchanged) between real units; per-group bias epilogue == `D_bf16 + bias[g]` bit for bit on each tile's real rows; MoE (with and without biases, NVFP4 / grouped BF16 / loop) vs a per-token loop, BF16 experts and a per-group fp64 GEMM; bias gradients == routed gradient sums, bias-only training bit-identical; grouped BF16 == loop at bf16 level, deterministic; no host sync in forward + backward; CUDA-graph forward replays == eager bit for bit under changing routing; captured Adam steps learn; `torch.compile(fullgraph=True)` == eager (bit-identical outputs, bias and NVFP4 weight gradients with `emulate_precision_casts`); checkpointing bit-exact; **two-process DDP, FSDP1, FSDP2** bit-exact, fused and unfused; capacity and the shared expert vs a per-token reference (dropped-slot counts exact; a capacity no slot reaches == dropless bit for bit); **two-rank expert parallelism** == the single-process layer per rank (fp32), local expert gradients == the sum over ranks |
 | Expert parallelism, wire, combine (v0.17) | `tests/test_moe_ep_cuda.py` | dequantize **bit-exact** vs `reference.dequantize` (bf16 / fp32, strided message rows, per-row tensor scales); `amax_floor` == quantizing with an extra row at the floor (plain and multi-part paths); NVFP4 message round trip reproduces codes and scales (also with Four Over Six); the router's (row, member) pairs, ids, masks and positions on a worked example; persistent GEMMs bit-identical with an SM margin; **two- and four-process expert parallelism** (flat and two nodes of two; dropless and capacity; 1–7 chunks) == the single-process layer in fp32, every gradient; NVFP4: forward and input gradient with NVFP4 messages **bit-identical** to bf16 messages (also through the node stage), weight gradients and NVFP4 gradient messages by cosine; the same over NCCL on 2 / 4 GPUs; DDP + expert parallelism == one process on both batches (every gradient); fused combine == fp32 reference **bit for bit** (bf16 / fp16 / fp32, vector and scalar paths, strided rows), its gradients == autograd, the layer == the bmm path |
+| Dynamic tiles, MXFP8 returns, serialized exchanges (v0.18) | `tests/test_gemm_dynamic_cuda.py`, `tests/test_moe_ep_cuda.py` | dynamic tile claiming **bit-identical** to the fixed assignment (dense bf16 / fp32, split-K, accumulate, bias + residual; grouped with runs of 40 unused tiles, longer than the claim ring; ragged K with an empty group) under SM margins (1, 12, 75, 82 CTAs), beside a kernel holding SMs, on two streams at once, and under CUDA graph capture (fixed assignment); `ep_dynamic_tiles` bit-identical, on only inside the layer's forward and backward; MXFP8 encode / decode **bit-exact** vs a PyTorch reference (bf16 / fp32, strided wide messages; scales, codes), stochastic rounding unbiased; MXFP8 returns vs bf16 (cosine, 2 / 4 processes, nodes); serialized exchanges == the single-process layer; the same over NCCL on 2 / 4 GPUs |
 | Memory / race safety | `tools/sanitize.sh` | compute-sanitizer memcheck, racecheck, synccheck, initcheck over every kernel variant (ragged shapes, TMA and cp.async loops, persistent grids with more units than SMs, split-K, accumulate, the bias / residual epilogue, all producer ops, multi-part inputs, the norm backward, GPU-resident seeds, layer and v0.8 block forward + backward, 8-bit attention forward + backward): 0 findings |
 | Long-run stability | `tools/soak.py` | 8 minutes (v0.7): 18,401 fused + unfused training iterations, 3,682 bit-exact gradient replays, 92,005 GEMMs re-checked bit for bit; 5 minutes (v0.8, residual-fused blocks): 14,474 iterations, 2,896 replays, 72,370 GEMMs; no non-finite values, no hang |
 | Packaging | wheel built and installed into an isolated directory | imports and trains from outside the repository |
@@ -818,6 +823,12 @@ Every benchmark checks correctness against the reference before it times anythin
 
 ## 6. Known limitations and next steps
 
+Done in v0.18: the three open items of v0.17's expert parallelism. Chunks with nodes were slower because
+the rail and node collectives of different chunks ran concurrently: exchanges are now issued from one
+stream, one after another (`ep_serial`; chunks then 14–16% faster with nodes). The GEMMs' 1.7x slowdown
+beside NCCL was SM residency of the fixed tile assignment: dynamic tile claiming (§4.2; 1.04–1.08x beside the
+all-to-all). The return direction travels as MXFP8 (`ep_wire_return`), +0.26% loss (noise). Layer B on four
+RTX PRO 4500: 67.2 ms, from v0.17's 96.1 (RESULTS.md §8.5–8.8).
 Done in v0.17: expert parallelism with each token sent once per rank (or node, two-stage), chunked
 exchanges overlapping the experts, NVFP4 messages, an SM margin for the persistent GEMMs, expert parallelism
 under DDP, a fused gather / combine for every MoE path (§4.5, item 5); measured on four RTX PRO 4500
@@ -893,11 +904,10 @@ accumulation.
    v0.14, capacity, shared expert and expert parallelism since v0.15, §4.5) cover SwiGLU and GELU experts.
    Expert parallelism (fixed-size or variable-size exchanges, nodes, chunks, NVFP4 messages; v0.15–v0.17)
    is verified with two and four gloo processes on one GPU and over NCCL on two RTX 5090s and four RTX PRO
-   4500 (RESULTS.md §8.1–8.2). Not timed: a real multi-node cluster (the two-stage exchanges ran over pairs
-   of GPUs behind separate PCIe host bridges of one host). Chunks overlap the exchange, but on that host the
-   expert GEMMs run ~1.7x slower while NCCL copies run beside them (memory contention), and an SM margin does
-   not change that; on fast links chunking costs a few percent. The combine direction (expert outputs,
-   input gradients) always travels in bf16.
+   4500 (RESULTS.md §8.1–8.2, §8.7–8.8). Not timed: a real multi-node cluster (the two-stage exchanges ran
+   over pairs of GPUs behind separate PCIe host bridges of one host). On fast links chunking does not pay
+   (the exchange is short); the GEMMs claim their tiles at run time beside the transfers (v0.18; the fixed
+   assignment ran them 1.7–2.2x slower), and the return direction can travel as MXFP8.
 6. **Framework coverage.** DDP, FSDP1 and FSDP2 are tested with two ranks on one GPU over gloo and
    (v0.8) with NCCL across two physical RTX 5090s, bit-identical to a single process. Data-parallel
    *speed* depends on the host: on the rented two-GPU machine all-reduce ran at 2 GB/s (no P2P), so DDP

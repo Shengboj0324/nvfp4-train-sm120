@@ -1,0 +1,100 @@
+W1126 19:48:48.374000 5479 torch/distributed/run.py:851] 
+W1126 19:48:48.374000 5479 torch/distributed/run.py:851] *****************************************
+W1126 19:48:48.374000 5479 torch/distributed/run.py:851] Setting OMP_NUM_THREADS environment variable for each process to be 1 in default, to avoid your system being overloaded, please further tune the variable for optimal performance in your application as needed. 
+W1126 19:48:48.374000 5479 torch/distributed/run.py:851] *****************************************
+/workspace/venv/lib/python3.10/site-packages/torch/profiler/profiler.py:224: UserWarning: Warning: Profiler clears events at the end of each cycle.Only events from the current cycle will be reported.To keep events across cycles, set acc_events=True.
+  _warn_once(
+{"a2a_ms": 9.972, "a2a_GiB_s_per_gpu": 3.134, "nvfp4_alone_ms": 0.429, "bf16_alone_ms": 1.121, "bf16_beside_ms": 1.127, "nvfp4_alone_margin0_ms": 0.428, "nvfp4_beside_margin0_ms": 0.506, "nvfp4_alone_margin8_ms": 0.457, "nvfp4_beside_margin8_ms": 0.466, "nvfp4_alone_margin16_ms": 0.49, "nvfp4_beside_margin16_ms": 0.506, "nvfp4_alone_margin24_ms": 0.536, "nvfp4_beside_margin24_ms": 0.578, "nvfp4_alone_margin32_ms": 0.623, "nvfp4_beside_margin32_ms": 0.651, "nvfp4_alone_margin48_ms": 0.866, "nvfp4_beside_margin48_ms": 0.903, "nvfp4_dyn_alone_margin0_ms": 0.459, "nvfp4_dyn_beside_margin0_ms": 0.466, "nvfp4_dyn_alone_margin8_ms": 0.483, "nvfp4_dyn_beside_margin8_ms": 0.49, "nccl_grid": [[2, 1, 1]], "sms": 82, "env": {"NCCL_VERSION": "2.25.1-1"}}
+nvfp4 GEMM 16384x2816x2048: alone 0.429 ms; beside the all-to-all margin 0: 1.18x, margin 8: 1.09x, margin 16: 1.18x, margin 24: 1.35x, margin 32: 1.52x, margin 48: 2.10x; dynamic tiles margin 0: 1.09x, margin 8: 1.14x; bf16 cuBLAS 1.01x; NCCL grid [[2, 1, 1]]
+/workspace/venv/lib/python3.10/site-packages/torch/profiler/profiler.py:224: UserWarning: Warning: Profiler clears events at the end of each cycle.Only events from the current cycle will be reported.To keep events across cycles, set acc_events=True.
+  _warn_once(
+[rank0]:[E1126 19:58:53.799769256 ProcessGroupNCCL.cpp:689] [Rank 0] Watchdog caught collective operation timeout: WorkNCCL(SeqNum=40, OpType=ALLREDUCE, NumelIn=1, NumelOut=1, Timeout(ms)=600000) ran for 600071 milliseconds before timing out.
+[rank0]:[E1126 19:58:53.800089688 ProcessGroupNCCL.cpp:2303] [PG ID 0 PG GUID 0(default_pg) Rank 0]  failure detected by watchdog at work sequence id: 40 PG status: last enqueued work: 40, last completed work: 39
+[rank0]:[E1126 19:58:53.800845091 ProcessGroupNCCL.cpp:733] Stack trace of the failed collective: 
+#0 barrier from /workspace/venv/lib/python3.10/site-packages/torch/distributed/distributed_c10d.py:5030
+#1 wrapper from /workspace/venv/lib/python3.10/site-packages/torch/distributed/c10d_logger.py:83
+#2 main from /workspace/nvfp4-train-sm120/bench/bench_overlap.py:116
+#3 <module> from /workspace/nvfp4-train-sm120/bench/bench_overlap.py:121
+
+[rank0]:[E1126 19:58:53.801099872 ProcessGroupNCCL.cpp:2636] [PG ID 0 PG GUID 0(default_pg) Rank 0] First PG on this rank to signal dumping.
+[rank0]:[E1126 19:58:54.435601669 ProcessGroupNCCL.cpp:1914] [PG ID 0 PG GUID 0(default_pg) Rank 0] Received a dump signal due to a collective timeout from this local rank and we will try our best to dump the debug info. Last enqueued NCCL work: 40, last completed NCCL work: 39.This is most likely caused by incorrect usages of collectives, e.g., wrong sizes used across ranks, the order of collectives is not same for all ranks or the scheduled collective, for some reason, didn't run. Additionally, this can be caused by GIL deadlock or other reasons such as network errors or bugs in the communications library (e.g. NCCL), etc. 
+[rank0]:[E1126 19:58:54.436319358 ProcessGroupNCCL.cpp:1628] [PG ID 0 PG GUID 0(default_pg) Rank 0] ProcessGroupNCCL preparing to dump debug info. Include stack trace: 1, only active collectives: 0
+[rank1]:[E1126 19:58:54.446954787 ProcessGroupNCCL.cpp:1849] [PG ID 0 PG GUID 0(default_pg) Rank 1] Observed flight recorder dump signal from another rank via TCPStore.
+[rank1]:[E1126 19:58:54.448941631 ProcessGroupNCCL.cpp:1914] [PG ID 0 PG GUID 0(default_pg) Rank 1] Received a dump signal due to a collective timeout from  rank 0 and we will try our best to dump the debug info. Last enqueued NCCL work: 40, last completed NCCL work: 39.This is most likely caused by incorrect usages of collectives, e.g., wrong sizes used across ranks, the order of collectives is not same for all ranks or the scheduled collective, for some reason, didn't run. Additionally, this can be caused by GIL deadlock or other reasons such as network errors or bugs in the communications library (e.g. NCCL), etc. 
+[rank1]:[E1126 19:58:54.449949301 ProcessGroupNCCL.cpp:1628] [PG ID 0 PG GUID 0(default_pg) Rank 1] ProcessGroupNCCL preparing to dump debug info. Include stack trace: 1, only active collectives: 0
+[rank1]:[E1126 19:58:54.691890916 ProcessGroupNCCL.cpp:689] [Rank 1] Watchdog caught collective operation timeout: WorkNCCL(SeqNum=40, OpType=ALLTOALL_BASE, NumelIn=33554432, NumelOut=33554432, Timeout(ms)=600000) ran for 600039 milliseconds before timing out.
+[rank1]:[E1126 19:58:54.692366116 ProcessGroupNCCL.cpp:2303] [PG ID 0 PG GUID 0(default_pg) Rank 1]  failure detected by watchdog at work sequence id: 40 PG status: last enqueued work: 40, last completed work: 39
+[rank1]:[E1126 19:58:54.693242205 ProcessGroupNCCL.cpp:733] Stack trace of the failed collective: 
+#0 all_to_all_single from /workspace/venv/lib/python3.10/site-packages/torch/distributed/distributed_c10d.py:4829
+#1 wrapper from /workspace/venv/lib/python3.10/site-packages/torch/distributed/c10d_logger.py:83
+#2 main from /workspace/nvfp4-train-sm120/bench/bench_overlap.py:93
+#3 <module> from /workspace/nvfp4-train-sm120/bench/bench_overlap.py:121
+
+[rank0]:[E1126 19:59:54.316298543 ProcessGroupNCCL.cpp:750] [Rank 0] Some NCCL operations have failed or timed out. Due to the asynchronous nature of CUDA kernels, subsequent GPU operations might run on corrupted/incomplete data.
+[rank0]:[E1126 19:59:54.316408613 ProcessGroupNCCL.cpp:764] [Rank 0] To avoid data inconsistency, we are taking the entire process down.
+[rank0]:[E1126 19:59:54.318361934 ProcessGroupNCCL.cpp:2119] [PG ID 0 PG GUID 0(default_pg) Rank 0] Process group watchdog thread terminated with exception: [Rank 0] Watchdog caught collective operation timeout: WorkNCCL(SeqNum=40, OpType=ALLREDUCE, NumelIn=1, NumelOut=1, Timeout(ms)=600000) ran for 600071 milliseconds before timing out.
+Exception raised from checkTimeout at /pytorch/torch/csrc/distributed/c10d/ProcessGroupNCCL.cpp:692 (most recent call first):
+frame #0: c10::Error::Error(c10::SourceLocation, std::__cxx11::basic_string<char, std::char_traits<char>, std::allocator<char> >) + 0x9d (0x76169e57205d in /workspace/venv/lib/python3.10/site-packages/torch/lib/libc10.so)
+frame #1: c10d::ProcessGroupNCCL::WorkNCCL::checkTimeout(std::optional<std::chrono::duration<long, std::ratio<1l, 1000l> > >) + 0x2a7 (0x76158ad97d87 in /workspace/venv/lib/python3.10/site-packages/torch/lib/libtorch_cuda.so)
+frame #2: c10d::ProcessGroupNCCL::Watchdog::runLoop() + 0x17b1 (0x76158ad9d1a1 in /workspace/venv/lib/python3.10/site-packages/torch/lib/libtorch_cuda.so)
+frame #3: c10d::ProcessGroupNCCL::Watchdog::run() + 0x157 (0x76158ad9e597 in /workspace/venv/lib/python3.10/site-packages/torch/lib/libtorch_cuda.so)
+frame #4: <unknown function> + 0xdc253 (0x76165eeb0253 in /lib/x86_64-linux-gnu/libstdc++.so.6)
+frame #5: <unknown function> + 0x94ac3 (0x76169f2e4ac3 in /lib/x86_64-linux-gnu/libc.so.6)
+frame #6: clone + 0x44 (0x76169f375a04 in /lib/x86_64-linux-gnu/libc.so.6)
+
+terminate called after throwing an instance of 'c10::DistBackendError'
+  what():  [PG ID 0 PG GUID 0(default_pg) Rank 0] Process group watchdog thread terminated with exception: [Rank 0] Watchdog caught collective operation timeout: WorkNCCL(SeqNum=40, OpType=ALLREDUCE, NumelIn=1, NumelOut=1, Timeout(ms)=600000) ran for 600071 milliseconds before timing out.
+Exception raised from checkTimeout at /pytorch/torch/csrc/distributed/c10d/ProcessGroupNCCL.cpp:692 (most recent call first):
+frame #0: c10::Error::Error(c10::SourceLocation, std::__cxx11::basic_string<char, std::char_traits<char>, std::allocator<char> >) + 0x9d (0x76169e57205d in /workspace/venv/lib/python3.10/site-packages/torch/lib/libc10.so)
+frame #1: c10d::ProcessGroupNCCL::WorkNCCL::checkTimeout(std::optional<std::chrono::duration<long, std::ratio<1l, 1000l> > >) + 0x2a7 (0x76158ad97d87 in /workspace/venv/lib/python3.10/site-packages/torch/lib/libtorch_cuda.so)
+frame #2: c10d::ProcessGroupNCCL::Watchdog::runLoop() + 0x17b1 (0x76158ad9d1a1 in /workspace/venv/lib/python3.10/site-packages/torch/lib/libtorch_cuda.so)
+frame #3: c10d::ProcessGroupNCCL::Watchdog::run() + 0x157 (0x76158ad9e597 in /workspace/venv/lib/python3.10/site-packages/torch/lib/libtorch_cuda.so)
+frame #4: <unknown function> + 0xdc253 (0x76165eeb0253 in /lib/x86_64-linux-gnu/libstdc++.so.6)
+frame #5: <unknown function> + 0x94ac3 (0x76169f2e4ac3 in /lib/x86_64-linux-gnu/libc.so.6)
+frame #6: clone + 0x44 (0x76169f375a04 in /lib/x86_64-linux-gnu/libc.so.6)
+
+Exception raised from run at /pytorch/torch/csrc/distributed/c10d/ProcessGroupNCCL.cpp:2125 (most recent call first):
+frame #0: c10::Error::Error(c10::SourceLocation, std::__cxx11::basic_string<char, std::char_traits<char>, std::allocator<char> >) + 0x9d (0x76169e57205d in /workspace/venv/lib/python3.10/site-packages/torch/lib/libc10.so)
+frame #1: <unknown function> + 0x9b5d75 (0x76158a5fed75 in /workspace/venv/lib/python3.10/site-packages/torch/lib/libtorch_cuda.so)
+frame #2: <unknown function> + 0xdc253 (0x76165eeb0253 in /lib/x86_64-linux-gnu/libstdc++.so.6)
+frame #3: <unknown function> + 0x94ac3 (0x76169f2e4ac3 in /lib/x86_64-linux-gnu/libc.so.6)
+frame #4: clone + 0x44 (0x76169f375a04 in /lib/x86_64-linux-gnu/libc.so.6)
+
+W1126 19:59:54.705000 5479 torch/distributed/elastic/multiprocessing/api.py:1012] Sending process 5554 closing signal SIGTERM
+E1126 19:59:54.972000 5479 torch/distributed/elastic/multiprocessing/api.py:986] failed (exitcode: -6) local_rank: 0 (pid: 5553) of binary: /workspace/venv/bin/python3
+Traceback (most recent call last):
+  File "/workspace/venv/bin/torchrun", line 8, in <module>
+    sys.exit(main())
+  File "/workspace/venv/lib/python3.10/site-packages/torch/distributed/elastic/multiprocessing/errors/__init__.py", line 362, in wrapper
+    return f(*args, **kwargs)
+  File "/workspace/venv/lib/python3.10/site-packages/torch/distributed/run.py", line 990, in main
+    run(args)
+  File "/workspace/venv/lib/python3.10/site-packages/torch/distributed/run.py", line 981, in run
+    elastic_launch(
+  File "/workspace/venv/lib/python3.10/site-packages/torch/distributed/launcher/api.py", line 170, in __call__
+    return launch_agent(self._config, self._entrypoint, list(args))
+  File "/workspace/venv/lib/python3.10/site-packages/torch/distributed/launcher/api.py", line 317, in launch_agent
+    raise ChildFailedError(
+torch.distributed.elastic.multiprocessing.errors.ChildFailedError: 
+======================================================
+bench/bench_overlap.py FAILED
+------------------------------------------------------
+Failures:
+[1]:
+  time      : 2026-11-26_19:59:54
+  host      : 8f39e7723ac5
+  rank      : 1 (local_rank: 1)
+  exitcode  : -15 (pid: 5554)
+  error_file: <N/A>
+  traceback : Signal 15 (SIGTERM) received by PID 5554
+------------------------------------------------------
+Root Cause (first observed failure):
+[0]:
+  time      : 2026-11-26_19:59:54
+  host      : 8f39e7723ac5
+  rank      : 0 (local_rank: 0)
+  exitcode  : -6 (pid: 5553)
+  error_file: <N/A>
+  traceback : Signal 6 (SIGABRT) received by PID 5553
+======================================================
+[guard] elapsed 670s | peak GPU temp 43C, power 84W, GPU mem 2532MB | min host mem avail 105067MB | cooldown 0s

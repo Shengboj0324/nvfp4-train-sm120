@@ -1,0 +1,21 @@
+{
+ "sms": 82,
+ "shape": [
+  16384,
+  2816,
+  2048
+ ],
+ "device": "NVIDIA RTX PRO 4500 Blackwell",
+ "static_alone_ms": 0.4282815933227539,
+ "static_held1_ms": 0.4267536163330078,
+ "static_held2_ms": 0.7517183780670166,
+ "static_held4_ms": 0.7515135765075683,
+ "static_held8_ms": 0.7463935852050781,
+ "static_held16_ms": 0.7345151901245117,
+ "dynamic_alone_ms": 0.4461696147918701,
+ "dynamic_held1_ms": 0.4322832107543945,
+ "dynamic_held2_ms": 0.43934879302978513,
+ "dynamic_held4_ms": 0.44620962142944337,
+ "dynamic_held8_ms": 0.4613647937774658,
+ "dynamic_held16_ms": 0.4942336082458496
+}

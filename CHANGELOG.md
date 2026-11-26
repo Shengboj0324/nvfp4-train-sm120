@@ -1,5 +1,34 @@
 # Changelog
 
+## 0.18.0 — Expert parallelism: chunks with nodes, GEMMs beside NCCL, MXFP8 return messages (2026-11-26)
+
+- **Chunks with nodes fixed** (`moe.ep_serial`, "auto": on with `ep_node_size` > 1 and `ep_chunks` > 1):
+  v0.17's regression (2.4× slower with chunks) came from the rail and node collectives of different chunks
+  running concurrently. Exchanges are now issued from one side stream, each after the previous one ends; on
+  four RTX PRO 4500 with nodes of two, chunks 2 are 14–16% faster than none (layer B 80.4 vs 95.4 ms; v0.17:
+  230). The side stream records its buffers (the process group's references are dropped at its wait; a
+  first version let the compute stream reuse a buffer NCCL was reading).
+- **Dynamic tile claiming in the persistent GEMMs** (`ops.set_dynamic_tiles`, `NVFP4_GEMM_DYNAMIC=1`;
+  `moe.ep_dynamic_tiles`, "auto": on around the layer's forward and backward with chunks or an overlapped
+  shared expert): v0.17's "GEMMs 1.7× slower beside the transfers" was SM residency, not memory
+  contention: CTAs that could not start while NCCL held SMs ran their whole fixed share as a second wave
+  (1.75× for 2–16 held SMs, `bench/bench_residency.py`; 2.07–2.22× beside the four-GPU all-to-all). CTAs now
+  start on one tile and claim the next from a per-stream counter: 0.98–1.11× held, 1.04–1.08× beside the
+  all-to-all. Bit-identical results; graphs being captured keep the fixed assignment; off by default (costs
+  0–6% alone).
+- **MXFP8 return messages** (`moe.ep_wire_return = "fp8"`, `train_gpt.py --moe-ep-wire-return`): expert
+  outputs and the input gradients sent back travel as e4m3 with a power-of-two scale per 32 values (1.94×
+  fewer bytes than bf16; gradients stochastically rounded). Loss over two seeds +0.26% (within noise); with
+  nodes, the NVFP4 dispatch and chunks, layer B on four GPUs takes 67.2 ms (v0.17: 96.1; data parallelism:
+  195.1). Kernels in `csrc/moe_combine.cu` (`nvfp4._library.mxfp8_encode` / `mxfp8_decode`, 750–800 GB/s).
+- **Benchmarks:** `bench/bench_overlap.py` (a GEMM beside a real all-to-all: margins, dynamic tiles,
+  `NCCL_MAX_NCHANNELS`), `bench/bench_residency.py`, new variants in `bench_moe_ep.py` /
+  `profile_moe_ep.py` (`--node-size`, `--only`); `tools/pod_session.sh` `overlap` phase.
+- **Measured** on 1, 2 and 4 RTX PRO 4500 Blackwell (RESULTS.md §8.5–8.8); MoE tests over NCCL pass on two
+  and four GPUs; sanitizers cover the new kernels (racecheck skips the claim ring, whose spin it cannot
+  run); 5-minute soak passes.
+- Test spawns retry when the chosen port is taken (EADDRINUSE).
+
 ## 0.17.0 — MoE: variable-size, node-aware, chunked expert parallelism with NVFP4 messages; fused combine; RTX PRO 4500 (2026-11-26)
 
 - **Each token once per rank** (`ep_dispatch="variable"`, the default without a capacity): a token goes once

@@ -185,8 +185,8 @@ loss = loss + 0.01 * moe.aux_loss             # Switch load-balancing loss (1.0 
     node once per node, to the rank with the sender's position there, which forwards it within its node
     and sums the node's rows on the way back: two-stage exchanges for clusters (or hosts) whose links
     between groups of GPUs are slower than within them. Every rank of the default group must construct
-    the layers (the rail and node sub-groups are created collectively, once per (group, L)). Keep
-    `ep_chunks = 1` with nodes (RESULTS.md §8.2).
+    the layers (the rail and node sub-groups are created collectively, once per (group, L)). Nodes and
+    chunks combine since v0.18 (`ep_serial`; RESULTS.md §8.8).
   - `moe.ep_chunks = n` (v0.17): the tokens go in n chunks, the next chunk's rows travelling while this
     chunk's experts run. It pays when the exchange dominates (RESULTS.md §8.2); on fast links it costs a
     few percent. `nvfp4.ops.set_sm_margin(k)` leaves k SMs free in the persistent GEMMs for the transfers.
@@ -200,7 +200,9 @@ loss = loss + 0.01 * moe.aux_loss             # Switch load-balancing loss (1.0 
     power-of-two scale per 32 values, 1.94x fewer bytes than bf16 (outputs rounded to nearest, gradients
     stochastically). Any experts; loss effect in RESULTS.md §8.5 (+0.26%, within seed noise).
   - `moe.ep_serial` (v0.18; "auto": on with nodes and chunks): every exchange is issued from one side
-    stream, one at a time, so the rail and node collectives of different chunks never run concurrently.
+    stream, one at a time, so the rail and node collectives of different chunks never run concurrently
+    (concurrent ones made chunks with nodes 2.7x slower; serialized, chunks 2 is 14% faster than none on
+    four RTX PRO 4500, RESULTS.md §8.8).
   - `moe.ep_dynamic_tiles` (v0.18; "auto": on with chunks or an overlapped shared expert): the layer's
     NVFP4 GEMMs, forward and backward, claim their tiles at run time (`nvfp4.ops.set_dynamic_tiles`), so
     that SMs held by NCCL's kernels do not leave a second wave of tiles behind (the GEMMs ran 1.7x slower
