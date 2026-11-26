@@ -417,6 +417,11 @@ def _a2a(x: torch.Tensor, send, recv, group, async_op: bool, serial: bool = Fals
     with torch.cuda.stream(s):
         work = dist.all_to_all_single(out, x, recv, send, group=group, async_op=True)
         work.wait()  # the next serialized collective starts after this one ends
+    # That wait drops the process group's own references to the buffers, and only s waits for the transfer:
+    # without these, a buffer freed on the compute stream could be reused there while NCCL still reads
+    # (or writes) it (a corrupted payload: out-of-range ids in the first measurement).
+    x.record_stream(s)
+    out.record_stream(s)
     if not async_op:
         work.wait()
     return out, work

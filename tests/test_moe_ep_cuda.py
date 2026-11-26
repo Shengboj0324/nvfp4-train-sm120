@@ -309,7 +309,13 @@ def _spawn(world, configs, backend="gloo"):
     if not dist.is_available() or not (dist.is_gloo_available() if backend == "gloo" else dist.is_nccl_available()):
         pytest.skip(f"{backend} not available")
     os.environ.setdefault("OMP_NUM_THREADS", "2")
-    mp.spawn(_worker, args=(world, _free_port(), configs, backend), nprocs=world, join=True)
+    for attempt in range(3):  # the free port can be taken before rank 0 listens on it
+        try:
+            mp.spawn(_worker, args=(world, _free_port(), configs, backend), nprocs=world, join=True)
+            return
+        except mp.ProcessRaisedException as e:
+            if "EADDRINUSE" not in str(e) or attempt == 2:
+                raise
 
 
 def test_variable_ep_two_ranks():
