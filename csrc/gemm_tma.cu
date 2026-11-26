@@ -24,9 +24,14 @@
 
 #include <algorithm>
 #include <atomic>
+#include <cstdlib>
 #include <cstring>
+#include <map>
+#include <mutex>
 #include <stdexcept>
 #include <string>
+#include <utility>
+#include <vector>
 
 #include <c10/cuda/CUDAException.h>
 
@@ -37,6 +42,11 @@ namespace gemm {
 // SMs the persistent kernels leave free (ops.set_sm_margin): communication kernels running at the same time
 // (expert-parallel all-to-alls) then find SMs instead of waiting for, or delaying, a GEMM that holds them all.
 static std::atomic<int> g_sm_margin{0};
+// Dynamic tile claiming in the persistent kernels (ops.set_dynamic_tiles; NVFP4_GEMM_DYNAMIC=1 starts it on).
+static std::atomic<bool> g_dynamic_tiles{[] {
+  const char* e = std::getenv("NVFP4_GEMM_DYNAMIC");
+  return e != nullptr && std::string(e) == "1";
+}()};
 
 namespace tma {
 
@@ -63,7 +73,13 @@ constexpr int BAR_BASE = SCALE_BASE + 2 * QUAD_BYTES;    // full[STAGES], empty[
 // in kernels that take the address of a __grid_constant__ tensor map.
 constexpr int THREADS = MMA_THREADS;
 constexpr int CNT_OFF = BAR_BASE + (2 * STAGES + 2) * 8 + 16;  // unsigned[STAGES]: stage releases so far
-constexpr int SMEM_BYTES = CNT_OFF + 64 + 1024 /*alignment slack*/;
+// Dynamic tile claiming (Args::sched): the CTA's claimed work units, a ring of RING slots {seq tag, unit}
+// after one int (the next sequence number to claim). The load cursors run ahead of the consumers by at most
+// STAGES + 2 * QUAD k-tiles, and every claimed unit has at least one k-tile, so RING slots never overrun.
+constexpr int RING = 32;
+static_assert(RING > STAGES + 2 * QUAD + 2, "claim ring");
+constexpr int SCHED_OFF = CNT_OFF + 64;
+constexpr int SMEM_BYTES = SCHED_OFF + 16 + 8 * RING + 1024 /*alignment slack*/;
 static_assert(SMEM_BYTES <= 101376, "sm_120 allows at most 99 KB of dynamic shared memory per block");
 
 __device__ __forceinline__ void mbar_init(uint32_t bar, uint32_t count) {
@@ -192,7 +208,39 @@ __device__ __forceinline__ int quads_of(int nk) { return (nk + QUAD - 1) / QUAD;
 
 struct Grid {
   int tiles_n, tiles, total;
+  // dynamic tile claiming (Args::sched): shared memory, [0] the next sequence number to claim, then per ring
+  // slot s {tag, unit} at [4 + 2 s]: the CTA's n-th claimed unit sits in slot n % RING with tag n. Null: static.
+  int* ring;
 };
+
+// The unit of sequence number n among this CTA's units under dynamic claiming. The first thread to need it
+// claims it (n == 0: unit blockIdx.x; then the next unit of the global claim counter) and publishes it in the
+// ring; the others read it there. Units without k-tiles (unused tiles of grouped GEMMs) are skipped: the
+// consumers store their zero tiles after the claimed units. Returns >= total when no unit is left. (Measured
+// alternatives: a non-inlined call cost the main loop register spills, 8-16%; thread 0 claiming one unit
+// ahead and publishing at its next refill was slower than this, 7-14%; this costs 0-6% alone.)
+template <bool G>
+__device__ __forceinline__ int claimed_unit(const Args& p, const Grid& gd, int n) {
+  volatile int* r = gd.ring;
+  const int s = 4 + 2 * (n % RING);
+  if (r[s] != n) {
+    if (atomicCAS(gd.ring, n, n + 1) == n) {
+      int u = n == 0 ? static_cast<int>(blockIdx.x) : static_cast<int>(gridDim.x) + atomicAdd(p.sched, 1);
+      if constexpr (G) {
+        while (u < gd.total && unit_of<G>(p, u, gd.tiles_n, gd.tiles).nk == 0)
+          u = static_cast<int>(gridDim.x) + atomicAdd(p.sched, 1);
+      }
+      r[s + 1] = u;
+      __threadfence_block();
+      r[s] = n;
+      return u;
+    }
+    while (r[s] != n) {
+    }
+  }
+  __threadfence_block();
+  return r[s + 1];
+}
 
 // The load cursors: the next k-tile and the next scale quad to load (unit, index within the unit, and the
 // unit decoded once per unit, not per load), and their sequence numbers in the CTA's ring (sequence n goes
@@ -200,9 +248,9 @@ struct Grid {
 // warp (lane 0) keeps its own copy and advances it at the same points; whichever warp issues a load, all
 // copies agree (no shared cursor state).
 struct Producer {
-  int du, dk, dseq;  // data
+  int du, dk, dseq, dn;  // data (dn: the unit's sequence number among the CTA's units, dynamic claiming)
   Unit dw;
-  int qu, qq, qseq;  // scales
+  int qu, qq, qseq, qn;  // scales
   Unit qw;
 };
 
@@ -218,13 +266,29 @@ __device__ __forceinline__ void skip_empty(int& u, Unit& w, const Args& p, const
   }
 }
 
+// The next unit of a cursor: u + gridDim.x (static; skipping units without k-tiles), or the next claimed one.
+template <bool G>
+__device__ __forceinline__ void next_unit(int& u, int& n, Unit& w, const Args& p, const Grid& gd) {
+  if (gd.ring != nullptr) {
+    u = claimed_unit<G>(p, gd, ++n);
+    if (u < gd.total) w = unit_of<G>(p, u, gd.tiles_n, gd.tiles);
+  } else {
+    u += gridDim.x;
+    if (u < gd.total) w = unit_of<G>(p, u, gd.tiles_n, gd.tiles);
+    skip_empty<G>(u, w, p, gd);
+  }
+}
+
 template <bool G>
 __device__ __forceinline__ void producer_init(Producer& pr, const Args& p, const Grid& gd) {
-  pr.du = pr.qu = blockIdx.x;
   pr.dk = pr.dseq = pr.qq = pr.qseq = 0;
-  pr.dw = pr.qw = unit_of<G>(p, blockIdx.x, gd.tiles_n, gd.tiles);
-  skip_empty<G>(pr.du, pr.dw, p, gd);
-  skip_empty<G>(pr.qu, pr.qw, p, gd);
+  pr.dn = pr.qn = 0;
+  pr.du = pr.qu = gd.ring != nullptr ? claimed_unit<G>(p, gd, 0) : static_cast<int>(blockIdx.x);
+  if (pr.du < gd.total) pr.dw = pr.qw = unit_of<G>(p, pr.du, gd.tiles_n, gd.tiles);
+  if (gd.ring == nullptr) {
+    skip_empty<G>(pr.du, pr.dw, p, gd);
+    skip_empty<G>(pr.qu, pr.qw, p, gd);
+  }
 }
 
 // Load the next k-tile (if any; only if `issue`) into data stage dseq % STAGES and advance the cursor.
@@ -243,9 +307,7 @@ __device__ __forceinline__ void issue_next_stage(Producer& pr, const Args& p, co
   ++pr.dseq;
   if (++pr.dk == w.nk) {
     pr.dk = 0;
-    pr.du += gridDim.x;
-    if (pr.du < gd.total) pr.dw = unit_of<G>(p, pr.du, gd.tiles_n, gd.tiles);
-    skip_empty<G>(pr.du, pr.dw, p, gd);
+    next_unit<G>(pr.du, pr.dn, pr.dw, p, gd);
   }
 }
 
@@ -266,9 +328,7 @@ __device__ __forceinline__ void issue_next_quad(Producer& pr, const Args& p, con
   ++pr.qseq;
   if (++pr.qq == quads_of(w.nk)) {
     pr.qq = 0;
-    pr.qu += gridDim.x;
-    if (pr.qu < gd.total) pr.qw = unit_of<G>(p, pr.qu, gd.tiles_n, gd.tiles);
-    skip_empty<G>(pr.qu, pr.qw, p, gd);
+    next_unit<G>(pr.qu, pr.qn, pr.qw, p, gd);
   }
 }
 
@@ -486,9 +546,7 @@ __global__ void __launch_bounds__(THREADS, 1)
   const int warp = threadIdx.x >> 5, lane = threadIdx.x & 31;
   unsigned* cnt = reinterpret_cast<unsigned*>(smem + CNT_OFF);
   static_assert(STAGES * sizeof(unsigned) <= 64, "shared pipeline state");
-  // every warp's lane 0 keeps the load cursors; thread 0 also issues the prologue loads
-  Producer pr;
-  producer_init<G>(pr, p, gd);
+  gd.ring = p.sched != nullptr ? reinterpret_cast<int*>(smem + SCHED_OFF) : nullptr;
   if (threadIdx.x == 0) {
     for (int s = 0; s < STAGES; ++s) {
       mbar_init(full_bar(bars, s), 1);
@@ -497,8 +555,16 @@ __global__ void __launch_bounds__(THREADS, 1)
     for (int q = 0; q < 2; ++q) mbar_init(sfull_bar(bars, q), 1);
     asm volatile("fence.mbarrier_init.release.cluster;\n" ::: "memory");
     for (int s = 0; s < STAGES; ++s) cnt[s] = 0;
+    if (gd.ring != nullptr) {
+      gd.ring[0] = 0;
+      for (int s = 0; s < RING; ++s) gd.ring[4 + 2 * s] = -1;
+    }
   }
-  {
+  if (gd.ring != nullptr) __syncthreads();  // the ring is initialized before the first claim
+  // every warp's lane 0 keeps the load cursors; thread 0 also issues the prologue loads
+  Producer pr;
+  producer_init<G>(pr, p, gd);
+  if (lane == 0) {  // the warps' cursor copies (lane 0 keeps them); thread 0 issues
     const bool issue = threadIdx.x == 0;
     for (int q = 0; q < 2; ++q) issue_next_quad<G>(pr, p, gd, base, bars, mp, issue);
     for (int s = 0; s < STAGES; ++s) issue_next_stage<G>(pr, p, gd, base, bars, mp, issue);
@@ -524,7 +590,10 @@ __global__ void __launch_bounds__(THREADS, 1)
   }
 
   Pos ps{0, 0, 0, 0};
-  for (int u = blockIdx.x; u < gd.total; u += gridDim.x) {
+  const bool dyn = gd.ring != nullptr;
+  int n = 0;
+  for (int u = dyn ? claimed_unit<G>(p, gd, 0) : static_cast<int>(blockIdx.x); u < gd.total;
+       u = dyn ? claimed_unit<G>(p, gd, ++n) : u + static_cast<int>(gridDim.x)) {
     const Unit w = unit_of<G>(p, u, gd.tiles_n, gd.tiles);
     ps.nk = w.nk;
     ps.half = G ? w.half : 0;
@@ -546,6 +615,27 @@ __global__ void __launch_bounds__(THREADS, 1)
     ps.g0 += w.nk;
     ps.q0 += quads_of(w.nk);
     finish_tile<OutT, kAccum>(p, acc, w.m0, w.n0, wm, wn, lane, flag, w.z, w.tile);
+  }
+  if (!dyn) return;
+  if constexpr (G) {  // the units without k-tiles, which no claim returns: zero tiles, statically spread
+    for (int u = blockIdx.x; u < gd.total; u += gridDim.x) {
+      const Unit w = unit_of<G>(p, u, gd.tiles_n, gd.tiles);
+      if (w.nk != 0) continue;
+      float acc[MI][NI][4];
+#pragma unroll
+      for (int i = 0; i < MI; ++i)
+#pragma unroll
+        for (int j = 0; j < NI; ++j)
+#pragma unroll
+          for (int r = 0; r < 4; ++r) acc[i][j][r] = 0.0f;
+      finish_tile<OutT, kAccum>(p, acc, w.m0, w.n0, wm, wn, lane, flag, w.z, w.tile);
+    }
+  }
+  // This CTA claims nothing more (its last claim returned >= total). The last CTA to exit resets the
+  // counters for the next launch on this stream (stream order makes the stores visible to it).
+  if (threadIdx.x == 0 && atomicAdd(p.sched + 1, 1) == static_cast<int>(gridDim.x) - 1) {
+    p.sched[0] = 0;
+    p.sched[1] = 0;
   }
 }
 
@@ -575,6 +665,45 @@ bool make_map(CUtensorMap* map, const void* ptr, int64_t rows, int64_t cols, int
                      CU_TENSOR_MAP_FLOAT_OOB_FILL_NONE) == CUDA_SUCCESS;
 }
 
+// The claim counters of dynamic tile claiming (Args::sched) for launches on `stream`, or null (static
+// assignment: switched off, or the stream is being captured into a CUDA graph). One pair per stream: launches
+// on one stream run one after another, and each resets its pair on exit; concurrent streams get their own.
+int* sched_counters(int dev, cudaStream_t stream) {
+  if (!g_dynamic_tiles.load(std::memory_order_relaxed)) return nullptr;
+  cudaStreamCaptureStatus st = cudaStreamCaptureStatusNone;
+  if (cudaStreamIsCapturing(stream, &st) != cudaSuccess || st != cudaStreamCaptureStatusNone) {
+    (void)cudaGetLastError();
+    return nullptr;
+  }
+  constexpr int CHUNK = 256;  // pairs per allocation
+  static std::mutex mu;
+  static std::map<std::pair<int, cudaStream_t>, int*> slots;
+  static std::vector<std::pair<int, int*>> chunks;  // device, next free pair of its newest chunk
+  static std::vector<int> used;
+  std::lock_guard<std::mutex> lock(mu);
+  const auto key = std::make_pair(dev, stream);
+  const auto it = slots.find(key);
+  if (it != slots.end()) return it->second;
+  int idx = -1;
+  for (size_t i = 0; i < chunks.size(); ++i)
+    if (chunks[i].first == dev && used[i] < CHUNK) idx = static_cast<int>(i);
+  if (idx < 0) {
+    int* buf = nullptr;
+    // one-time setup outside any capture (checked above): zeroed, and complete before any kernel uses it
+    if (cudaMalloc(&buf, CHUNK * 2 * sizeof(int)) != cudaSuccess || cudaMemset(buf, 0, CHUNK * 2 * sizeof(int)) !=
+        cudaSuccess || cudaDeviceSynchronize() != cudaSuccess) {
+      (void)cudaGetLastError();
+      return nullptr;
+    }
+    chunks.emplace_back(dev, buf);
+    used.push_back(0);
+    idx = static_cast<int>(chunks.size()) - 1;
+  }
+  int* c = chunks[idx].second + 2 * used[idx]++;
+  slots.emplace(key, c);
+  return c;
+}
+
 template <typename OutT, bool kAccum, bool G = false>
 void launch(const Args& p, const CUtensorMap (&maps)[4], dim3 grid, cudaStream_t stream) {
   static std::atomic<uint64_t> configured{0};
@@ -590,7 +719,9 @@ void launch(const Args& p, const CUtensorMap (&maps)[4], dim3 grid, cudaStream_t
   C10_CUDA_CHECK(cudaDeviceGetAttribute(&sms, cudaDevAttrMultiProcessorCount, dev));
   sms = std::max(1, sms - g_sm_margin.load(std::memory_order_relaxed));
   const dim3 pgrid(std::max(1, std::min(units, sms)));
-  nvfp4_gemm_tma_kernel<OutT, kAccum, G><<<pgrid, THREADS, SMEM_BYTES, stream>>>(p, prm[0], prm[1], prm[2], prm[3]);
+  Args q = p;
+  q.sched = static_cast<int>(pgrid.x) < units ? sched_counters(dev, stream) : nullptr;
+  nvfp4_gemm_tma_kernel<OutT, kAccum, G><<<pgrid, THREADS, SMEM_BYTES, stream>>>(q, prm[0], prm[1], prm[2], prm[3]);
 }
 
 }  // namespace tma
@@ -598,6 +729,8 @@ void launch(const Args& p, const CUtensorMap (&maps)[4], dim3 grid, cudaStream_t
 int tma_k_tile() { return tma::BK; }
 void set_sm_margin(int64_t n) { g_sm_margin.store(static_cast<int>(std::max<int64_t>(0, n))); }
 int64_t sm_margin() { return g_sm_margin.load(); }
+void set_dynamic_tiles(bool on) { g_dynamic_tiles.store(on); }
+bool dynamic_tiles() { return g_dynamic_tiles.load(); }
 
 // Grouped GEMMs (Args::group_mode 1 / 2): A has a_map_rows rows, B b_map_rows; scale rows have stride p.sf_ld
 // bytes (a multiple of 16, >= K / 16). Launches `units` persistent CTAs at most. Returns false (nothing

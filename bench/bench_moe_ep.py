@@ -92,7 +92,8 @@ def main():
             variants += [("ep dropless", {}, {}), ("ep dropless chunks 2", {}, {"ep_chunks": 2}),
                          ("ep dropless chunks 4", {}, {"ep_chunks": 4}),
                          ("ep dropless chunks 2 margin 8", {}, {"ep_chunks": 2, **m8}),
-                         ("ep dropless chunks 4 margin 8", {}, {"ep_chunks": 4, **m8})]
+                         ("ep dropless chunks 4 margin 8", {}, {"ep_chunks": 4, **m8}),
+                         ("ep dropless chunks 2 dynamic", {}, {"ep_chunks": 2, "dynamic": True})]
             if prec == "nvfp4":
                 variants += [("ep wire nvfp4", {}, {"ep_wire": "nvfp4"}),
                              ("ep wire nvfp4 chunks 2", {}, {"ep_wire": "nvfp4", "ep_chunks": 2}),
@@ -111,6 +112,8 @@ def main():
                              (f"ep nodes {L} chunks 2", {"ep_node_size": L}, {"ep_chunks": 2, "ep_serial": False}),
                              (f"ep nodes {L} chunks 2 serial", {"ep_node_size": L}, {"ep_chunks": 2, "ep_serial": True}),
                              (f"ep nodes {L} chunks 4 serial", {"ep_node_size": L}, {"ep_chunks": 4, "ep_serial": True}),
+                             (f"ep nodes {L} chunks 2 serial dynamic", {"ep_node_size": L},
+                              {"ep_chunks": 2, "ep_serial": True, "dynamic": True}),
                              (f"ep nodes {L} fp8 return", {"ep_node_size": L}, {"ep_wire_return": "fp8"})]
                 if prec == "nvfp4":
                     variants += [(f"ep nodes {L} wire nvfp4", {"ep_node_size": L}, {"ep_wire": "nvfp4"}),
@@ -120,10 +123,12 @@ def main():
                 m = make(ep_group=dist.group.WORLD, **ctor)
                 attrs = dict(attrs)
                 ops.set_sm_margin(attrs.pop("margin", 0))
+                ops.set_dynamic_tiles(attrs.pop("dynamic", False))  # GEMMs claim tiles at run time
                 for k_, v_ in attrs.items():
                     setattr(m, k_, v_)
                 res[name] = step_ms(m, x)
                 ops.set_sm_margin(0)
+                ops.set_dynamic_tiles(False)
                 if m.last_ep_rows is not None:
                     sent[name] = list(m.last_ep_rows)
                 del m

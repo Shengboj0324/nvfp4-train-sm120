@@ -733,6 +733,25 @@ NVFP4 is now 1.61–2.70× the grouped BF16 experts on the laptop (was 1.47–2.
 49.2 ms in the profile (compute stream busy 62.5 → 40.0 ms), since it also replaces the partial sums and
 the dispatch's backward. On the RTX PRO 4500 the layer is 1.45–2.02× grouped BF16.
 
+### 8.5 MXFP8 return messages: the loss (v0.18, `experiments/results/v0.18_ep_return/`)
+
+The same MoE GPT and protocol as §8.3 (`experiments/run_ep_return.sh`), with the return direction (expert
+outputs going back, and the input gradients of the dispatch's backward) in bf16 or in MXFP8
+(`ep_wire_return="fp8"`: e4m3 codes with one power-of-two scale per 32 values, round-to-nearest for the
+outputs and stochastic rounding for the gradients):
+
+| return messages | seed 0 | seed 1 | mean | vs bf16 |
+|---|---|---|---|---|
+| bf16 | 1.4940 | 1.5023 | 1.4982 | – |
+| MXFP8 (`ep_wire_return="fp8"`) | 1.5022 | 1.5020 | 1.5021 | +0.26% |
+
+The difference is below the seed spread of the bf16 runs (0.55%) and of single MoE GPT runs (±0.33%), like
+the NVFP4 gradient messages of §8.3. MXFP8 keeps 3 mantissa bits per value against NVFP4's 1, so it was
+chosen over NVFP4 for these messages: the experts' outputs are summed after the trip (NVFP4's error would
+not be re-quantized away as for the dispatched activations), and a 1.94× smaller message than bf16 (264
+bytes per 256 values) is what the return direction needs, not 3.5×. One process adds the encode / decode
+without the transfer they save: 929 vs 886 s for 3000 steps.
+
 ## 9. RTX PRO 4500 Blackwell (v0.17, `experiments/results/v0.17_ep_4xpro4500/nvfp4_results2/`)
 
 The first sm_120 part besides the RTX 5090s: 82 SMs (the 5090 Laptop also has 82, at a 175 W limit), 200 W,

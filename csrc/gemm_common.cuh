@@ -72,6 +72,11 @@ struct Args {
   // Mode 1 with `bias` ([groups, N] fp32): tile t of group g >= 0 adds bias[g, col] to its first tile_rows[t]
   // rows (all BM rows if tile_rows is null); the other rows (an expert's padding) and unused tiles get none.
   const int* tile_rows;
+  // TMA kernel only: {claims, exits}, zero on entry and on exit (the last CTA to exit resets them), or null.
+  // Set: CTA c starts on unit c and then claims units gridDim.x, gridDim.x + 1, ... from claims as it needs
+  // them, so CTAs that start late (SMs held by other kernels, e.g. NCCL's) find the work already taken
+  // instead of running their fixed share after everyone else. Null: CTA c runs units c, c + gridDim.x, ...
+  int* sched;
 };
 
 __device__ __forceinline__ float bf16_round(float v) { return __bfloat162float(__float2bfloat16_rn(v)); }

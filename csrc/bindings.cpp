@@ -69,7 +69,8 @@ torch::Tensor nvfp4_gemm(torch::Tensor a, torch::Tensor sfa, torch::Tensor gdec_
                          c10::optional<torch::Tensor> residual, bool bias_round);
 
 void nvfp4_set_four_six(bool on);
-namespace nvfp4 { namespace gemm { void set_sm_margin(int64_t n); int64_t sm_margin(); } }
+namespace nvfp4 { namespace gemm { void set_sm_margin(int64_t n); int64_t sm_margin(); void set_dynamic_tiles(bool on);
+bool dynamic_tiles(); } }
 bool nvfp4_four_six();
 void nvfp4_set_ms_eden(bool on);
 bool nvfp4_ms_eden();
@@ -174,6 +175,9 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
   m.def("four_six", &nvfp4_four_six, "Whether Four Over Six block scales are enabled");
   m.def("set_sm_margin", &nvfp4::gemm::set_sm_margin, "SMs the persistent GEMMs leave free", py::arg("n"));
   m.def("sm_margin", &nvfp4::gemm::sm_margin, "SMs the persistent GEMMs leave free");
+  m.def("set_dynamic_tiles", &nvfp4::gemm::set_dynamic_tiles, "persistent GEMMs claim tiles at run time",
+        py::arg("on"));
+  m.def("dynamic_tiles", &nvfp4::gemm::dynamic_tiles, "persistent GEMMs claim tiles at run time");
   m.def("set_ms_eden", &nvfp4_set_ms_eden,
         "Enable / disable MS-EDEN (64-point RHT, EDEN-corrected scales instead of element SR) on wgrad operands",
         py::arg("on"));

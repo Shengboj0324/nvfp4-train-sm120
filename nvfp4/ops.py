@@ -66,6 +66,23 @@ def sm_margin() -> int:
     return int(_C.sm_margin()) if _C is not None else 0
 
 
+def set_dynamic_tiles(on: bool) -> None:
+    """Whether the persistent NVFP4 GEMMs (TMA kernel, dense and grouped) claim their tiles at run time
+    (default off; ``NVFP4_GEMM_DYNAMIC=1`` starts it on). Each CTA starts on one tile and then takes the next
+    unclaimed one from a counter, so CTAs that start late (SMs held by a kernel on another stream, such as
+    NCCL's all-to-alls) find the work already done instead of running a fixed share of the tiles after
+    everyone else. Off: CTA c runs tiles c, c + grid, ... Results are identical either way (each tile is
+    computed by one CTA in the same order). Launches being captured into CUDA graphs always use the fixed
+    assignment. Read at launch. Alone it costs 0-6% (the claims; RTX 5090 Laptop GPU)."""
+    if _C is not None:
+        _C.set_dynamic_tiles(bool(on))
+
+
+def dynamic_tiles() -> bool:
+    """Whether the persistent GEMMs claim tiles at run time (``set_dynamic_tiles``)."""
+    return bool(_C.dynamic_tiles()) if _C is not None else False
+
+
 _WEIGHT_BLOCKS = ["2d"]
 
 

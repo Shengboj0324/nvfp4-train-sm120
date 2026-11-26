@@ -230,6 +230,9 @@ do_overlap() {
       echo "$tag: $(grep 'nvfp4 GEMM' "$OUT/overlap_$tag.log")"
     done
   done
+  # one GPU: the GEMM while a spin kernel holds k SMs (fixed vs dynamic tile assignment), no NCCL
+  CUDA_VISIBLE_DEVICES=0 python tools/guard.py --log "$OUT/residency.csv" -- python bench/bench_residency.py     --out "$OUT/residency.json" > "$OUT/residency.log" 2>&1 || st=1
+  grep -E "^(static|dynamic)" "$OUT/residency.log"
   return $st
 }
 
