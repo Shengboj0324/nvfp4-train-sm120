@@ -1,0 +1,121 @@
+W1126 17:14:47.144000 6575 torch/distributed/run.py:851] 
+W1126 17:14:47.144000 6575 torch/distributed/run.py:851] *****************************************
+W1126 17:14:47.144000 6575 torch/distributed/run.py:851] Setting OMP_NUM_THREADS environment variable for each process to be 1 in default, to avoid your system being overloaded, please further tune the variable for optimal performance in your application as needed. 
+W1126 17:14:47.144000 6575 torch/distributed/run.py:851] *****************************************
+/workspace/venv/lib/python3.10/site-packages/torch/profiler/profiler.py:224: UserWarning: Warning: Profiler clears events at the end of each cycle.Only events from the current cycle will be reported.To keep events across cycles, set acc_events=True.
+  _warn_once(
+/workspace/venv/lib/python3.10/site-packages/torch/profiler/profiler.py:224: UserWarning: Warning: Profiler clears events at the end of each cycle.Only events from the current cycle will be reported.To keep events across cycles, set acc_events=True.
+  _warn_once(
+dropless         wall   49.11  compute   38.35 (busy   38.35, idle  10.76)  nccl   32.13  host sync   0.00  kernels/step 464
+chunks2          wall   51.15  compute   45.25 (busy   45.25, idle   5.90)  nccl   44.06  host sync   0.00  kernels/step 708
+/pytorch/aten/src/ATen/native/cuda/ScatterGatherKernel.cu:163: operator(): block: [59,0,0], thread: [10,0,0] Assertion `idx_dim >= 0 && idx_dim < index_size && "scatter gather kernel index out of bounds"` failed.
+/pytorch/aten/src/ATen/native/cuda/ScatterGatherKernel.cu:163: operator(): block: [59,0,0], thread: [51,0,0] Assertion `idx_dim >= 0 && idx_dim < index_size && "scatter gather kernel index out of bounds"` failed.
+[rank0]: Traceback (most recent call last):
+[rank0]:   File "/workspace/nvfp4-train-sm120/bench/profile_moe_ep.py", line 149, in <module>
+[rank0]:     main()
+[rank0]:   File "/workspace/nvfp4-train-sm120/bench/profile_moe_ep.py", line 105, in main
+[rank0]:     step()
+[rank0]:   File "/workspace/nvfp4-train-sm120/bench/profile_moe_ep.py", line 101, in step
+[rank0]:     y = m(x)
+[rank0]:   File "/workspace/venv/lib/python3.10/site-packages/torch/nn/modules/module.py", line 1779, in _wrapped_call_impl
+[rank0]:     return self._call_impl(*args, **kwargs)
+[rank0]:   File "/workspace/venv/lib/python3.10/site-packages/torch/nn/modules/module.py", line 1790, in _call_impl
+[rank0]:     return forward_call(*args, **kwargs)
+[rank0]:   File "/workspace/nvfp4-train-sm120/nvfp4/moe.py", line 1001, in forward
+[rank0]:     y = self._forward(_TileScope.apply(x, prev) if scoped else x)
+[rank0]:   File "/workspace/nvfp4-train-sm120/nvfp4/moe.py", line 1047, in _forward
+[rank0]:     y, sh = self._forward_ep_variable(x2d, slot_expert.view(T, k), w)
+[rank0]:   File "/workspace/nvfp4-train-sm120/nvfp4/moe.py", line 1191, in _forward_ep_variable
+[rank0]:     sh = self._shared(x2d) if self.shared_d_ff and self.ep_overlap else None  # during the last returns
+[rank0]:   File "/workspace/nvfp4-train-sm120/nvfp4/moe.py", line 988, in _shared
+[rank0]:     ys, pos = self._mlp(x2d, zeros, torch.arange(T, device=x2d.device), 1, 1, self.shared_d_ff, T, False,
+[rank0]:   File "/workspace/nvfp4-train-sm120/nvfp4/moe.py", line 969, in _mlp
+[rank0]:     ys = self._mlp_nvfp4(x, lay, ws, bs, caches, x_amax) if nvfp4 else \
+[rank0]:   File "/workspace/nvfp4-train-sm120/nvfp4/moe.py", line 930, in _mlp_nvfp4
+[rank0]:     xs = _Dispatch.apply(x.to(BF16), lay.src, lay.pos)  # bf16 first: the quantizer reads bf16 (as NVFP4Linear)
+[rank0]: torch.AcceleratorError: CUDA error: device-side assert triggered
+[rank0]: Search for `cudaErrorAssert' in https://docs.nvidia.com/cuda/cuda-runtime-api/group__CUDART__TYPES.html for more information.
+[rank0]: CUDA kernel errors might be asynchronously reported at some other API call, so the stacktrace below might be incorrect.
+[rank0]: For debugging consider passing CUDA_LAUNCH_BLOCKING=1
+[rank0]: Compile with `TORCH_USE_CUDA_DSA` to enable device-side assertions.
+
+[rank0]:[E1126 17:14:56.470202026 ProcessGroupNCCL.cpp:2119] [PG ID 0 PG GUID 0(default_pg) Rank 0] Process group watchdog thread terminated with exception: CUDA error: device-side assert triggered
+Search for `cudaErrorAssert' in https://docs.nvidia.com/cuda/cuda-runtime-api/group__CUDART__TYPES.html for more information.
+CUDA kernel errors might be asynchronously reported at some other API call, so the stacktrace below might be incorrect.
+For debugging consider passing CUDA_LAUNCH_BLOCKING=1
+Compile with `TORCH_USE_CUDA_DSA` to enable device-side assertions.
+
+Exception raised from query at /pytorch/c10/cuda/CUDAEvent.h:111 (most recent call first):
+frame #0: c10::Error::Error(c10::SourceLocation, std::__cxx11::basic_string<char, std::char_traits<char>, std::allocator<char> >) + 0x9d (0x76fb0c97205d in /workspace/venv/lib/python3.10/site-packages/torch/lib/libc10.so)
+frame #1: <unknown function> + 0xc114 (0x76fb4badc114 in /workspace/venv/lib/python3.10/site-packages/torch/lib/libc10_cuda.so)
+frame #2: c10d::ProcessGroupNCCL::WorkNCCL::finishedGPUExecutionInternal() const + 0x50 (0x76fa38388ef0 in /workspace/venv/lib/python3.10/site-packages/torch/lib/libtorch_cuda.so)
+frame #3: c10d::ProcessGroupNCCL::WorkNCCL::isCompleted() + 0x68 (0x76fa38397a08 in /workspace/venv/lib/python3.10/site-packages/torch/lib/libtorch_cuda.so)
+frame #4: c10d::ProcessGroupNCCL::Watchdog::runLoop() + 0x9c3 (0x76fa3839c3b3 in /workspace/venv/lib/python3.10/site-packages/torch/lib/libtorch_cuda.so)
+frame #5: c10d::ProcessGroupNCCL::Watchdog::run() + 0x157 (0x76fa3839e597 in /workspace/venv/lib/python3.10/site-packages/torch/lib/libtorch_cuda.so)
+frame #6: <unknown function> + 0xdc253 (0x76fb0c4b0253 in /lib/x86_64-linux-gnu/libstdc++.so.6)
+frame #7: <unknown function> + 0x94ac3 (0x76fb4c74fac3 in /lib/x86_64-linux-gnu/libc.so.6)
+frame #8: clone + 0x44 (0x76fb4c7e0a04 in /lib/x86_64-linux-gnu/libc.so.6)
+
+terminate called after throwing an instance of 'c10::DistBackendError'
+  what():  [PG ID 0 PG GUID 0(default_pg) Rank 0] Process group watchdog thread terminated with exception: CUDA error: device-side assert triggered
+Search for `cudaErrorAssert' in https://docs.nvidia.com/cuda/cuda-runtime-api/group__CUDART__TYPES.html for more information.
+CUDA kernel errors might be asynchronously reported at some other API call, so the stacktrace below might be incorrect.
+For debugging consider passing CUDA_LAUNCH_BLOCKING=1
+Compile with `TORCH_USE_CUDA_DSA` to enable device-side assertions.
+
+Exception raised from query at /pytorch/c10/cuda/CUDAEvent.h:111 (most recent call first):
+frame #0: c10::Error::Error(c10::SourceLocation, std::__cxx11::basic_string<char, std::char_traits<char>, std::allocator<char> >) + 0x9d (0x76fb0c97205d in /workspace/venv/lib/python3.10/site-packages/torch/lib/libc10.so)
+frame #1: <unknown function> + 0xc114 (0x76fb4badc114 in /workspace/venv/lib/python3.10/site-packages/torch/lib/libc10_cuda.so)
+frame #2: c10d::ProcessGroupNCCL::WorkNCCL::finishedGPUExecutionInternal() const + 0x50 (0x76fa38388ef0 in /workspace/venv/lib/python3.10/site-packages/torch/lib/libtorch_cuda.so)
+frame #3: c10d::ProcessGroupNCCL::WorkNCCL::isCompleted() + 0x68 (0x76fa38397a08 in /workspace/venv/lib/python3.10/site-packages/torch/lib/libtorch_cuda.so)
+frame #4: c10d::ProcessGroupNCCL::Watchdog::runLoop() + 0x9c3 (0x76fa3839c3b3 in /workspace/venv/lib/python3.10/site-packages/torch/lib/libtorch_cuda.so)
+frame #5: c10d::ProcessGroupNCCL::Watchdog::run() + 0x157 (0x76fa3839e597 in /workspace/venv/lib/python3.10/site-packages/torch/lib/libtorch_cuda.so)
+frame #6: <unknown function> + 0xdc253 (0x76fb0c4b0253 in /lib/x86_64-linux-gnu/libstdc++.so.6)
+frame #7: <unknown function> + 0x94ac3 (0x76fb4c74fac3 in /lib/x86_64-linux-gnu/libc.so.6)
+frame #8: clone + 0x44 (0x76fb4c7e0a04 in /lib/x86_64-linux-gnu/libc.so.6)
+
+Exception raised from run at /pytorch/torch/csrc/distributed/c10d/ProcessGroupNCCL.cpp:2125 (most recent call first):
+frame #0: c10::Error::Error(c10::SourceLocation, std::__cxx11::basic_string<char, std::char_traits<char>, std::allocator<char> >) + 0x9d (0x76fb0c97205d in /workspace/venv/lib/python3.10/site-packages/torch/lib/libc10.so)
+frame #1: <unknown function> + 0x9b5d75 (0x76fa37bfed75 in /workspace/venv/lib/python3.10/site-packages/torch/lib/libtorch_cuda.so)
+frame #2: <unknown function> + 0xdc253 (0x76fb0c4b0253 in /lib/x86_64-linux-gnu/libstdc++.so.6)
+frame #3: <unknown function> + 0x94ac3 (0x76fb4c74fac3 in /lib/x86_64-linux-gnu/libc.so.6)
+frame #4: clone + 0x44 (0x76fb4c7e0a04 in /lib/x86_64-linux-gnu/libc.so.6)
+
+W1126 17:14:56.730000 6575 torch/distributed/elastic/multiprocessing/api.py:1012] Sending process 6648 closing signal SIGTERM
+E1126 17:14:57.046000 6575 torch/distributed/elastic/multiprocessing/api.py:986] failed (exitcode: -6) local_rank: 0 (pid: 6647) of binary: /workspace/venv/bin/python3
+Traceback (most recent call last):
+  File "/workspace/venv/bin/torchrun", line 8, in <module>
+    sys.exit(main())
+  File "/workspace/venv/lib/python3.10/site-packages/torch/distributed/elastic/multiprocessing/errors/__init__.py", line 362, in wrapper
+    return f(*args, **kwargs)
+  File "/workspace/venv/lib/python3.10/site-packages/torch/distributed/run.py", line 990, in main
+    run(args)
+  File "/workspace/venv/lib/python3.10/site-packages/torch/distributed/run.py", line 981, in run
+    elastic_launch(
+  File "/workspace/venv/lib/python3.10/site-packages/torch/distributed/launcher/api.py", line 170, in __call__
+    return launch_agent(self._config, self._entrypoint, list(args))
+  File "/workspace/venv/lib/python3.10/site-packages/torch/distributed/launcher/api.py", line 317, in launch_agent
+    raise ChildFailedError(
+torch.distributed.elastic.multiprocessing.errors.ChildFailedError: 
+======================================================
+bench/profile_moe_ep.py FAILED
+------------------------------------------------------
+Failures:
+[1]:
+  time      : 2026-11-26_17:14:57
+  host      : 9b5ee09b9823
+  rank      : 1 (local_rank: 1)
+  exitcode  : -15 (pid: 6648)
+  error_file: <N/A>
+  traceback : Signal 15 (SIGTERM) received by PID 6648
+------------------------------------------------------
+Root Cause (first observed failure):
+[0]:
+  time      : 2026-11-26_17:14:56
+  host      : 9b5ee09b9823
+  rank      : 0 (local_rank: 0)
+  exitcode  : -6 (pid: 6647)
+  error_file: <N/A>
+  traceback : Signal 6 (SIGABRT) received by PID 6647
+======================================================
+[guard] elapsed 13s | peak GPU temp 29C, power 96W, GPU mem 6824MB | min host mem avail 422554MB | cooldown 0s

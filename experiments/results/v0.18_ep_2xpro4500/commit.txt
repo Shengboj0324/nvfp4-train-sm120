@@ -1,0 +1,1 @@
+02f5d8f docs: USAGE (ep_wire_return, ep_serial, ep_dynamic_tiles), DESIGN 4.2 dynamic tiles, RESULTS 8.6 residency

@@ -1,0 +1,137 @@
+== session start 2026-11-26T17:10:15Z
+
+==================== env ====================
+Thu Nov 26 17:10:15 2026       
++-----------------------------------------------------------------------------------------+
+| NVIDIA-SMI 595.112.07             Driver Version: 595.112.07     CUDA Version: 13.2     |
++-----------------------------------------+------------------------+----------------------+
+| GPU  Name                 Persistence-M | Bus-Id          Disp.A | Volatile Uncorr. ECC |
+| Fan  Temp   Perf          Pwr:Usage/Cap |           Memory-Usage | GPU-Util  Compute M. |
+|                                         |                        |               MIG M. |
+|=========================================+========================+======================|
+|   0  NVIDIA RTX PRO 4500 Blac...    On  |   00000000:81:00.0 Off |                  Off |
+| 30%   27C    P8              3W /  200W |       2MiB /  32623MiB |      0%      Default |
+|                                         |                        |                  N/A |
++-----------------------------------------+------------------------+----------------------+
+|   1  NVIDIA RTX PRO 4500 Blac...    On  |   00000000:E1:00.0 Off |                  Off |
+| 30%   25C    P8             10W /  200W |       2MiB /  32623MiB |      0%      Default |
+|                                         |                        |                  N/A |
++-----------------------------------------+------------------------+----------------------+
+
++-----------------------------------------------------------------------------------------+
+| Processes:                                                                              |
+|  GPU   GI   CI              PID   Type   Process name                        GPU Memory |
+|        ID   ID                                                               Usage      |
+|=========================================================================================|
+|  No running processes found                                                             |
++-----------------------------------------------------------------------------------------+
+index, name, compute_cap, memory.total [MiB], power.limit [W], clocks.max.sm [MHz], pcie.link.gen.max, pcie.link.width.max
+0, NVIDIA RTX PRO 4500 Blackwell, 12.0, 32623 MiB, 200.00 W, 3090 MHz, 4, 16
+1, NVIDIA RTX PRO 4500 Blackwell, 12.0, 32623 MiB, 200.00 W, 3090 MHz, 4, 16
+	[4mGPU0	GPU1	NIC0	CPU Affinity	NUMA Affinity	GPU NUMA ID[0m
+GPU0	 X 	NODE	NODE	64-127,192-255	1		N/A
+GPU1	NODE	 X 	NODE	64-127,192-255	1		N/A
+NIC0	NODE	NODE	 X 				
+
+Legend:
+
+  X    = Self
+  SYS  = Connection traversing PCIe as well as the SMP interconnect between NUMA nodes (e.g., QPI/UPI)
+  NODE = Connection traversing PCIe as well as the interconnect between PCIe Host Bridges within a NUMA node
+  PHB  = Connection traversing PCIe as well as a PCIe Host Bridge (typically the CPU)
+  PXB  = Connection traversing multiple PCIe bridges (without traversing the PCIe Host Bridge)
+  PIX  = Connection traversing at most a single PCIe bridge
+  NV#  = Connection traversing a bonded set of # NVLinks
+
+NIC Legend:
+
+  NIC0: mlx5_bond_0
+
+driver supports CUDA 13.2
+nvcc 12.8 at /usr/local/cuda
+ERROR: Could not find a version that satisfies the requirement torch==2.14.1 (from versions: 2.7.0+cu128, 2.7.1+cu128, 2.8.0+cu128, 2.9.0+cu128, 2.9.1+cu128, 2.10.0+cu128, 2.11.0+cu128)
+ERROR: No matching distribution found for torch==2.14.1
+torch 2.11.0+cu128 cuda 12.8 ['NVIDIA RTX PRO 4500 Blackwell', 'NVIDIA RTX PRO 4500 Blackwell']
+02f5d8f docs: USAGE (ep_wire_return, ep_serial, ep_dynamic_tiles), DESIGN 4.2 dynamic tiles, RESULTS 8.6 residency
+== env: ok (117 s)
+
+==================== build ====================
+ptxas info    : Used 56 registers, used 1 barriers, 18968 bytes smem
+    8 bytes stack frame, 8 bytes spill stores, 12 bytes spill loads
+ptxas info    : Used 80 registers, used 1 barriers, 8 bytes cumulative stack size, 18968 bytes smem
+ptxas info    : Used 48 registers, used 1 barriers, 16680 bytes smem
+ptxas info    : Used 80 registers, used 1 barriers, 16688 bytes smem
+ptxas info    : Used 51 registers, used 1 barriers, 18968 bytes smem
+ptxas info    : Used 80 registers, used 1 barriers, 16 bytes cumulative stack size, 18968 bytes smem
+ptxas info    : Used 48 registers, used 1 barriers, 16680 bytes smem
+ptxas info    : Used 80 registers, used 1 barriers, 16688 bytes smem
+ptxas info    : Used 56 registers, used 1 barriers, 18968 bytes smem
+ptxas info    : Used 89 registers, used 1 barriers, 18968 bytes smem
+ptxas info    : Used 38 registers, used 1 barriers, 32 bytes smem
+ptxas info    : Used 48 registers, used 1 barriers, 16680 bytes smem
+ptxas info    : Used 80 registers, used 1 barriers, 16688 bytes smem
+ptxas info    : Used 54 registers, used 1 barriers, 18968 bytes smem
+ptxas info    : Used 89 registers, used 1 barriers, 18968 bytes smem
+ptxas info    : Used 30 registers, used 1 barriers, 32 bytes smem
+ptxas info    : Used 48 registers, used 1 barriers, 16680 bytes smem
+ptxas info    : Used 80 registers, used 1 barriers, 16688 bytes smem
+x86_64-linux-gnu-g++ -shared -Wl,-O1 -Wl,-Bsymbolic-functions -Wl,-Bsymbolic-functions -g -fwrapv -O2 -Wl,-Bsymbolic-functions -g -fwrapv -O2 -g -fstack-protector-strong -Wformat -Werror=format-security -Wdate-time -D_FORTIFY_SOURCE=2 /workspace/nvfp4-train-sm120/build/temp.linux-x86_64-3.10/csrc/attention.o /workspace/nvfp4-train-sm120/build/temp.linux-x86_64-3.10/csrc/bindings.o /workspace/nvfp4-train-sm120/build/temp.linux-x86_64-3.10/csrc/gemm.o /workspace/nvfp4-train-sm120/build/temp.linux-x86_64-3.10/csrc/gemm_tma.o /workspace/nvfp4-train-sm120/build/temp.linux-x86_64-3.10/csrc/moe_combine.o /workspace/nvfp4-train-sm120/build/temp.linux-x86_64-3.10/csrc/norm.o /workspace/nvfp4-train-sm120/build/temp.linux-x86_64-3.10/csrc/quantize.o /workspace/nvfp4-train-sm120/build/temp.linux-x86_64-3.10/csrc/quantize_dual.o -L/workspace/venv/lib/python3.10/site-packages/torch/lib -L/usr/local/cuda/lib64 -lc10 -ltorch -ltorch_cpu -ltorch_python -lcudart -lc10_cuda -ltorch_cuda -o build/lib.linux-x86_64-3.10/nvfp4/_C.cpython-310-x86_64-linux-gnu.so
+== build: ok (79 s)
+
+==================== overlap ====================
+w2_chdefault: nvfp4 GEMM 16384x2816x2048: alone 0.421 ms; beside the all-to-all margin 0: 1.28x, margin 8: 1.10x, margin 16: 1.20x, margin 24: 1.36x, margin 32: 1.55x, margin 48: 2.16x; dynamic tiles margin 0: 1.09x, margin 8: 1.14x; bf16 cuBLAS 1.01x; NCCL grid [[2, 1, 1]]
+w2_ch4: nvfp4 GEMM 16384x2816x2048: alone 0.425 ms; beside the all-to-all margin 0: 1.19x, margin 8: 1.08x, margin 16: 1.17x, margin 24: 1.33x, margin 32: 1.53x, margin 48: 2.09x; dynamic tiles margin 0: 1.08x, margin 8: 1.13x; bf16 cuBLAS 1.01x; NCCL grid [[2, 1, 1]]
+w2_ch8: nvfp4 GEMM 16384x2816x2048: alone 0.423 ms; beside the all-to-all margin 0: 1.28x, margin 8: 1.14x, margin 16: 1.26x, margin 24: 1.37x, margin 32: 1.55x, margin 48: 2.18x; dynamic tiles margin 0: 1.09x, margin 8: 1.14x; bf16 cuBLAS 1.00x; NCCL grid [[2, 1, 1]]
+static   alone 0.421 ms; with k SMs held: k=1 1.00x, k=2 1.77x, k=4 1.76x, k=8 1.75x, k=16 1.72x
+dynamic  alone 0.439 ms; with k SMs held: k=1 0.96x, k=2 0.98x, k=4 0.99x, k=8 1.03x, k=16 1.10x
+== overlap: ok (74 s)
+
+==================== eprof ====================
+  traceback : Signal 15 (SIGTERM) received by PID 6648
+------------------------------------------------------
+Root Cause (first observed failure):
+[0]:
+  time      : 2026-11-26_17:14:56
+  host      : 9b5ee09b9823
+  rank      : 0 (local_rank: 0)
+  exitcode  : -6 (pid: 6647)
+  error_file: <N/A>
+  traceback : Signal 6 (SIGABRT) received by PID 6647
+======================================================
+[guard] elapsed 13s | peak GPU temp 29C, power 96W, GPU mem 6824MB | min host mem avail 422554MB | cooldown 0s
+== eprof: FAILED (13 s)
+
+==================== ep ====================
+                    error_pid=failed_process.pid,
+>       raise ProcessRaisedException(msg, error_index, failed_process.pid)
+E       torch.distributed.DistNetworkError: The server socket has failed to listen on any local network address. port: 45063, useIpv6: false, code: -98, name: EADDRINUSE, message: address already in use
+1 failed, 99 passed in 39.70s
+W1126 17:15:43.448000 7183 torch/distributed/run.py:851] 
+W1126 17:15:43.448000 7183 torch/distributed/run.py:851] *****************************************
+W1126 17:15:43.448000 7183 torch/distributed/run.py:851] Setting OMP_NUM_THREADS environment variable for each process to be 1 in default, to avoid your system being overloaded, please further tune the variable for optimal performance in your application as needed. 
+W1126 17:15:43.448000 7183 torch/distributed/run.py:851] *****************************************
+d=1024 d_ff=2816 E=8 k=2 T=16384 shared=0 bf16  local 19.49 ms  ep cap 1.25 34.97 ms  ep dropless 25.47 ms  ep dropless chunks 2 24.36 ms  ep dropless chunks 4 30.52 ms  ep dropless chunks 2 margin 8 24.42 ms  ep dropless chunks 4 margin 8 29.60 ms  ep dropless chunks 2 static tiles 24.48 ms  ep fp8 return 26.09 ms
+d=1024 d_ff=2816 E=8 k=2 T=16384 shared=0 nvfp4 local 12.53 ms  ep cap 1.25 23.34 ms  ep dropless 19.56 ms  ep dropless chunks 2 19.11 ms  ep dropless chunks 4 27.74 ms  ep dropless chunks 2 margin 8 19.54 ms  ep dropless chunks 4 margin 8 28.39 ms  ep dropless chunks 2 static tiles 19.37 ms  ep wire nvfp4 19.06 ms  ep wire nvfp4 chunks 2 19.59 ms  ep wire nvfp4+grad chunks 2 20.32 ms  ep wire nvfp4 chunks 2 margin 8 19.93 ms  ep wire nvfp4 chunks 4 margin 8 27.28 ms  ep wire nvfp4 + fp8 return 19.55 ms  ep wire nvfp4 + fp8 return chunks 2 20.57 ms
+  a2a of 80 MiB: 2.11 ms (18.5 GiB/s sent per GPU); all-reduce of 132 MiB expert gradients: 7.76 ms
+d=2048 d_ff=1408 E=32 k=4 T=16384 shared=2816 bf16  local 60.23 ms  ep cap 1.25 109.22 ms  ep cap serial 118.31 ms  ep dropless 64.27 ms  ep dropless chunks 2 68.41 ms  ep dropless chunks 4 80.18 ms  ep dropless chunks 2 margin 8 68.54 ms  ep dropless chunks 4 margin 8 80.23 ms  ep dropless chunks 2 static tiles 68.49 ms  ep fp8 return 67.48 ms
+d=2048 d_ff=1408 E=32 k=4 T=16384 shared=2816 nvfp4 local 37.85 ms  ep cap 1.25 73.86 ms  ep cap serial 77.23 ms  ep dropless 47.16 ms  ep dropless chunks 2 50.05 ms  ep dropless chunks 4 62.68 ms  ep dropless chunks 2 margin 8 50.58 ms  ep dropless chunks 4 margin 8 63.17 ms  ep dropless chunks 2 static tiles 51.59 ms  ep wire nvfp4 46.64 ms  ep wire nvfp4 chunks 2 50.09 ms  ep wire nvfp4+grad chunks 2 52.12 ms  ep wire nvfp4 chunks 2 margin 8 50.89 ms  ep wire nvfp4 chunks 4 margin 8 63.96 ms  ep wire nvfp4 + fp8 return 48.80 ms  ep wire nvfp4 + fp8 return chunks 2 53.17 ms
+  a2a of 320 MiB: 8.25 ms (18.9 GiB/s sent per GPU); all-reduce of 528 MiB expert gradients: 28.47 ms
+[guard] elapsed 104s | peak GPU temp 57C, power 202W, GPU mem 11808MB | min host mem avail 416937MB | cooldown 0s
+/workspace/venv/lib/python3.10/site-packages/torch/autograd/graph.py:869: UserWarning: The AccumulateGrad node's stream does not match the stream of the node that produced the incoming gradient. This may incur unnecessary synchronization and break CUDA graph capture if the AccumulateGrad node's stream is the default stream. This mismatch is caused by an AccumulateGrad node created prior to the current iteration being kept alive. This can happen if the autograd graph is still being kept alive by tensors such as the loss, or if you are using DDP, which will stash a reference to the node. To resolve the mismatch, delete all references to the autograd graph or ensure that DDP initialization is performed under the same stream as subsequent forwards. If the mismatch is intentional, you can use torch.autograd.graph.set_warn_on_accumulate_grad_stream_mismatch(False) to suppress this warning. (Triggered internally at /pytorch/torch/csrc/autograd/input_buffer.cpp:240.)
+  return Variable._execution_engine.run_backward(  # Calls into the C++ engine to run the backward pass
+{"d": 1024, "d_ff": 2816, "experts": 8, "top_k": 2, "activation": "swiglu", "tokens": 16384, "bf16_ms": 21.373, "bf16_grouped_ms": 20.774, "bf16_grouped_graph_ms": 20.634, "nvfp4_ms": 12.356, "nvfp4_graph_ms": 12.255, "speedup": 1.73, "speedup_graph": 1.744, "speedup_vs_grouped": 1.681, "speedup_graph_vs_grouped": 1.684}
+{"d": 2048, "d_ff": 5632, "experts": 8, "top_k": 2, "activation": "swiglu", "tokens": 16384, "bf16_ms": 69.612, "bf16_grouped_ms": 69.333, "bf16_grouped_graph_ms": 69.277, "nvfp4_ms": 34.381, "nvfp4_graph_ms": 34.265, "speedup": 2.025, "speedup_graph": 2.032, "speedup_vs_grouped": 2.017, "speedup_graph_vs_grouped": 2.022}
+{"d": 2048, "d_ff": 1408, "experts": 32, "top_k": 4, "activation": "swiglu", "tokens": 16384, "bf16_ms": 52.607, "bf16_grouped_ms": 47.903, "bf16_grouped_graph_ms": 47.852, "nvfp4_ms": 27.448, "nvfp4_graph_ms": 27.311, "speedup": 1.917, "speedup_graph": 1.926, "speedup_vs_grouped": 1.745, "speedup_graph_vs_grouped": 1.752}
+{"d": 768, "d_ff": 1536, "experts": 8, "top_k": 2, "activation": "gelu_tanh", "tokens": 16384, "bf16_ms": 7.05, "bf16_grouped_ms": 6.646, "bf16_grouped_graph_ms": 6.419, "nvfp4_ms": 4.724, "nvfp4_graph_ms": 4.504, "speedup": 1.492, "speedup_graph": 1.565, "speedup_vs_grouped": 1.407, "speedup_graph_vs_grouped": 1.425}
+{"d": 2048, "d_ff": 1408, "experts": 32, "top_k": 4, "activation": "swiglu", "tokens": 16384, "capacity_factor": 1.25, "shared_d_ff": 2816, "bf16_ms": 70.55, "bf16_grouped_ms": 65.486, "bf16_grouped_graph_ms": 65.419, "nvfp4_ms": 37.063, "nvfp4_graph_ms": 36.945, "speedup": 1.903, "speedup_graph": 1.91, "speedup_vs_grouped": 1.767, "speedup_graph_vs_grouped": 1.771}
+[guard] elapsed 36s | peak GPU temp 61C, power 201W, GPU mem 17408MB | min host mem avail 440747MB | cooldown 0s
+== ep: FAILED (184 s)
+
+== summary
+  env: ok
+  build: ok
+  overlap: ok
+  eprof: FAILED
+  ep: FAILED
+results: /workspace/nvfp4_results.tar.gz
+== session end 2026-11-26T17:18:02Z
