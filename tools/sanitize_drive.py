@@ -199,8 +199,11 @@ qa, _ = ops.quantize_dual(torch.randn(384, 512, device=d), col=False)
 ops.gemm(qa, qa, impl="tma")
 ops.set_sm_margin(0)
 # dynamic tile claiming: dense (and split-K), grouped with runs of unused tiles, ragged K with an empty group
-# (claiming engages only with more units than CTAs: a margin leaves 3 CTAs)
-ops.set_dynamic_tiles(True)
+# (claiming engages only with more units than CTAs: a margin leaves 3 CTAs). Not under racecheck: its
+# serialized execution of a block makes the threads that wait for a claim spin almost forever (and a
+# flag-synchronized ring is outside what it models); memcheck, synccheck and initcheck cover it.
+import os  # noqa: E402
+ops.set_dynamic_tiles(os.environ.get("NVFP4_SANITIZE_TOOL") != "racecheck")
 ops.set_sm_margin(torch.cuda.get_device_properties(0).multi_processor_count - 3)
 qd, _ = ops.quantize_dual(torch.randn(1024, 512, device=d), col=False)
 ops.gemm(qd, qa, impl="tma")
