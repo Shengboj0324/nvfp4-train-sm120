@@ -13,6 +13,8 @@
 #   gpt     GPT-124M, 3000 steps: BF16 and NVFP4 on one GPU, NVFP4 with DDP over all GPUs (NCCL)
 #   ep      MoE expert parallelism over all GPUs (NCCL): the MoE tests, bench/bench_moe_ep.py (two GPUs; with
 #           four, also all four with two-stage exchanges over pairs of GPUs), bench_moe.py
+#   moegpt  MoE GPT (8 experts, top-2) over all GPUs: experts replicated (DDP) vs expert parallelism (plain;
+#           chunked with NVFP4 messages; with four GPUs, nodes of two), tokens/s and loss
 # Everything ends up in $OUT (default /workspace/nvfp4_results) and $OUT.tar.gz.
 # Every GPU job runs under tools/guard.py (temperature / memory limits, over all GPUs).
 set -uo pipefail
@@ -197,6 +199,36 @@ do_ep() {
   return $st
 }
 
+do_moegpt() {
+  cd "$REPO" || return 1
+  export PYTHONPATH=$REPO NVFP4_DATA=${NVFP4_DATA:-/workspace/nvfp4_data}
+  [ -f "$NVFP4_DATA/train.bin" ] || python experiments/prepare_tinystories.py --train-mb 250 --out "$NVFP4_DATA" || return 1
+  local st=0 ngpu
+  ngpu=$(nvidia-smi -L | wc -l)
+  [ "$ngpu" -ge 2 ] || { echo "needs two GPUs"; return 1; }
+  local steps=${MOEGPT_STEPS:-600}
+  local common=(--precision nvfp4 --steps "$steps" --eval-every 200 --hp-last 2 --fuse-wgrad --fuse-producers
+                --moe-experts 8 --batch $((16 * ngpu)) --micro-batch 16 --seed 0)
+  run_moegpt() { local name=$1; shift
+    python tools/guard.py --log "$OUT/moegpt_$name.csv" -- torchrun --standalone --nproc_per_node "$ngpu" \
+      experiments/train_gpt.py "${common[@]}" "$@" --out "$OUT/moegpt_$name.jsonl" > "$OUT/moegpt_$name.log" 2>&1 || st=1
+    python - "$OUT/moegpt_$name.jsonl" <<'PY'
+import json, statistics, sys
+recs = [json.loads(l) for l in open(sys.argv[1])]
+val = [r for r in recs if "val_loss" in r]
+tps = [r["tok_per_s"] for r in recs if r.get("tok_per_s")]
+mem = max(r.get("max_mem_gb", 0) for r in recs)
+print(f"{sys.argv[1].split('/')[-1]:34s} final val {val[-1]['val_loss']:.4f} at step {val[-1]['step']}, "
+      f"median tok/s {statistics.median(tps[len(tps)//2:]):,.0f}, max mem {mem:.1f} GB")
+PY
+  }
+  run_moegpt ddp
+  run_moegpt ep --moe-ep
+  run_moegpt ep_chunks2_wire --moe-ep --moe-ep-chunks 2 --moe-ep-wire nvfp4 --sm-margin 8
+  if [ "$ngpu" -ge 4 ]; then run_moegpt ep_nodes2 --moe-ep --moe-ep-node-size 2; fi
+  return $st
+}
+
 for p in $PHASES; do
   case $p in
     env) phase env do_env ;;
@@ -205,6 +237,7 @@ for p in $PHASES; do
     bench) phase bench do_bench ;;
     gpt) phase gpt do_gpt ;;
     ep) phase ep do_ep ;;
+    moegpt) phase moegpt do_moegpt ;;
   esac
 done
 echo; echo "== summary"; for p in $PHASES; do echo "  $p: ${STATUS[$p]:-not run}"; done

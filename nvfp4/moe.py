@@ -9,8 +9,9 @@ Routing: softmax over the router logits (fp32), top-k experts per token, weights
 choices. The (token, expert) pairs are sorted by expert (stable). Dropless by default; with
 ``capacity_factor`` each expert keeps its first C = ceil(capacity_factor T k / E) slots in token order. Options:
 a shared expert (``shared_d_ff``: a dense MLP every token goes through, added to the routed output) and
-expert parallelism (``ep_group``: each rank holds E / W experts; slots travel by all-to-alls, of a fixed size
-with a capacity; dropless expert parallelism reads the row counts on the host).
+expert parallelism (``ep_group``: each rank holds E / W experts; slots travel by fixed-size all-to-alls with a
+capacity, or tokens once per rank (or node, ``ep_node_size``) by variable-size ones that read the row counts on
+the host, optionally chunked to overlap the experts and with NVFP4 messages).
 Otherwise the layer never reads the expert sizes on the host: its buffers have the worst-case size for the number of
 tokens, and the layout is computed on the GPU, so a training step with MoE layers can be captured in a CUDA
 graph and traced by ``torch.compile`` without graph breaks. That holds for the NVFP4 experts and for the
@@ -622,13 +623,27 @@ class MoE(nn.Module):
     token goes through with weight 1, its output added to the routed experts' (n shared experts of hidden h
     are one of hidden n h). Parameters ``shared_w_*`` [1, ., .] (and ``shared_b_*``).
     ep_group (None: every expert on this process): expert parallelism over a torch.distributed process group
-    of W ranks: this rank holds experts [r E / W, (r + 1) E / W) (the stacked parameters have E / W rows), and
-    the routed slots travel to their expert's rank and back by two all-to-alls, one per direction. With
-    ``capacity_factor`` the exchanges have a fixed size (C slots per expert and source rank) and nothing is read
-    on the host; dropless, the row counts are exchanged first and read on the host once per forward (as in
-    Megatron-LM's dropless dispatcher), so such a step cannot be captured in a CUDA graph. The shared expert
-    runs while the expert outputs travel back (``ep_overlap = False``: after them). The router and the shared
-    expert are replicated; gradients of the local experts already include every rank's tokens.
+    of W ranks: this rank holds experts [r E / W, (r + 1) E / W) (the stacked parameters have E / W rows). The
+    router and the shared expert are replicated; gradients of the local experts already include every rank's
+    tokens. Two ways to exchange (``ep_dispatch``, "auto": "fixed" with a capacity factor and none of the
+    options below, else "variable"):
+      * "fixed" (needs ``capacity_factor``): every slot travels to its expert's rank and back in fixed-size
+        all-to-alls (C slots per expert and source rank); nothing is read on the host (CUDA-graph capturable).
+      * "variable": each token travels once to every rank holding one of its experts (with those experts' ids
+        and routing weights), which returns one row, the weighted sum of its experts' outputs (DeepEP's
+        layout: top-k > 1 sends fewer rows than slots). The row counts go first, in one all-to-all read on the
+        host once per forward (not capturable). Dropped slots (``capacity_factor``) are not sent.
+        ``ep_node_size`` L (constructor; ranks r L .. r L + L - 1 form a node): tokens cross nodes once per
+        node, to the rank with the sender's position in that node, which forwards them once per rank of its node
+        and sums their rows (two-stage, for clusters whose links between nodes are slower). ``ep_chunks`` n:
+        the tokens go in n chunks in a wavefront, the next chunk's rows travelling while this chunk's experts run
+        (and the gradients likewise); ``ops.set_sm_margin`` leaves the transfers SMs. With NVFP4 experts,
+        ``ep_wire = "nvfp4"`` sends the activations as NVFP4 with the group's tensor scale (3.6x fewer bytes;
+        the receiver's re-quantization reproduces the codes, so the forward and the input gradient are
+        unchanged, only the weight gradient's token-wise quantization sees the dequantized rows) and
+        ``ep_wire_grad = "nvfp4"`` the gradients sent to the experts (stochastically rounded, unbiased).
+        ``last_ep_rows``: rows this rank sent to other ranks in the last forward (across nodes, within its node).
+    The shared expert runs while the expert outputs travel back (``ep_overlap = False``: after them).
 
     After forward, ``aux_loss`` holds the Switch Transformer load-balancing loss E * sum_e f_e P_e (f_e:
     fraction of routed slots, P_e: mean router probability of expert e; before dropping; this rank's tokens),
@@ -1083,8 +1098,46 @@ class MoE(nn.Module):
         if self.shared_d_ff:
             r += f", shared_d_ff={self.shared_d_ff}"
         if self.ep_group is not None:
-            r += f", expert_parallel={self.ep_size} (local experts {self.n_local})"
+            r += f", expert_parallel={self.ep_size} (local experts {self.n_local}" + \
+                (f", nodes of {self.ep_node_size})" if self.ep_node_size > 1 else ")")
         return r + (", nvfp4=True" if self.nvfp4 else "")
 
 
-__all__ = ["MoE"]
+def expert_parallel_parameters(module: nn.Module) -> list[str]:
+    """Names (as in ``module.named_parameters()``) of the expert weights and biases of the expert-parallel MoE
+    layers in ``module``: they differ per rank, so data parallelism over the same ranks must leave them alone
+    (``DistributedDataParallel._set_params_and_buffers_to_ignore_for_model(module, names)``, see
+    ``ignore_expert_parameters_in_ddp``), and their gradients already sum every rank's tokens."""
+    names = []
+    for prefix, m in module.named_modules():
+        if isinstance(m, MoE) and m.ep_group is not None:
+            for n, p in m.named_parameters(recurse=False):
+                if p is not None and n.startswith(("w_", "b_")):
+                    names.append(f"{prefix}.{n}" if prefix else n)
+    return names
+
+
+def ignore_expert_parameters_in_ddp(module: nn.Module) -> list[str]:
+    """Before wrapping ``module`` in DistributedDataParallel: exclude the expert-parallel experts (their
+    gradients are not to be averaged over ranks); returns their names."""
+    from torch.nn.parallel import DistributedDataParallel as DDP
+    names = expert_parallel_parameters(module)
+    DDP._set_params_and_buffers_to_ignore_for_model(module, names)
+    return names
+
+
+@torch.no_grad()
+def scale_expert_grads(module: nn.Module, factor: float | None = None) -> None:
+    """Multiply the expert-parallel experts' gradients by ``factor`` (default 1 / the expert-parallel group's
+    size). Data parallelism averages the other gradients over ranks (the objective is the mean of the ranks'
+    losses); an expert's gradient from expert parallelism is the sum of every rank's contribution. Call before
+    the optimizer step (and before gradient clipping)."""
+    for m in module.modules():
+        if isinstance(m, MoE) and m.ep_group is not None:
+            f = 1.0 / m.ep_size if factor is None else factor
+            for n, p in m.named_parameters(recurse=False):
+                if p is not None and p.grad is not None and n.startswith(("w_", "b_")):
+                    p.grad.mul_(f)
+
+
+__all__ = ["MoE", "expert_parallel_parameters", "ignore_expert_parameters_in_ddp", "scale_expert_grads"]

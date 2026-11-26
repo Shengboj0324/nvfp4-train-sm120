@@ -27,7 +27,8 @@ from nvfp4.fused import layernorm_linear, layernorm_mlp
 from nvfp4.linear import NVFP4Linear, convert_linears
 from nvfp4.moe import MoE
 
-EP_GROUP = None  # --moe-ep-wire: the MoE layers run their expert-parallel path over this (one-process) group
+EP_GROUP = None  # --moe-ep / --moe-ep-wire: the MoE layers' expert-parallel group
+EP_NODE = 1
 
 
 class Block(nn.Module):
@@ -41,7 +42,7 @@ class Block(nn.Module):
         self.moe = None
         if moe is not None:  # (experts, top_k, d_ff, capacity factor, shared d_ff): a mixture-of-experts MLP
             self.moe = MoE(d, moe[2], moe[0], top_k=moe[1], activation="gelu_tanh", capacity_factor=moe[3] or None,
-                           shared_d_ff=moe[4], ep_group=EP_GROUP)
+                           shared_d_ff=moe[4], ep_group=EP_GROUP, ep_node_size=EP_NODE)
         else:
             self.fc1 = nn.Linear(d, 4 * d, bias=False)
             self.fc2 = nn.Linear(4 * d, d, bias=False)
@@ -196,9 +197,15 @@ def main():
     ap.add_argument("--moe-aux", type=float, default=0.01, help="load-balancing loss coefficient")
     ap.add_argument("--moe-capacity", type=float, default=0.0, help="expert capacity factor (0: dropless)")
     ap.add_argument("--moe-shared", type=int, default=0, help="hidden size of a shared expert (0: none)")
+    ap.add_argument("--moe-ep", action="store_true",
+                    help="expert parallelism over the torchrun ranks (each holds experts / world of every MoE layer; "
+                         "DDP covers the other parameters)")
     ap.add_argument("--moe-ep-wire", choices=["", "bf16", "nvfp4", "nvfp4+grad"], default="",
-                    help="run the MoE layers' expert-parallel exchanges over a one-process group with these "
-                         "message formats (activations; +grad: gradients too): the wire formats' accuracy on one GPU")
+                    help="expert-parallel message formats (activations; +grad: gradients too). Without --moe-ep: "
+                         "the exchanges run over a one-process group (the wire formats' accuracy on one GPU)")
+    ap.add_argument("--moe-ep-chunks", type=int, default=1, help="expert-parallel exchanges in this many chunks")
+    ap.add_argument("--moe-ep-node-size", type=int, default=1, help="two-stage exchanges over nodes of this size")
+    ap.add_argument("--sm-margin", type=int, default=0, help="SMs the persistent NVFP4 GEMMs leave free")
     ap.add_argument("--bf16-tail", type=float, default=0.0,
                     help="train the last FRAC of the steps with the NVFP4 layers in BF16 (ops.set_high_precision)")
     ap.add_argument("--hp-modules", default="",
@@ -224,13 +231,17 @@ def main():
     train = np.memmap(os.path.join(a.data, "train.bin"), dtype=np.uint16, mode="r")
     val = np.memmap(os.path.join(a.data, "val.bin"), dtype=np.uint16, mode="r")
     moe = None
-    if a.moe_ep_wire:
+    ep = a.moe_ep or bool(a.moe_ep_wire)
+    if ep:
         import torch.distributed as dist
-        assert not ddp, "--moe-ep-wire is a one-GPU study (the expert weights would differ per rank)"
-        dist.init_process_group(os.environ.get("NVFP4_DIST_BACKEND", "nccl"), init_method="tcp://127.0.0.1:29533",
-                                rank=0, world_size=1)
-        global EP_GROUP
-        EP_GROUP = dist.group.WORLD
+        if not ddp:  # one process: the expert-parallel path over a one-process group (a numerics study)
+            dist.init_process_group(os.environ.get("NVFP4_DIST_BACKEND", "nccl"),
+                                    init_method="tcp://127.0.0.1:29533", rank=0, world_size=1)
+        global EP_GROUP, EP_NODE
+        EP_GROUP, EP_NODE = dist.group.WORLD, a.moe_ep_node_size
+        if a.sm_margin:
+            from nvfp4 import ops as _ops
+            _ops.set_sm_margin(a.sm_margin)
     if a.moe_experts:
         moe = (a.moe_experts, a.moe_topk, a.moe_dff or 4 * a.d // a.moe_topk, a.moe_capacity, a.moe_shared)
     model = GPT(50304, a.d, a.layers, a.heads, a.ctx, moe=moe, moe_aux=a.moe_aux).cuda()
@@ -254,9 +265,9 @@ def main():
         for i, blk in enumerate(model.blocks):
             blk.attn_8bit = a.precision == "bf16" or i < a.layers - a.hp_last
             blk.attn_backward = a.attn_backward
-    if a.moe_ep_wire:
+    if ep:
         for blk in model.blocks:
-            blk.moe.ep_dispatch = "variable"
+            blk.moe.ep_dispatch, blk.moe.ep_chunks = "variable", a.moe_ep_chunks
             blk.moe.ep_wire = "nvfp4" if a.moe_ep_wire.startswith("nvfp4") else "bf16"
             blk.moe.ep_wire_grad = "nvfp4" if a.moe_ep_wire == "nvfp4+grad" else "bf16"
     n_params = sum(p.numel() for p in model.parameters())
@@ -264,6 +275,9 @@ def main():
     fwd = model
     if ddp:
         from torch.nn.parallel import DistributedDataParallel as DDP
+        if ep:  # the experts differ per rank: DDP averages the rest
+            from nvfp4.moe import ignore_expert_parameters_in_ddp
+            ignore_expert_parameters_in_ddp(model)
         fwd = DDP(model, device_ids=[torch.cuda.current_device()])
         torch.cuda.manual_seed(a.seed * 7919 + rank + 1)  # independent rounding seeds per rank
     sched = lambda s: min(1.0, (s + 1) / a.warmup) * (0.1 + 0.9 * 0.5 * (1 + math.cos(math.pi * min(s, a.steps) / a.steps)))  # noqa: E731
@@ -314,6 +328,9 @@ def main():
                 (loss / accum).backward()
             loss_acc += loss.detach() / accum
         loss = loss_acc
+        if ep and ddp:  # expert gradients sum every rank's tokens; DDP averages the others
+            from nvfp4.moe import scale_expert_grads
+            scale_expert_grads(model)
         gn = torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
         opt.step()
         opt.zero_grad(set_to_none=True)
@@ -341,7 +358,7 @@ def main():
     torch.cuda.synchronize()
     del model, opt, fwd
     torch.cuda.empty_cache()
-    if ddp or a.moe_ep_wire:
+    if ddp or ep:
         torch.distributed.destroy_process_group()
 
 

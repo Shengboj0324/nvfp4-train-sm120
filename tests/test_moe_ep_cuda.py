@@ -262,3 +262,96 @@ def test_multi_gpu_nccl_variable_ep():
     else:
         _spawn(2, [("fp32", None, 1, 1), ("fp32", 0.75, 1, 3), ("fp32", None, 2, 2), ("nvfp4", 1), ("nvfp4", 2)],
                "nccl")
+
+
+def test_variable_ep_validation():
+    class _G:  # a stand-in group: only the size and rank are read before the checks
+        pass
+    import torch.distributed as dist
+    orig = dist.get_world_size, dist.get_rank
+    dist.get_world_size, dist.get_rank = (lambda g=None: 2), (lambda g=None: 0)
+    try:
+        with pytest.raises(ValueError):
+            MoE(256, 256, 4, ep_group=_G(), ep_node_size=3)  # 2 ranks don't split into nodes of 3
+        with pytest.raises(ValueError):
+            MoE(256, 256, 4, ep_node_size=2)  # nodes without expert parallelism
+        m = MoE(256, 256, 4, capacity_factor=1.0, ep_group=_G())
+        assert m._ep_mode(8) == "fixed" and m._ep_mode(None) == "variable"
+        m.ep_chunks = 2
+        assert m._ep_mode(8) == "variable"  # auto: chunks need variable-size exchanges
+        m.ep_dispatch = "fixed"
+        with pytest.raises(ValueError):
+            m._ep_mode(8)
+        m.ep_chunks = 1
+        with pytest.raises(ValueError):
+            m._ep_mode(None)  # fixed-size exchanges need a capacity
+        for attr, bad in (("ep_wire", "fp8"), ("ep_chunks", 0), ("ep_dispatch", "x")):
+            m2 = MoE(256, 256, 4, ep_group=_G())
+            setattr(m2, attr, bad)
+            with pytest.raises(ValueError):
+                m2._ep_mode(None)
+    finally:
+        dist.get_world_size, dist.get_rank = orig
+
+
+class _Net(torch.nn.Module):
+    def __init__(self, group=None, node=1):
+        super().__init__()
+        self.inp = torch.nn.Linear(256, 256)
+        self.moe = MoE(256, 256, E, top_k=K, shared_d_ff=256, bias=True, ep_group=group, ep_node_size=node)
+
+    def forward(self, x):
+        return self.moe(torch.tanh(self.inp(x)))
+
+
+def _ddp_ep_worker(rank, world, port, backend="gloo"):
+    """DDP over the dense parameters + expert parallelism over the same ranks equals one process training on
+    every rank's batch (the mean loss): the dense gradients by DDP's average, the experts' after
+    scale_expert_grads."""
+    import datetime
+
+    import torch.distributed as dist
+    from torch.nn.parallel import DistributedDataParallel as DDP
+
+    from nvfp4.moe import ignore_expert_parameters_in_ddp, scale_expert_grads
+    os.environ["MASTER_ADDR"], os.environ["MASTER_PORT"] = "127.0.0.1", str(port)
+    torch.set_num_threads(2)
+    torch.cuda.set_device(rank if backend == "nccl" else 0)
+    dist.init_process_group(backend, rank=rank, world_size=world, timeout=datetime.timedelta(minutes=4))
+    try:
+        torch.manual_seed(0)
+        ref = _Net().to(DEV)
+        net = _Net(dist.group.WORLD).to(DEV)
+        El = E // world
+        with torch.no_grad():
+            for n, p in net.named_parameters():
+                q = dict(ref.named_parameters())[n]
+                p.copy_(q[rank * El:(rank + 1) * El] if n.startswith(("moe.w_", "moe.b_")) else q)
+        names = ignore_expert_parameters_in_ddp(net)
+        assert sorted(names) == sorted(n for n, _ in net.named_parameters() if n.startswith(("moe.w_", "moe.b_")))
+        ddp = DDP(net, device_ids=[torch.cuda.current_device()] if backend == "nccl" else None)
+        xs = [_data(r)[0] for r in range(world)]
+        ddp(xs[rank]).pow(2).mean().backward()
+        scale_expert_grads(net)
+        ref(torch.cat(xs)).pow(2).mean().backward()
+        for n, p in net.named_parameters():
+            want = dict(ref.named_parameters())[n].grad
+            if n.startswith(("moe.w_", "moe.b_")):
+                want = want[rank * El:(rank + 1) * El]
+            torch.testing.assert_close(p.grad, want, rtol=1e-4, atol=1e-6, msg=lambda m: f"{n}: {m}")
+        dist.barrier()
+    finally:
+        dist.destroy_process_group()
+
+
+def test_ddp_with_expert_parallelism():
+    import torch.distributed as dist
+    import torch.multiprocessing as mp
+    from conftest import gloo_cuda_reductions_ok
+    from test_integration_cuda import _free_port
+    if not dist.is_available() or not dist.is_gloo_available():
+        pytest.skip("gloo not available")
+    if not gloo_cuda_reductions_ok():
+        pytest.skip("gloo all_reduce of CUDA tensors crashes in this PyTorch build")
+    os.environ.setdefault("OMP_NUM_THREADS", "2")
+    mp.spawn(_ddp_ep_worker, args=(2, _free_port()), nprocs=2, join=True)
