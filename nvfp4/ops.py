@@ -50,6 +50,22 @@ def four_six() -> bool:
     return _FOUR_SIX[0]
 
 
+def set_sm_margin(n: int) -> None:
+    """Leave ``n`` SMs free in the persistent NVFP4 GEMMs (default 0: one CTA on every SM). Kernels that run at
+    the same time on another stream, such as the all-to-alls of overlapped expert parallelism (``MoE.ep_chunks``,
+    the shared expert during an exchange), otherwise find no SM free while a GEMM runs: they wait for it, or
+    the CTAs that could not start delay their part of the GEMM until the transfer ends. Read at launch."""
+    if n < 0:
+        raise ValueError(f"the SM margin must be >= 0, got {n}")
+    if _C is not None:
+        _C.set_sm_margin(int(n))
+
+
+def sm_margin() -> int:
+    """The persistent GEMMs' SM margin (``set_sm_margin``)."""
+    return int(_C.sm_margin()) if _C is not None else 0
+
+
 _WEIGHT_BLOCKS = ["2d"]
 
 
@@ -189,7 +205,8 @@ def quantize(x: torch.Tensor, *, transpose: bool = False, block_2d: bool = False
 
 def quantize_dual(x: torch.Tensor | list[torch.Tensor] | tuple[torch.Tensor, ...], *, row: bool = True,
                   col: bool = True, block_2d: bool = False, row_sr_seed: Seed = None, col_sr_seed: Seed = None,
-                  rht_seed: Seed = None, col_pad: int = 16, bias_grad: bool = False):
+                  rht_seed: Seed = None, col_pad: int = 16, bias_grad: bool = False,
+                  amax_floor: torch.Tensor | None = None):
     """One read of ``x`` [R, C] -> (``x`` quantized along C, ``x.T`` quantized along R).
 
     The second output is padded with zero rows of ``x`` to a multiple of ``col_pad`` and optionally
@@ -202,6 +219,9 @@ def quantize_dual(x: torch.Tensor | list[torch.Tensor] | tuple[torch.Tensor, ...
     ``bias_grad=True`` also returns the column sums of ``x`` (fp32 [C], the gradient of a bias added to the
     layer output ``x`` is the gradient of), from the same read: ``(row, col, bias_grad)``;
     ``bias_grad="tiles"`` returns the per-64-row-tile sums instead (see _colsums).
+    ``amax_floor`` (one fp32 element on x's device): the tensor scale of the row output (and of the col output
+    without RHT) comes from max(amax(x), amax_floor) instead of amax(x), e.g. one scale for the ranks of an
+    expert-parallel group (re-quantizing dequantized values with the same scale reproduces the codes).
     """
     if isinstance(x, (list, tuple)) or bias_grad:
         parts = list(x) if isinstance(x, (list, tuple)) else [x]
@@ -209,12 +229,20 @@ def quantize_dual(x: torch.Tensor | list[torch.Tensor] | tuple[torch.Tensor, ...
             raise ValueError("block_2d is not supported for multi-part inputs / bias_grad")
         outs = _lib.quantize_dual_parts(parts, row, col, *_seed_flags(row_sr_seed, col_sr_seed, rht_seed),
                                         int(col_pad), *_seed_tensors(row_sr_seed, col_sr_seed, rht_seed),
-                                        bool(bias_grad))
+                                        bool(bias_grad), amax_floor)
         pair = _pair(outs[:6], row, col)
         return (*pair, _colsums(outs[6], bias_grad)) if bias_grad else pair
     outs = _lib.quantize_dual(x, row, col, block_2d, *_seed_flags(row_sr_seed, col_sr_seed, rht_seed), int(col_pad),
-                              *_seed_tensors(row_sr_seed, col_sr_seed, rht_seed))
+                              *_seed_tensors(row_sr_seed, col_sr_seed, rht_seed), amax_floor)
     return _pair(outs, row, col)
+
+
+def dequantize(data: torch.Tensor, scales: torch.Tensor, gdec: torch.Tensor,
+               dtype: torch.dtype = torch.bfloat16) -> torch.Tensor:
+    """NVFP4 rows (``data`` uint8 [R, C/2], ``scales`` uint8 [R, C/16], both may be row-strided views) -> [R, C] in
+    ``dtype`` (bf16 or fp32), bit-identical to ``reference.dequantize(...).to(dtype)``. ``gdec``: the tensor decode
+    scale, one fp32 element or one per row (e.g. a column of a received message, any row stride)."""
+    return _lib.dequantize(data, scales, gdec, dtype)
 
 
 def _colsums(partial: torch.Tensor, bias_grad) -> torch.Tensor:

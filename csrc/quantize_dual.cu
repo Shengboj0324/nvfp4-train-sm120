@@ -601,7 +601,8 @@ std::vector<torch::Tensor> run_dual(const torch::Tensor& x, int pro, const torch
                                     const float* rstd, const float* gamma, const float* beta, bool do_row, bool do_col,
                                     bool block_2d, bool row_sr, int64_t row_seed, bool col_sr, int64_t col_seed,
                                     bool col_rht, int64_t rht_seed, int64_t col_pad, const SeedTensors& seeds,
-                                    bool col_sums = false, const std::vector<torch::Tensor>* parts = nullptr) {
+                                    bool col_sums = false, const std::vector<torch::Tensor>* parts = nullptr,
+                                    const OptTensor& amax_floor = c10::nullopt) {
   TORCH_CHECK(x.is_cuda() && x.dim() == 2 && x.is_contiguous(), "x must be a contiguous 2D CUDA tensor");
   TORCH_CHECK(x.scalar_type() == at::kBFloat16 || x.scalar_type() == at::kFloat, "x must be bf16 or fp32");
   TORCH_CHECK(reinterpret_cast<uintptr_t>(x.data_ptr()) % 16 == 0, "x must be 16-byte aligned");
@@ -673,6 +674,14 @@ std::vector<torch::Tensor> run_dual(const torch::Tensor& x, int pro, const torch
   }
 
   auto amax = torch::zeros({3}, x.options().dtype(at::kInt));
+  if (amax_floor.has_value() && amax_floor->defined()) {
+    // the plain amax (row output; col output without RHT) starts at the floor: the passes only raise it, so the
+    // tensor scale comes from max(amax(x), floor), e.g. one scale shared by the ranks of an expert-parallel group
+    TORCH_CHECK(amax_floor->is_cuda() && amax_floor->device() == x.device() &&
+                    amax_floor->scalar_type() == at::kFloat && amax_floor->numel() == 1,
+                "amax_floor must be one fp32 element on x's device");
+    amax.narrow(0, 0, 1).copy_(amax_floor->reshape({1}).abs().view(at::kInt));
+  }
   auto* amax_ptr = reinterpret_cast<unsigned int*>(amax.data_ptr<int>());
   auto stream = at::cuda::getCurrentCUDAStream();
   Outputs o{do_row ? rd.data_ptr<uint8_t>() : nullptr, do_row ? rs.data_ptr<uint8_t>() : nullptr,
@@ -781,10 +790,10 @@ std::vector<torch::Tensor> nvfp4_quantize_dual(torch::Tensor x, bool do_row, boo
                                                bool row_sr, int64_t row_seed, bool col_sr, int64_t col_seed,
                                                bool col_rht, int64_t rht_seed, int64_t col_pad,
                                                const OptTensor& row_seed_t, const OptTensor& col_seed_t,
-                                               const OptTensor& rht_seed_t) {
+                                               const OptTensor& rht_seed_t, const OptTensor& amax_floor) {
   return run_dual(x, kNone, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, do_row, do_col, block_2d, row_sr,
-                  row_seed,
-                  col_sr, col_seed, col_rht, rht_seed, col_pad, {row_seed_t, col_seed_t, rht_seed_t});
+                  row_seed, col_sr, col_seed, col_rht, rht_seed, col_pad, {row_seed_t, col_seed_t, rht_seed_t}, false,
+                  nullptr, amax_floor);
 }
 
 // quantize_dual of the concatenation of 1-3 same-shaped tensors along dim 1 (e.g. the q, k, v gradients of a
@@ -794,11 +803,12 @@ std::vector<torch::Tensor> nvfp4_quantize_dual_parts(std::vector<torch::Tensor> 
                                                      bool row_sr, int64_t row_seed, bool col_sr, int64_t col_seed,
                                                      bool col_rht, int64_t rht_seed, int64_t col_pad,
                                                      const OptTensor& row_seed_t, const OptTensor& col_seed_t,
-                                                     const OptTensor& rht_seed_t, bool col_sums) {
+                                                     const OptTensor& rht_seed_t, bool col_sums,
+                                                     const OptTensor& amax_floor) {
   TORCH_CHECK(!parts.empty(), "no input");
   return run_dual(parts[0], kNone, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, do_row, do_col, false, row_sr,
                   row_seed, col_sr, col_seed, col_rht, rht_seed, col_pad, {row_seed_t, col_seed_t, rht_seed_t},
-                  col_sums, &parts);
+                  col_sums, &parts, amax_floor);
 }
 
 // LayerNorm fused into the dual quantizer: quantizes y = LayerNorm(x; gamma, beta, eps) without

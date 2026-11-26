@@ -280,7 +280,9 @@ def test_expert_parallel_overlap_order(monkeypatch, cf):
     if not dist.is_available() or not dist.is_gloo_available():
         pytest.skip("gloo not available")
     events = []
-    for cls, tag in ((moe_mod._ExchangeStart, "start"), (moe_mod._ExchangeWait, "wait")):
+    # capacity: the fixed-size exchanges; dropless: the variable-size ones (one token per rank)
+    classes = (moe_mod._ExchangeStart, moe_mod._ExchangeWait) if cf is not None else (moe_mod._XStart, moe_mod._XWait)
+    for cls, tag in zip(classes, ("start", "wait")):
         for fn in ("forward", "backward"):
             orig = getattr(cls, fn)
 

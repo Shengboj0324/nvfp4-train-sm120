@@ -7,12 +7,15 @@ std::vector<torch::Tensor> nvfp4_quantize(torch::Tensor x, bool transpose, bool 
 std::vector<torch::Tensor> nvfp4_quantize_dual(torch::Tensor x, bool do_row, bool do_col, bool block_2d,
                                                bool row_sr, int64_t row_seed, bool col_sr, int64_t col_seed,
                                                bool col_rht, int64_t rht_seed, int64_t col_pad,
-                                               const OptTensor& row_seed_t, const OptTensor& col_seed_t, const OptTensor& rht_seed_t);
+                                               const OptTensor& row_seed_t, const OptTensor& col_seed_t, const OptTensor& rht_seed_t,
+                                               const OptTensor& amax_floor);
+torch::Tensor nvfp4_dequantize(torch::Tensor data, torch::Tensor scales, torch::Tensor gdec, at::ScalarType out_dtype);
 std::vector<torch::Tensor> nvfp4_quantize_dual_parts(std::vector<torch::Tensor> parts, bool do_row, bool do_col,
                                                      bool row_sr, int64_t row_seed, bool col_sr, int64_t col_seed,
                                                      bool col_rht, int64_t rht_seed, int64_t col_pad,
                                                      const OptTensor& row_seed_t, const OptTensor& col_seed_t,
-                                                     const OptTensor& rht_seed_t, bool col_sums);
+                                                     const OptTensor& rht_seed_t, bool col_sums,
+                                                     const OptTensor& amax_floor);
 std::vector<torch::Tensor> nvfp4_layernorm_quantize_dual(torch::Tensor x, torch::Tensor gamma, torch::Tensor beta,
                                                          double eps, bool do_row, bool do_col, bool row_sr,
                                                          int64_t row_seed, bool col_sr, int64_t col_seed, bool col_rht,
@@ -61,6 +64,7 @@ torch::Tensor nvfp4_gemm(torch::Tensor a, torch::Tensor sfa, torch::Tensor gdec_
                          c10::optional<torch::Tensor> residual, bool bias_round);
 
 void nvfp4_set_four_six(bool on);
+namespace nvfp4 { namespace gemm { void set_sm_margin(int64_t n); int64_t sm_margin(); } }
 bool nvfp4_four_six();
 void nvfp4_set_ms_eden(bool on);
 bool nvfp4_ms_eden();
@@ -89,13 +93,16 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
         py::arg("x"), py::arg("do_row") = true, py::arg("do_col") = true, py::arg("block_2d") = false,
         py::arg("row_sr") = false, py::arg("row_seed") = 0, py::arg("col_sr") = false, py::arg("col_seed") = 0,
         py::arg("col_rht") = false, py::arg("rht_seed") = 0, py::arg("col_pad") = 16, py::arg("row_seed_t") = py::none(), py::arg("col_seed_t") = py::none(),
-        py::arg("rht_seed_t") = py::none());
+        py::arg("rht_seed_t") = py::none(), py::arg("amax_floor") = py::none());
+  m.def("dequantize", &nvfp4_dequantize, "NVFP4 rows -> bf16 / fp32 (reference.dequantize)", py::arg("data"),
+        py::arg("scales"), py::arg("gdec"), py::arg("out_dtype"));
   m.def("quantize_dual_parts", &nvfp4_quantize_dual_parts,
         "quantize_dual of the concatenation (dim 1) of 1-3 tensors, read in place (+ per-tile column sums)",
         py::arg("parts"), py::arg("do_row") = true, py::arg("do_col") = true, py::arg("row_sr") = false,
         py::arg("row_seed") = 0, py::arg("col_sr") = false, py::arg("col_seed") = 0, py::arg("col_rht") = false,
         py::arg("rht_seed") = 0, py::arg("col_pad") = 16, py::arg("row_seed_t") = py::none(),
-        py::arg("col_seed_t") = py::none(), py::arg("rht_seed_t") = py::none(), py::arg("col_sums") = false);
+        py::arg("col_seed_t") = py::none(), py::arg("rht_seed_t") = py::none(), py::arg("col_sums") = false,
+        py::arg("amax_floor") = py::none());
   m.def("layernorm_quantize_dual", &nvfp4_layernorm_quantize_dual,
         "LayerNorm fused into quantize_dual: returns mean, rstd and the quantize_dual outputs of LayerNorm(x)",
         py::arg("x"), py::arg("gamma"), py::arg("beta"), py::arg("eps"), py::arg("do_row") = true,
@@ -150,6 +157,8 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
   m.def("set_four_six", &nvfp4_set_four_six, "Enable / disable Four Over Six block scales on round-to-nearest NVFP4 outputs",
         py::arg("on"));
   m.def("four_six", &nvfp4_four_six, "Whether Four Over Six block scales are enabled");
+  m.def("set_sm_margin", &nvfp4::gemm::set_sm_margin, "SMs the persistent GEMMs leave free", py::arg("n"));
+  m.def("sm_margin", &nvfp4::gemm::sm_margin, "SMs the persistent GEMMs leave free");
   m.def("set_ms_eden", &nvfp4_set_ms_eden,
         "Enable / disable MS-EDEN (64-point RHT, EDEN-corrected scales instead of element SR) on wgrad operands",
         py::arg("on"));

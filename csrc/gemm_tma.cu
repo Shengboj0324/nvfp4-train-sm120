@@ -23,6 +23,7 @@
 #include <cuda_runtime.h>
 
 #include <algorithm>
+#include <atomic>
 #include <cstring>
 #include <stdexcept>
 #include <string>
@@ -33,6 +34,10 @@
 
 namespace nvfp4 {
 namespace gemm {
+// SMs the persistent kernels leave free (ops.set_sm_margin): communication kernels running at the same time
+// (expert-parallel all-to-alls) then find SMs instead of waiting for, or delaying, a GEMM that holds them all.
+static std::atomic<int> g_sm_margin{0};
+
 namespace tma {
 
 #ifndef NVFP4_TMA_BK
@@ -583,6 +588,7 @@ void launch(const Args& p, const CUtensorMap (&maps)[4], dim3 grid, cudaStream_t
   int dev = 0, sms = 0;
   C10_CUDA_CHECK(cudaGetDevice(&dev));
   C10_CUDA_CHECK(cudaDeviceGetAttribute(&sms, cudaDevAttrMultiProcessorCount, dev));
+  sms = std::max(1, sms - g_sm_margin.load(std::memory_order_relaxed));
   const dim3 pgrid(std::max(1, std::min(units, sms)));
   nvfp4_gemm_tma_kernel<OutT, kAccum, G><<<pgrid, THREADS, SMEM_BYTES, stream>>>(p, prm[0], prm[1], prm[2], prm[3]);
 }
@@ -590,6 +596,8 @@ void launch(const Args& p, const CUtensorMap (&maps)[4], dim3 grid, cudaStream_t
 }  // namespace tma
 
 int tma_k_tile() { return tma::BK; }
+void set_sm_margin(int64_t n) { g_sm_margin.store(static_cast<int>(std::max<int64_t>(0, n))); }
+int64_t sm_margin() { return g_sm_margin.load(); }
 
 // Grouped GEMMs (Args::group_mode 1 / 2): A has a_map_rows rows, B b_map_rows; scale rows have stride p.sf_ld
 // bytes (a multiple of 16, >= K / 16). Launches `units` persistent CTAs at most. Returns false (nothing

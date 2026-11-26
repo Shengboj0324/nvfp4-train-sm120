@@ -40,6 +40,7 @@ Per step that is a fixed number of kernels, independent of the number of experts
 """
 from __future__ import annotations
 
+import contextlib
 import math
 from typing import NamedTuple
 
@@ -116,14 +117,14 @@ class _GroupedSwiGLU(torch.autograd.Function):
     need_w, need_b, fuse, out_dtype)."""
 
     @staticmethod
-    def forward(ctx, xs, wg, wu, wd, bg, bu, bd, tiles, trows, segs_d, segs_f, caches, cfg):
+    def forward(ctx, xs, wg, wu, wd, bg, bu, bd, tiles, trows, segs_d, segs_f, caches, cfg, x_amax):
         rht, need_dx, need_w, need_b, fuse, dt = cfg
         E, f, d = wg.shape
         need_a = need_dx or need_w or need_b  # the gradient flows back through down and the SwiGLU
         # [dG row SR, dG^T SR, RHT of x^T, dOut row SR, dOut^T SR, RHT of a^T, dU row SR, dU^T SR]
         seeds = draw_seeds(8, xs.device) if need_a else None
         xq, xtq = ops.quantize_dual(xs.to(BF16), col=need_w, rht_seed=seeds[2] if need_w and rht else None,
-                                    col_pad=ALIGN)
+                                    col_pad=ALIGN, amax_floor=x_amax)
         wgq, wgt = _stack(wg, need_dx, caches[0], seeds[0] if need_dx else None)
         wuq, wut = _stack(wu, need_dx, caches[1], seeds[6] if need_dx else None)
         wdq, wdt = _stack(wd, need_a, caches[2], seeds[3] if need_a else None)
@@ -153,7 +154,7 @@ class _GroupedSwiGLU(torch.autograd.Function):
         nin = ctx.needs_input_grad
         do_dx, do_wg, do_wu, do_wd = need_dx and nin[0], need_w and nin[1], need_w and nin[2], need_w and nin[3]
         do_bg, do_bu, do_bd = nin[4], nin[5], nin[6]
-        grads = [None] * 13
+        grads = [None] * 14
         do_a = do_dx or do_wg or do_wu or do_bg or do_bu
         wg, wu, wd, bg, bu, bd = ctx.params
         doq, dotq, *part = _quantize_grad(dy.contiguous(), do_a, do_wd, seeds[3:6], rht, do_bd)
@@ -200,13 +201,13 @@ class _GroupedGelu(torch.autograd.Function):
     need_b, fuse, out_dtype, approximate)."""
 
     @staticmethod
-    def forward(ctx, xs, w1, w2, b1, b2, tiles, trows, segs_d, segs_f, caches, cfg):
+    def forward(ctx, xs, w1, w2, b1, b2, tiles, trows, segs_d, segs_f, caches, cfg, x_amax):
         rht, need_dx, need_w, need_b, fuse, dt, approximate = cfg
         E, f, d = w1.shape
         need_h = need_dx or need_w or need_b
         seeds = draw_seeds(6, xs.device) if need_h else None  # [dH row SR, dH^T SR, RHT x^T, dOut row, col, RHT]
         xq, xtq = ops.quantize_dual(xs.to(BF16), col=need_w, rht_seed=seeds[2] if need_w and rht else None,
-                                    col_pad=ALIGN)
+                                    col_pad=ALIGN, amax_floor=x_amax)
         w1q, w1t = _stack(w1, need_dx, caches[0], seeds[0] if need_dx else None)
         w2q, w2t = _stack(w2, need_h, caches[1], seeds[3] if need_h else None)
         h = ops.gemm_grouped(xq, w1q, "m", tiles, group_rows=f, bias=b1, tile_rows=trows)  # h includes b1
@@ -234,7 +235,7 @@ class _GroupedGelu(torch.autograd.Function):
         nin = ctx.needs_input_grad
         do_dx, do_w1, do_w2 = need_dx and nin[0], need_w and nin[1], need_w and nin[2]
         do_b1, do_b2 = nin[3], nin[4]
-        grads = [None] * 11
+        grads = [None] * 12
         do_h = do_dx or do_w1 or do_b1
         w1, w2, b1, b2 = ctx.params
         doq, dotq, *part = _quantize_grad(dy.contiguous(), do_h, do_w2, seeds[3:6], rht, do_b2)
@@ -376,6 +377,225 @@ def _exchange(x: torch.Tensor, group, send=None, recv=None, overlap=None):
     return _ExchangeWait.apply(out, group, send, recv, pend), res
 
 
+# --- variable-size expert-parallel exchanges: each token once per rank (or node), payloads in bytes --------------
+
+def _bytes(t: torch.Tensor) -> torch.Tensor:
+    """A 2D tensor's rows as bytes, uint8 [R, C * itemsize]."""
+    return t.contiguous().view(torch.uint8)
+
+
+@contextlib.contextmanager
+def _plain_rows():
+    """Under MS-EDEN on dgrad the dual quantizer rotates its stochastically rounded row output; a message holds
+    the plain rows."""
+    prev = ops.ms_eden_dgrad()
+    if prev:
+        ops.set_ms_eden(True, dgrad=False)
+    try:
+        yield
+    finally:
+        if prev:
+            ops.set_ms_eden(True, dgrad=True)
+
+
+def _encode(x: torch.Tensor, wire: str, amax=None, sr_seed=None) -> torch.Tensor:
+    """x's rows as bytes: raw, or ``wire="nvfp4"``: NVFP4 codes and block scales with the tensor scale of
+    ``amax`` (round-to-nearest, or stochastic with ``sr_seed``), then the tensor decode scale and the amax as
+    fp32 in every row (9 d / 16 + 8 bytes for d values, 3.6x fewer than bf16 at d = 1024)."""
+    if wire != "nvfp4":
+        return _bytes(x)
+    with _plain_rows():
+        q, _ = ops.quantize_dual(x.to(BF16).contiguous(), row=True, col=False, row_sr_seed=sr_seed, amax_floor=amax)
+    tail = torch.cat([q.gdec.reshape(1), amax.reshape(1).float()]).view(1, 2).expand(x.shape[0], 2)
+    return torch.cat([q.data, q.scales, _bytes(tail)], 1)
+
+
+def _decode(buf: torch.Tensor, o: int, d: int, dtype, wire: str):
+    """(rows [R, d] in ``dtype`` from the bytes buf[:, o:], their tensor amax (NVFP4 rows: one fp32 element,
+    None without rows; raw rows: None), the offset after them)."""
+    if wire != "nvfp4":
+        n = d * dtype.itemsize
+        return buf[:, o:o + n].view(dtype), None, o + n
+    t = o + d // 2 + d // 16
+    tail = buf[:, t:t + 8].view(torch.float32)  # per row: (gdec, amax)
+    x = ops.dequantize(buf[:, o:o + d // 2], buf[:, o + d // 2:t], tail[:, 0], dtype)
+    return x, (tail[:1, 1].contiguous() if buf.shape[0] else None), t + 8
+
+
+def _global_max(t: torch.Tensor, group) -> torch.Tensor:
+    """The max over ``group``'s ranks of a one-element tensor (by all-to-all: gloo on PyTorch 2.11 Windows
+    crashes reducing CUDA tensors)."""
+    W = dist.get_world_size(group)
+    out = torch.empty(W, device=t.device, dtype=torch.float32)
+    dist.all_to_all_single(out, t.reshape(1).float().expand(W).contiguous(), group=group)
+    return out.max().reshape(1)
+
+
+class _Box:
+    """A tensor handed from one autograd node of a forward to another (an NVFP4 gradient message's amax)."""
+    __slots__ = ("amax",)
+
+    def __init__(self):
+        self.amax = None
+
+
+class _Xchg:
+    """One all-to-all of a row payload over ``group`` (``send`` / ``recv``: rows per rank) and, in the
+    backward, of the payload's gradients the other way.
+
+    Payload: x [R, d] (``dtype``; ``wire="nvfp4"``: NVFP4 with the tensor amax ``amax``), optionally routing
+    weights w [R, k] (fp32) and ids [R, k] (int32), packed into one byte message per rank. Gradients: x's
+    (``wire_grad="nvfp4"``: stochastically rounded NVFP4 with the tensor amax ``grad_amax``, a process group to
+    take the max over or a _Box filled by an earlier backward node) and w's (fp32). ``box``: receives the amax
+    of NVFP4 gradients arriving here. start() / finish(): whatever runs between them overlaps the transfer, and
+    in the backward runs between the reverse transfer's start (finish's backward) and its end."""
+
+    def __init__(self, group, send, recv, d: int, dtype, k: int = 0, w: bool = False, ids: bool = False,
+                 wire: str = "bf16", amax=None, wire_grad: str = "bf16", grad_amax=None, box: _Box | None = None):
+        self.group, self.send, self.recv, self.d, self.dtype, self.k = group, send, recv, d, dtype, k
+        self.w, self.ids, self.wire, self.amax = w, ids, wire, amax
+        self.wire_grad, self.grad_amax, self.box = wire_grad, grad_amax, box
+        self.work = self.out = self.bwork = self.bout = None
+
+    def start(self, x, w=None, ids=None):
+        return _XStart.apply(self, x, w, ids)
+
+    def finish(self, handle):
+        """(x, w, ids) received (None where not in the payload)."""
+        outs = list(_XWait.apply(handle, self))
+        x = outs.pop(0)
+        w = outs.pop(0) if self.w else None
+        return x, w, (outs.pop(0) if self.ids else None)
+
+
+class _XStart(torch.autograd.Function):
+    @staticmethod
+    def forward(ctx, xc: _Xchg, x, w, ids):
+        ctx.xc = xc
+        parts = [_encode(x, xc.wire, xc.amax)]
+        if xc.w:
+            parts.append(_bytes(w.float()))
+        if xc.ids:
+            parts.append(_bytes(ids.to(torch.int32)))
+        buf = torch.cat(parts, 1) if len(parts) > 1 else parts[0]
+        xc.out, xc.work = _a2a(buf, xc.send, xc.recv, xc.group, True)
+        return x.new_zeros(())  # a handle: carries the autograd link to _XWait
+
+    @staticmethod
+    def backward(ctx, _):
+        xc = ctx.xc
+        xc.bwork.wait()
+        buf, xc.bwork, xc.bout = xc.bout, None, None
+        gx, amax, o = _decode(buf, 0, xc.d, xc.dtype, xc.wire_grad)
+        if amax is not None and xc.box is not None:
+            xc.box.amax = amax
+        gw = buf[:, o:o + 4 * xc.k].view(torch.float32) if xc.w else None
+        return None, gx, gw, None
+
+
+class _XWait(torch.autograd.Function):
+    @staticmethod
+    def forward(ctx, handle, xc: _Xchg):
+        ctx.xc = xc
+        ctx.set_materialize_grads(False)
+        xc.work.wait()
+        buf, xc.work, xc.out = xc.out, None, None
+        x, _, o = _decode(buf, 0, xc.d, xc.dtype, xc.wire)
+        outs = [x]
+        if xc.w:
+            outs.append(buf[:, o:o + 4 * xc.k].view(torch.float32))
+            o += 4 * xc.k
+        if xc.ids:
+            outs.append(buf[:, o:o + 4 * xc.k].view(torch.int32))
+        ctx.rows, ctx.dev = buf.shape[0], buf.device
+        return tuple(outs)
+
+    @staticmethod
+    def backward(ctx, gx, *rest):
+        xc, R, dev = ctx.xc, ctx.rows, ctx.dev
+        gx = torch.zeros(R, xc.d, device=dev, dtype=xc.dtype) if gx is None else gx.to(xc.dtype)
+        amax = seed = None
+        if xc.wire_grad == "nvfp4":
+            local = gx.abs().amax().float().reshape(1) if R else torch.zeros(1, device=dev)
+            if isinstance(xc.grad_amax, _Box):
+                amax = xc.grad_amax.amax if xc.grad_amax.amax is not None else local
+            else:
+                amax = _global_max(local, xc.grad_amax)
+            seed = draw_seeds(1, dev)[0]
+        parts = [_encode(gx, xc.wire_grad, amax, seed)]
+        if xc.w:
+            gw = rest[0] if rest and rest[0] is not None else torch.zeros(R, xc.k, device=dev)
+            parts.append(_bytes(gw.float()))
+        buf = torch.cat(parts, 1) if len(parts) > 1 else parts[0]
+        xc.bout, xc.bwork = _a2a(buf, xc.recv, xc.send, xc.group, True)
+        return torch.zeros((), device=dev), None
+
+
+class _Route(NamedTuple):
+    """Rows with k choices each, sent once per (row, member) of a group (_route)."""
+    src: torch.Tensor   # int64 [n + 1]: the row each sent row copies (the last: R, a zero row that is not sent)
+    pos: torch.Tensor   # int64 [R, k]: the sent row of each (row, choice), for the first choice per member; else n
+    rows: torch.Tensor  # int64 [n]: src[:n]
+    mask: torch.Tensor  # bool [n, k]: the choices of each sent row that its member takes
+    ids: torch.Tensor   # int32 [n, k]: those choices' ids within the member, -1 elsewhere
+
+
+def _first_choices(ids: torch.Tensor, per: int, members: int):
+    """(member of each choice [R, k] (``members``: none), the choice is the row's first on its member)."""
+    k = ids.shape[1]
+    valid = ids >= 0
+    mem = torch.where(valid, ids // per, members)
+    earlier = torch.ones(k, k, dtype=torch.bool, device=ids.device).tril(-1)  # [j, j']: j' < j
+    dup = ((mem.unsqueeze(2) == mem.unsqueeze(1)) & earlier).any(2)
+    return mem, valid & ~dup
+
+
+def _route(ids: torch.Tensor, members: int, per: int, n: int) -> _Route:
+    """Routes rows whose k choices are ids [R, k] (-1: none) to ``members`` members holding ``per`` ids each
+    (id i on member i // per): one sent row per (row, member) pair, grouped by member, in row order. ``n``: the
+    number of pairs (known on the host). All on the GPU."""
+    R, k = ids.shape
+    dev = ids.device
+    mem, first = _first_choices(ids, per, members)
+    key = torch.where(first, mem * R + torch.arange(R, device=dev).unsqueeze(1), members * R)
+    order = torch.argsort(key.reshape(-1), stable=True)
+    sel = order[:n]
+    rows = sel // k
+    mask = mem.index_select(0, rows) == mem.reshape(-1).index_select(0, sel).unsqueeze(1)
+    sub = torch.where(mask, ids.index_select(0, rows) % per, -1).to(torch.int32)
+    inv = torch.empty_like(order).index_copy_(0, order, torch.arange(R * k, device=dev))
+    pos = torch.where(first.reshape(-1), inv, n).view(R, k)
+    return _Route(torch.cat([rows, rows.new_full((1,), R)]), pos, rows, mask, sub)
+
+
+def _gather_sum(rows: torch.Tensor, pos: torch.Tensor) -> torch.Tensor:
+    """out[r] = sum_j rows'[pos[r, j]], rows' = rows plus a zero row at index len(rows) (deterministic: each
+    real row is read once)."""
+    R, k = pos.shape
+    rows = torch.cat([rows, rows.new_zeros(1, rows.shape[1])])
+    g = rows.index_select(0, pos.reshape(-1)).view(R, k, rows.shape[1])
+    return g.float().sum(1).to(rows.dtype) if k > 1 else g[:, 0]
+
+
+_SUBGROUPS: dict = {}
+
+
+def _ep_subgroups(group, L: int):
+    """(node group, rail group) of this rank for nodes of L consecutive ranks of ``group``: the L ranks of its
+    node, and the ranks with its position in every node. Created once per (group, L) (new_group is collective:
+    every rank of the default group builds the same layers in the same order)."""
+    ranks = dist.get_process_group_ranks(group)
+    key = (tuple(ranks), L)
+    if key not in _SUBGROUPS:
+        N = len(ranks) // L
+        nodes = [dist.new_group([ranks[m * L + l] for l in range(L)]) for m in range(N)]
+        rails = [dist.new_group([ranks[m * L + l] for m in range(N)]) for l in range(L)]
+        _SUBGROUPS[key] = (nodes, rails)
+    nodes, rails = _SUBGROUPS[key]
+    r = dist.get_rank(group)
+    return nodes[r // L], rails[r % L]
+
+
 def _combine(ys: torch.Tensor, pos: torch.Tensor, w: torch.Tensor) -> torch.Tensor:
     """y[t] = sum_j w[t, j] ys[pos[t, j]]: a gather and a k-term weighted sum (deterministic; the gather's
     backward writes every row once, except the always-zero row dropped slots point to, which gets zeros)."""
@@ -419,7 +639,7 @@ class MoE(nn.Module):
 
     def __init__(self, d: int, d_ff: int, n_experts: int, top_k: int = 2, activation: str = "swiglu",
                  normalize_weights: bool = True, bias: bool = False, capacity_factor: float | None = None,
-                 shared_d_ff: int = 0, ep_group=None, device=None, dtype=None):
+                 shared_d_ff: int = 0, ep_group=None, ep_node_size: int = 1, device=None, dtype=None):
         super().__init__()
         if activation not in ("swiglu", "gelu_tanh", "gelu"):
             raise ValueError(f"activation must be swiglu, gelu_tanh or gelu, got {activation!r}")
@@ -429,11 +649,21 @@ class MoE(nn.Module):
             raise ValueError(f"capacity_factor must be positive, got {capacity_factor}")
         if shared_d_ff < 0:
             raise ValueError(f"shared_d_ff must be >= 0, got {shared_d_ff}")
-        self.ep_group, self.ep_size, self.ep_rank = ep_group, 1, 0
+        if ep_node_size < 1:
+            raise ValueError(f"ep_node_size must be >= 1, got {ep_node_size}")
+        self.ep_group, self.ep_size, self.ep_rank, self.ep_node_size = ep_group, 1, 0, ep_node_size
+        self._node_group = self._rail_group = None
         if ep_group is not None:
             self.ep_size, self.ep_rank = dist.get_world_size(ep_group), dist.get_rank(ep_group)
             if n_experts % self.ep_size:
                 raise ValueError(f"{n_experts} experts do not split over {self.ep_size} ranks")
+            if self.ep_size % ep_node_size:
+                raise ValueError(f"{self.ep_size} ranks do not split into nodes of {ep_node_size}")
+            self._rail_group = ep_group
+            if ep_node_size > 1:
+                self._node_group, self._rail_group = _ep_subgroups(ep_group, ep_node_size)
+        elif ep_node_size != 1:
+            raise ValueError("ep_node_size needs ep_group")
         self.d, self.d_ff, self.n_experts, self.top_k = d, d_ff, n_experts, top_k
         self.activation, self.normalize_weights = activation, normalize_weights
         self.capacity_factor, self.shared_d_ff = capacity_factor, shared_d_ff
@@ -452,12 +682,17 @@ class MoE(nn.Module):
         self.nvfp4 = False
         self.bf16_impl = "auto"
         self.ep_overlap = True
+        self.ep_dispatch = "auto"
+        self.ep_chunks = 1
+        self.ep_wire = "bf16"
+        self.ep_wire_grad = "bf16"
         self.wgrad_rht = True
         self.fuse_wgrad_accumulation = False
         self.cache_weight_quantization = False
         self._caches = tuple(WeightQuantCache() for _ in self._names)
         self._shared_caches = tuple(WeightQuantCache() for _ in self._names)
         self.aux_loss: torch.Tensor | None = None
+        self.last_ep_rows: tuple[int, int] | None = None
         self._counts: torch.Tensor | None = None
         self._dropped: torch.Tensor | None = None
 
@@ -505,7 +740,7 @@ class MoE(nn.Module):
         deepcopy refuses; none belongs to the module's state) and the process group (not copyable)."""
         state = self.__dict__.copy()
         state["aux_loss"] = state["_counts"] = state["_dropped"] = None
-        state["ep_group"] = None
+        state["ep_group"] = state["_node_group"] = state["_rail_group"] = None
         return state
 
     @property
@@ -564,7 +799,7 @@ class MoE(nn.Module):
                 outs.append(F.linear(h, ws[1][e], bs[1][e]))
         return torch.cat(outs, 0) if outs else xs[:0]
 
-    def _mlp_nvfp4(self, x, lay: _Layout, ws, bs, caches):
+    def _mlp_nvfp4(self, x, lay: _Layout, ws, bs, caches, x_amax=None):
         dt = torch.get_autocast_dtype("cuda") if torch.is_autocast_enabled("cuda") else x.dtype
         xs = _Dispatch.apply(x.to(BF16), lay.src, lay.pos)  # bf16 first: the quantizer reads bf16 (as NVFP4Linear)
         grad = torch.is_grad_enabled()
@@ -574,10 +809,12 @@ class MoE(nn.Module):
         caches = caches if self.cache_weight_quantization else (None,) * len(ws)
         if self.activation == "swiglu":
             return _GroupedSwiGLU.apply(xs, *ws, *bs, lay.tiles, lay.tile_rows, lay.segs_d, lay.segs_f, caches,
-                                        (self.wgrad_rht, need_dx, need_w, need_b, self.fuse_wgrad_accumulation, dt))
+                                        (self.wgrad_rht, need_dx, need_w, need_b, self.fuse_wgrad_accumulation, dt),
+                                        x_amax)
         approx = "tanh" if self.activation == "gelu_tanh" else "none"
         return _GroupedGelu.apply(xs, *ws, *bs, lay.tiles, lay.tile_rows, lay.segs_d, lay.segs_f, caches,
-                                  (self.wgrad_rht, need_dx, need_w, need_b, self.fuse_wgrad_accumulation, dt, approx))
+                                  (self.wgrad_rht, need_dx, need_w, need_b, self.fuse_wgrad_accumulation, dt, approx),
+                                  x_amax)
 
     def _mlp_bf16_grouped(self, x, lay: _Layout, ws, bs):
         """The high-precision experts on the padded buffer with grouped Triton GEMMs (autocast honoured as
@@ -596,13 +833,15 @@ class MoE(nn.Module):
             return lin(F.gelu(lin(xs, 0, lay.segs_f), approximate=approx), 1, lay.segs_d)
 
     def _mlp(self, x, slot_expert, slot_src, k: int, n_experts: int, f: int, max_rows: int, drops: bool,
-             ws, bs, caches):
+             ws, bs, caches, x_amax=None):
         """(rows [?, d], pos [S / k, k]): slot i of x's row slot_src[i] through expert slot_expert[i] (-1:
-        dropped, a zero row); row pos[s // k, s % k] of the result is slot s's output."""
+        dropped, a zero row); row pos[s // k, s % k] of the result is slot s's output. ``x_amax``: a floor for
+        the NVFP4 experts' input tensor scale (expert parallelism: the group's amax)."""
         nvfp4 = self.nvfp4 and not ops.high_precision() and x.is_cuda
         if nvfp4 or self._bf16_grouped(x):
             lay, _ = _plan(slot_expert, slot_src, x.shape[0], n_experts, k, self.d, f, max_rows, drops)
-            ys = self._mlp_nvfp4(x, lay, ws, bs, caches) if nvfp4 else self._mlp_bf16_grouped(x, lay, ws, bs)
+            ys = self._mlp_nvfp4(x, lay, ws, bs, caches, x_amax) if nvfp4 else \
+                self._mlp_bf16_grouped(x, lay, ws, bs)
             return ys, lay.pos
         # the loop splits the sorted rows: one host synchronization for the expert sizes
         key = torch.where(slot_expert >= 0, slot_expert, n_experts)
@@ -650,7 +889,9 @@ class MoE(nn.Module):
         else:
             self._dropped = torch.zeros((), device=dev, dtype=torch.long)
         slot_src = torch.arange(S, device=dev) // k
-        if self.ep_group is not None:
+        if self.ep_group is not None and self._ep_mode(C) == "variable":
+            y, sh = self._forward_ep_variable(x2d, slot_expert.view(T, k), w)
+        elif self.ep_group is not None:
             y, sh = self._forward_ep(x2d, slot_expert, slot_src, rank, counts, w, C)
         else:
             max_rows = S if C is None else min(S, E * C)
@@ -662,34 +903,155 @@ class MoE(nn.Module):
             y = y + sh.to(y.dtype)
         return y.reshape(*lead, self.d)
 
-    def _forward_ep(self, x2d, slot_expert, slot_src, rank, counts, w, C: int | None):
-        """Expert parallelism: (routed output, shared expert's output or None). The slots go to their expert's
-        rank, the local experts run on the received rows, the outputs come back and are combined. The shared
-        expert runs while the outputs travel back (and its backward while their gradients go out)."""
+    def _ep_mode(self, C: int | None) -> str:
+        """"fixed" (capacity, fixed-size per-slot exchanges, nothing read on the host) or "variable"."""
+        if self.ep_dispatch not in ("auto", "fixed", "variable"):
+            raise ValueError(f"ep_dispatch must be auto, fixed or variable, got {self.ep_dispatch!r}")
+        for name in ("ep_wire", "ep_wire_grad"):
+            if getattr(self, name) not in ("bf16", "nvfp4"):
+                raise ValueError(f"{name} must be 'bf16' or 'nvfp4', got {getattr(self, name)!r}")
+        if not (isinstance(self.ep_chunks, int) and self.ep_chunks >= 1):
+            raise ValueError(f"ep_chunks must be a positive int, got {self.ep_chunks!r}")
+        extra = self.ep_chunks > 1 or self.ep_node_size > 1 or self.ep_wire != "bf16" or self.ep_wire_grad != "bf16"
+        if self.ep_dispatch == "variable" or (self.ep_dispatch == "auto" and (C is None or extra)):
+            return "variable"
+        if C is None:
+            raise ValueError("ep_dispatch='fixed' needs a capacity_factor")
+        if extra:
+            raise ValueError("ep_chunks, ep_node_size and the NVFP4 wire need ep_dispatch='variable'")
+        return "fixed"
+
+    def _forward_ep_variable(self, x2d, idx, w):
+        """Expert parallelism with variable-size exchanges: (routed output, shared expert's output or None).
+        idx [T, k]: each token's experts (-1: dropped for capacity); w [T, k]: their weights.
+
+        Every token goes once to each rank holding one of its experts (with the ids and weights of the experts
+        it takes there), and that rank returns one row, the weighted sum of its experts' outputs. With nodes
+        (``ep_node_size`` L > 1) the token goes once to each node, to the rank with this rank's position there
+        (its "rail"), which forwards it once to each rank of its node that holds one of its experts and returns
+        the sum of their rows. One all-to-all of row counts (with the input's amax) and one host read per
+        forward size every message. With ``ep_chunks`` n the tokens go in n chunks, in a wavefront: the next
+        chunk's rows travel while this chunk's experts run, and (by autograd's order) the gradients likewise."""
+        T, k, E, W, El, L, d = x2d.shape[0], self.top_k, self.n_experts, self.ep_size, self.n_local, \
+            self.ep_node_size, self.d
+        N, dev, group = W // L, x2d.device, self.ep_group
+        me_l = self.ep_rank % L
+        nvfp4 = self.nvfp4 and not ops.high_precision() and x2d.is_cuda
+        wire = self.ep_wire if nvfp4 else "bf16"
+        wire_grad = self.ep_wire_grad if nvfp4 else "bf16"
+        if nvfp4:
+            xin = x2d.to(BF16)  # NVFP4 experts read bf16
+        elif torch.is_autocast_enabled("cuda") and x2d.is_cuda:
+            xin = x2d.to(torch.get_autocast_dtype("cuda"))  # the experts compute in it anyway
+        else:
+            xin = x2d
+        n = max(1, min(self.ep_chunks, T))
+        starts = [(c * T + n - 1) // n for c in range(n + 1)]
+        sizes = [starts[c + 1] - starts[c] for c in range(n)]
+        # --- what every rank sends where, per chunk: one all-to-all, one host read --------------------------
+        chunk = ((torch.arange(T, device=dev) * n) // T).unsqueeze(1)  # [T, 1]
+        valid = idx >= 0
+        a = torch.zeros(n * E + 1, device=dev, dtype=torch.long).scatter_add_(
+            0, torch.where(valid, chunk * E + idx, n * E).reshape(-1), torch.ones(T * k, device=dev, dtype=torch.long))
+
+        def pairs(per, members):  # (token, member) pairs per chunk [n, members]
+            mem, first = _first_choices(idx, per, members)
+            key = torch.where(first, chunk * members + mem, n * members).reshape(-1)
+            return torch.zeros(n * members + 1, device=dev, dtype=torch.long).scatter_add_(
+                0, key, torch.ones_like(key))[:-1].view(n, members)
+        b = pairs(El, W)           # rows to each rank
+        cn = pairs(El * L, N)      # rows to each node
+        F = El + 2 + L             # per (chunk, destination rank (m, l)): slots per expert there, rows to it,
+        cnt = torch.cat([a[:-1].view(n, W, El), b.unsqueeze(2),   # rows to its node, rows to each rank of its node
+                         cn.repeat_interleave(L, 1).unsqueeze(2), b.view(n, N, L).repeat_interleave(L, 1)], 2)
+        amax = xin.abs().amax().float() if nvfp4 and T else torch.zeros((), device=dev)
+        bits = amax.reshape(1).view(torch.int32).to(torch.long).view(1, 1).expand(W, 1)
+        msg = torch.cat([cnt.permute(1, 0, 2).reshape(W, n * F), bits], 1).contiguous()
+        got = torch.empty_like(msg)
+        dist.all_to_all_single(got, msg, group=group)
+        x_amax = got[:, -1].max().to(torch.int32).reshape(1).view(torch.float32) if nvfp4 else None
+        host = torch.cat([msg, got]).tolist()
+        sent, recvd = host[:W], host[W:]
+        rail = [m * L + me_l for m in range(N)]  # the EP ranks of this rank's rail (rail group order)
+        plans = []
+        for c in range(n):
+            o = c * F
+            p = dict(send1=[sent[r][o + El + 1] for r in rail], recv1=[recvd[r][o + El + 1] for r in rail],
+                     slots=sum(sum(recvd[r][o:o + El]) for r in range(W)))
+            if L > 1:
+                p["send2"] = [sum(recvd[r][o + El + 2 + l] for r in rail) for l in range(L)]
+                p["recv2"] = [sum(recvd[r][o + El] for r in range(W) if r % L == l) for l in range(L)]
+            plans.append(p)
+        # rows this rank sends to other ranks: over the rails (to other nodes) and within the node
+        self.last_ep_rows = (sum(v for c in range(n) for m, v in enumerate(plans[c]["send1"]) if m != self.ep_rank // L),
+                             sum(v for c in range(n) for l, v in enumerate(plans[c].get("send2", ())) if l != me_l))
+        ws, bs = self.experts_weights(), self.experts_biases()
+        xs_c, ids_c, w_c = xin.split(sizes), idx.split(sizes), w.split(sizes)
+
+        def run(c):  # one chunk; yields after starting each exchange but the last, returns the chunk's output
+            p = plans[c]
+            r1 = _route(ids_c[c], N, El * L, sum(p["send1"]))
+            d1 = _Xchg(self._rail_group, p["send1"], p["recv1"], d, xin.dtype, k, w=True, ids=True, wire=wire,
+                       amax=x_amax)
+            h = d1.start(_Dispatch.apply(xs_c[c], r1.src, r1.pos)[:r1.rows.shape[0]],
+                         w_c[c].index_select(0, r1.rows) * r1.mask, r1.ids)
+            yield
+            xe, we, ie = d1.finish(h)
+            box = _Box()
+            if L > 1:  # forward within the node
+                r2 = _route(ie, L, El, sum(p["send2"]))
+                d2 = _Xchg(self._node_group, p["send2"], p["recv2"], d, xin.dtype, k, w=True, ids=True, wire=wire,
+                           amax=x_amax)
+                h = d2.start(_Dispatch.apply(xe, r2.src, r2.pos)[:r2.rows.shape[0]],
+                             we.index_select(0, r2.rows) * r2.mask, r2.ids)
+                yield
+                xe, we, ie = d2.finish(h)
+            R = xe.shape[0]
+            ys, pos = self._mlp(xe, ie.reshape(-1).long(), torch.arange(R * k, device=dev) // k, k, El, self.d_ff,
+                                p["slots"], True, ws, bs, self._caches, x_amax)
+            part = _combine(ys, pos, we)  # this rank's experts' weighted sum for every row
+            if L > 1:
+                back = _Xchg(self._node_group, p["recv2"], p["send2"], d, part.dtype, wire_grad=wire_grad,
+                             grad_amax=box)
+                h = back.start(part)
+                yield
+                part = _gather_sum(back.finish(h)[0], r2.pos)  # the node's sum for every row
+            back = _Xchg(self._rail_group, p["recv1"], p["send1"], d, part.dtype, wire_grad=wire_grad,
+                         grad_amax=group, box=box)
+            h = back.start(part)
+            yield
+            return _gather_sum(back.finish(h)[0], r1.pos)
+
+        gens = [run(c) for c in range(n)]
+        steps = 2 if L == 1 else 4  # yields per chunk
+        for tick in range(n + steps - 1):  # wavefront: later chunks start their exchanges first
+            for c in reversed(range(n)):
+                if 0 <= tick - c < steps:
+                    next(gens[c])
+        sh = self._shared(x2d) if self.shared_d_ff and self.ep_overlap else None  # during the last returns
+        ys = []
+        for g in gens:
+            try:
+                next(g)
+            except StopIteration as e:
+                ys.append(e.value)
+        y = torch.cat(ys) if n > 1 else ys[0]
+        if self.shared_d_ff and sh is None:
+            sh = self._shared(x2d)
+        return y, sh
+
+    def _forward_ep(self, x2d, slot_expert, slot_src, rank, counts, w, C: int):
+        """Expert parallelism with a capacity and fixed-size exchanges: (routed output, shared expert's output or
+        None). The slots go to their expert's rank, the local experts run on the received rows, the outputs come
+        back and are combined. The shared expert runs while the outputs travel back (and its backward while
+        their gradients go out)."""
         T, k, E, W, El = x2d.shape[0], self.top_k, self.n_experts, self.ep_size, self.n_local
-        dev, S = x2d.device, T * k
+        dev = x2d.device
         nvfp4 = self.nvfp4 and not ops.high_precision() and x2d.is_cuda
         xin = x2d.to(BF16) if nvfp4 else x2d  # NVFP4 experts read bf16: half the bytes on the wire
         shared = (lambda: self._shared(x2d)) if self.shared_d_ff else None
         overlap = shared if self.ep_overlap else None
         group, ws, bs = self.ep_group, self.experts_weights(), self.experts_biases()
-        if C is None:
-            # dropless: rows sorted by expert (so by rank), variable splits; one host read of the counts
-            order = torch.argsort(slot_expert, stable=True)
-            pos = torch.empty_like(order).index_copy_(0, order, torch.arange(S, device=dev)).view(T, k)
-            xs = _Dispatch.apply(xin, slot_src.index_select(0, order), pos)
-            recv_counts = torch.empty_like(counts)
-            dist.all_to_all_single(recv_counts, counts, group=group)  # [W, E/W]: per source rank
-            host = torch.cat([counts, recv_counts]).tolist()
-            send = [sum(host[r * El:(r + 1) * El]) for r in range(W)]
-            recv = [sum(host[E + r * El:E + (r + 1) * El]) for r in range(W)]
-            R = sum(recv)
-            xr, _ = _exchange(xs, group, send, recv)  # [R, d]: by source rank, then by local expert
-            e_loc = torch.arange(El, device=dev).repeat(W).repeat_interleave(recv_counts, output_size=R)
-            ys, p = self._mlp(xr, e_loc, torch.arange(R, device=dev), 1, El, self.d_ff, R, False, ws, bs,
-                              self._caches)
-            yb, sh = _exchange(ys.index_select(0, p.view(-1)), group, recv, send, overlap)
-            return _combine(yb, pos, w), (sh if overlap is not None or shared is None else shared())
         # capacity: fixed-size buffer [W, E/W, C, d] (expert e's kept slots in rows e C + rank)
         kept = slot_expert >= 0
         send_pos = torch.where(kept, slot_expert * C + rank, E * C)  # E C: a zero row, not sent

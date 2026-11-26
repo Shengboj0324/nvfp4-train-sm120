@@ -27,6 +27,8 @@ from nvfp4.fused import layernorm_linear, layernorm_mlp
 from nvfp4.linear import NVFP4Linear, convert_linears
 from nvfp4.moe import MoE
 
+EP_GROUP = None  # --moe-ep-wire: the MoE layers run their expert-parallel path over this (one-process) group
+
 
 class Block(nn.Module):
     def __init__(self, d: int, h: int, moe: tuple | None = None):
@@ -39,7 +41,7 @@ class Block(nn.Module):
         self.moe = None
         if moe is not None:  # (experts, top_k, d_ff, capacity factor, shared d_ff): a mixture-of-experts MLP
             self.moe = MoE(d, moe[2], moe[0], top_k=moe[1], activation="gelu_tanh", capacity_factor=moe[3] or None,
-                           shared_d_ff=moe[4])
+                           shared_d_ff=moe[4], ep_group=EP_GROUP)
         else:
             self.fc1 = nn.Linear(d, 4 * d, bias=False)
             self.fc2 = nn.Linear(4 * d, d, bias=False)
@@ -194,6 +196,9 @@ def main():
     ap.add_argument("--moe-aux", type=float, default=0.01, help="load-balancing loss coefficient")
     ap.add_argument("--moe-capacity", type=float, default=0.0, help="expert capacity factor (0: dropless)")
     ap.add_argument("--moe-shared", type=int, default=0, help="hidden size of a shared expert (0: none)")
+    ap.add_argument("--moe-ep-wire", choices=["", "bf16", "nvfp4", "nvfp4+grad"], default="",
+                    help="run the MoE layers' expert-parallel exchanges over a one-process group with these "
+                         "message formats (activations; +grad: gradients too): the wire formats' accuracy on one GPU")
     ap.add_argument("--bf16-tail", type=float, default=0.0,
                     help="train the last FRAC of the steps with the NVFP4 layers in BF16 (ops.set_high_precision)")
     ap.add_argument("--hp-modules", default="",
@@ -219,6 +224,13 @@ def main():
     train = np.memmap(os.path.join(a.data, "train.bin"), dtype=np.uint16, mode="r")
     val = np.memmap(os.path.join(a.data, "val.bin"), dtype=np.uint16, mode="r")
     moe = None
+    if a.moe_ep_wire:
+        import torch.distributed as dist
+        assert not ddp, "--moe-ep-wire is a one-GPU study (the expert weights would differ per rank)"
+        dist.init_process_group(os.environ.get("NVFP4_DIST_BACKEND", "nccl"), init_method="tcp://127.0.0.1:29533",
+                                rank=0, world_size=1)
+        global EP_GROUP
+        EP_GROUP = dist.group.WORLD
     if a.moe_experts:
         moe = (a.moe_experts, a.moe_topk, a.moe_dff or 4 * a.d // a.moe_topk, a.moe_capacity, a.moe_shared)
     model = GPT(50304, a.d, a.layers, a.heads, a.ctx, moe=moe, moe_aux=a.moe_aux).cuda()
@@ -242,6 +254,11 @@ def main():
         for i, blk in enumerate(model.blocks):
             blk.attn_8bit = a.precision == "bf16" or i < a.layers - a.hp_last
             blk.attn_backward = a.attn_backward
+    if a.moe_ep_wire:
+        for blk in model.blocks:
+            blk.moe.ep_dispatch = "variable"
+            blk.moe.ep_wire = "nvfp4" if a.moe_ep_wire.startswith("nvfp4") else "bf16"
+            blk.moe.ep_wire_grad = "nvfp4" if a.moe_ep_wire == "nvfp4+grad" else "bf16"
     n_params = sum(p.numel() for p in model.parameters())
     opt = torch.optim.AdamW(model.parameters(), lr=a.lr, betas=(0.9, 0.95), weight_decay=0.1, fused=True)
     fwd = model
@@ -324,7 +341,7 @@ def main():
     torch.cuda.synchronize()
     del model, opt, fwd
     torch.cuda.empty_cache()
-    if ddp:
+    if ddp or a.moe_ep_wire:
         torch.distributed.destroy_process_group()
 
 

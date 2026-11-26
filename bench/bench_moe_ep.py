@@ -2,15 +2,19 @@
 experts are split over W GPUs, vs every GPU holding all experts (no exchange; data parallelism would add an
 all-reduce of the expert gradients, timed separately), and the all-to-all alone.
 
-    torchrun --standalone --nproc_per_node 2 bench/bench_moe_ep.py [--out bench/results/moe_ep.json]
+    torchrun --standalone --nproc_per_node W bench/bench_moe_ep.py [--node-size L] [--out bench/results/moe_ep.json]
 
 Each rank routes its own T tokens. Rows per configuration and expert precision (BF16 grouped / NVFP4):
-  local          all E experts on every GPU, no communication
-  ep cap 1.25    E / W experts per GPU, fixed-size exchanges (capacity factor 1.25)
-  ep cap serial  the same with the shared expert run after the exchange instead of during it
-  ep dropless    E / W experts per GPU, variable-size exchanges (one host read of the row counts)
-  a2a            one all-to-all of the capacity-1.25 dispatch buffer (bf16), forward direction only
-  allreduce      all-reduce of the expert gradients in bf16 (what data parallelism pays instead)
+  local              all E experts on every GPU, no communication
+  ep cap 1.25        E / W experts per GPU, fixed-size per-slot exchanges (capacity factor 1.25)
+  ep cap serial      the same with the shared expert run after the exchange instead of during it
+  ep dropless        variable-size exchanges, each token once per rank holding one of its experts
+  ... chunks n       the tokens in n chunks, exchanges overlapping the experts (wavefront)
+  ... wire nvfp4     NVFP4 activation messages (+grad: NVFP4 gradient messages too; NVFP4 experts only)
+  ... nodes L        (--node-size L) two-stage exchanges over nodes of L GPUs
+  a2a                one all-to-all of the capacity-1.25 dispatch buffer (bf16), forward direction only
+  allreduce          all-reduce of the expert gradients in bf16 (what data parallelism pays instead)
+Also recorded: rows each rank sends to other ranks per step (forward dispatch; ``last_ep_rows``).
 """
 from __future__ import annotations
 
@@ -26,7 +30,7 @@ import torch.distributed as dist
 sys.path.insert(0, os.path.dirname(__file__))
 from bench_gemm import timeit  # noqa: E402
 
-from nvfp4 import convert_linears  # noqa: E402
+from nvfp4 import convert_linears, ops  # noqa: E402
 from nvfp4.moe import MoE  # noqa: E402
 
 CONFIGS = [  # d, d_ff, experts, top_k, tokens per GPU, shared_d_ff
@@ -52,6 +56,7 @@ def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--out", default="bench/results/moe_ep.json")
     ap.add_argument("--smoke", action="store_true", help="tiny shapes over gloo, every rank on GPU 0")
+    ap.add_argument("--node-size", type=int, default=1, help="also time two-stage exchanges over nodes of this size")
     a = ap.parse_args()
     rank, W = int(os.environ["RANK"]), int(os.environ["WORLD_SIZE"])
     if a.smoke:
@@ -79,15 +84,42 @@ def main():
                 if prec == "nvfp4":
                     convert_linears(m, fuse_wgrad_accumulation=False)
                 return m
-            res = {"local": step_ms(make(), x)}
-            ep = make(ep_group=dist.group.WORLD, capacity_factor=1.25)
-            res["ep cap 1.25"] = step_ms(ep, x)
+            res, sent = {"local": step_ms(make(), x)}, {}
+            variants = [("ep cap 1.25", {"capacity_factor": 1.25}, {})]
+            m8 = {"margin": 8}  # SMs the persistent GEMMs leave to the all-to-alls (ops.set_sm_margin)
             if shared:
-                ep.ep_overlap = False
-                res["ep cap serial"] = step_ms(ep, x)
-            res["ep dropless"] = step_ms(make(ep_group=dist.group.WORLD), x)
+                variants.append(("ep cap serial", {"capacity_factor": 1.25}, {"ep_overlap": False}))
+            variants += [("ep dropless", {}, {}), ("ep dropless chunks 2", {}, {"ep_chunks": 2}),
+                         ("ep dropless chunks 4", {}, {"ep_chunks": 4}),
+                         ("ep dropless chunks 2 margin 8", {}, {"ep_chunks": 2, **m8}),
+                         ("ep dropless chunks 4 margin 8", {}, {"ep_chunks": 4, **m8})]
+            if prec == "nvfp4":
+                variants += [("ep wire nvfp4", {}, {"ep_wire": "nvfp4"}),
+                             ("ep wire nvfp4 chunks 2", {}, {"ep_wire": "nvfp4", "ep_chunks": 2}),
+                             ("ep wire nvfp4+grad chunks 2", {}, {"ep_wire": "nvfp4", "ep_wire_grad": "nvfp4",
+                                                                  "ep_chunks": 2}),
+                             ("ep wire nvfp4 chunks 2 margin 8", {}, {"ep_wire": "nvfp4", "ep_chunks": 2, **m8}),
+                             ("ep wire nvfp4 chunks 4 margin 8", {}, {"ep_wire": "nvfp4", "ep_chunks": 4, **m8})]
+            if a.node_size > 1:
+                L = a.node_size
+                variants += [(f"ep nodes {L}", {"ep_node_size": L}, {}),
+                             (f"ep nodes {L} chunks 2 margin 8", {"ep_node_size": L}, {"ep_chunks": 2, **m8})]
+                if prec == "nvfp4":
+                    variants.append((f"ep nodes {L} wire nvfp4 chunks 2 margin 8", {"ep_node_size": L},
+                                     {"ep_wire": "nvfp4", "ep_chunks": 2, **m8}))
+            for name, ctor, attrs in variants:
+                m = make(ep_group=dist.group.WORLD, **ctor)
+                attrs = dict(attrs)
+                ops.set_sm_margin(attrs.pop("margin", 0))
+                for k_, v_ in attrs.items():
+                    setattr(m, k_, v_)
+                res[name] = step_ms(m, x)
+                ops.set_sm_margin(0)
+                if m.last_ep_rows is not None:
+                    sent[name] = list(m.last_ep_rows)
+                del m
             rows.append({"d": d, "d_ff": d_ff, "E": E, "k": k, "T": T, "shared": shared, "W": W,
-                         "precision": prec, **res})
+                         "precision": prec, **res, "rows_sent": sent})
             if rank == 0:
                 print(f"d={d} d_ff={d_ff} E={E} k={k} T={T} shared={shared} {prec:5s} " +
                       "  ".join(f"{n} {v:.2f} ms" for n, v in res.items()), flush=True)

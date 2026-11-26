@@ -64,20 +64,26 @@ def aligned(t: Tensor) -> Tensor:
 def _quantize_dual_impl(x: Tensor, do_row: bool, do_col: bool, block_2d: bool, row_sr: bool, row_seed: int,
                         col_sr: bool, col_seed: int, col_rht: bool, rht_seed: int, col_pad: int,
                         row_seed_t: Optional[Tensor], col_seed_t: Optional[Tensor],
-                        rht_seed_t: Optional[Tensor]) -> _DUAL:
+                        rht_seed_t: Optional[Tensor], amax_floor: Optional[Tensor] = None) -> _DUAL:
     require(x)
     return tuple(_C.quantize_dual(aligned(x), do_row, do_col, block_2d, row_sr, row_seed, col_sr, col_seed, col_rht,
-                                  rht_seed, col_pad, row_seed_t, col_seed_t, rht_seed_t))
+                                  rht_seed, col_pad, row_seed_t, col_seed_t, rht_seed_t, amax_floor))
 
 
 def _quantize_dual_parts_impl(parts: List[Tensor], do_row: bool, do_col: bool, row_sr: bool, row_seed: int,
                               col_sr: bool, col_seed: int, col_rht: bool, rht_seed: int, col_pad: int,
                               row_seed_t: Optional[Tensor], col_seed_t: Optional[Tensor],
-                              rht_seed_t: Optional[Tensor], col_sums: bool) -> List[Tensor]:
+                              rht_seed_t: Optional[Tensor], col_sums: bool,
+                              amax_floor: Optional[Tensor] = None) -> List[Tensor]:
     require(parts[0])
     return list(_C.quantize_dual_parts([aligned(p) for p in parts], do_row, do_col, row_sr, row_seed, col_sr,
                                        col_seed, col_rht, rht_seed, col_pad, row_seed_t, col_seed_t, rht_seed_t,
-                                       col_sums))
+                                       col_sums, amax_floor))
+
+
+def _dequantize_impl(data: Tensor, scales: Tensor, gdec: Tensor, out_dtype: torch.dtype) -> Tensor:
+    require(data)
+    return _C.dequantize(data, scales, gdec, out_dtype)
 
 
 def _layernorm_quantize_dual_impl(x: Tensor, weight: Tensor, bias: Tensor, eps: float, do_row: bool, do_col: bool,
@@ -213,6 +219,7 @@ def _attn_bwd_impl(q: Tensor, qs: Tensor, qt: Tensor, qts: Tensor, k: Tensor, ks
 # --- custom ops (torch.compile) ----------------------------------------------------------------------
 
 _quantize_dual_op = torch.library.custom_op("nvfp4::quantize_dual", _quantize_dual_impl, mutates_args=())
+_dequantize_op = torch.library.custom_op("nvfp4::dequantize", _dequantize_impl, mutates_args=())
 _quantize_dual_parts_op = torch.library.custom_op("nvfp4::quantize_dual_parts", _quantize_dual_parts_impl,
                                                   mutates_args=())
 _layernorm_quantize_dual_op = torch.library.custom_op("nvfp4::layernorm_quantize_dual", _layernorm_quantize_dual_impl,
@@ -252,6 +259,11 @@ def _(x, do_row, do_col, block_2d, row_sr, row_seed, col_sr, col_seed, col_rht, 
     return _dual_fake(x, do_row, do_col, col_pad)
 
 
+@_dequantize_op.register_fake
+def _(data, scales, gdec, out_dtype):
+    return data.new_empty((data.shape[0], data.shape[1] * 2), dtype=out_dtype)
+
+
 def _colsum_fake(x: Tensor, rows: int, do_col: bool, col_pad: int, C: int) -> Tensor:
     rows = (rows + col_pad - 1) // col_pad * col_pad if do_col else rows
     return x.new_empty((max(1, (rows + 63) // 64), C), dtype=torch.float32)
@@ -259,7 +271,7 @@ def _colsum_fake(x: Tensor, rows: int, do_col: bool, col_pad: int, C: int) -> Te
 
 @_quantize_dual_parts_op.register_fake
 def _(parts, do_row, do_col, row_sr, row_seed, col_sr, col_seed, col_rht, rht_seed, col_pad, row_seed_t, col_seed_t,
-      rht_seed_t, col_sums):
+      rht_seed_t, col_sums, amax_floor=None):
     R, Cp = parts[0].shape
     C = Cp * len(parts)
     outs = list(_dual_fake(parts[0].new_empty((R, C)), do_row, do_col, col_pad))
@@ -401,6 +413,7 @@ def _pick(impl, op):
 
 quantize_dual = _pick(_quantize_dual_impl, _quantize_dual_op)
 quantize_dual_parts = _pick(_quantize_dual_parts_impl, _quantize_dual_parts_op)
+dequantize = _pick(_dequantize_impl, _dequantize_op)
 norm_backward = _pick(_norm_backward_impl, _norm_backward_op)
 layernorm_quantize_dual = _pick(_layernorm_quantize_dual_impl, _layernorm_quantize_dual_op)
 gelu_quantize_dual = _pick(_gelu_quantize_dual_impl, _gelu_quantize_dual_op)

@@ -17,6 +17,7 @@
 #include <torch/extension.h>
 
 #include <atomic>
+#include <type_traits>
 
 #include "nvfp4_common.cuh"
 
@@ -182,6 +183,78 @@ void nvfp4_set_ms_eden(bool on) { nvfp4::g_ms_eden.store(on); }
 bool nvfp4_ms_eden() { return nvfp4::ms_eden_enabled(); }
 void nvfp4_set_ms_eden_dgrad(bool on) { nvfp4::g_ms_eden_dgrad.store(on); }
 bool nvfp4_ms_eden_dgrad() { return nvfp4::ms_eden_dgrad_enabled(); }
+
+namespace nvfp4 {
+
+// reference.dequantize: one thread per 16-element block, value = (e2m1 * e4m3 scale) * gdec in fp32, rounded to
+// the output dtype. Row r's tensor decode scale is gdec[r * gdec_ld] (gdec_ld 0: one for all rows).
+template <typename OutT>
+__global__ void __launch_bounds__(256) dequantize_kernel(const uint8_t* __restrict__ data, int64_t ld_data,
+                                                         const uint8_t* __restrict__ scales, int64_t ld_scales,
+                                                         const float* __restrict__ gdec, int64_t gdec_ld,
+                                                         OutT* __restrict__ out, int64_t rows, int64_t nb) {
+  const int64_t i = static_cast<int64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+  if (i >= rows * nb) return;
+  const int64_t r = i / nb, b = i - r * nb;
+  const float g = gdec[r * gdec_ld];
+  const float sf = e4m3_to_float(scales[r * ld_scales + b]);
+  const uint8_t* src = data + r * ld_data + b * (kBlock / 2);
+  constexpr float kMag[8] = {0.0f, 0.5f, 1.0f, 1.5f, 2.0f, 3.0f, 4.0f, 6.0f};
+  OutT* dst = out + r * nb * kBlock + b * kBlock;
+#pragma unroll
+  for (int q = 0; q < kBlock / 2; ++q) {
+    const uint8_t byte = src[q];
+#pragma unroll
+    for (int h = 0; h < 2; ++h) {
+      const uint32_t code = (byte >> (4 * h)) & 0xFu;
+      const float m = kMag[code & 7u];
+      const float v = __fmul_rn(__fmul_rn((code & 8u) ? -m : m, sf), g);
+      if constexpr (std::is_same_v<OutT, float>) dst[2 * q + h] = v;
+      else dst[2 * q + h] = __float2bfloat16_rn(v);
+    }
+  }
+}
+
+}  // namespace nvfp4
+
+// NVFP4 rows -> bf16 / fp32 [R, 2 * data.size(1)] (data / scales may be row-strided views, e.g. of a received
+// message; gdec: one element, or one per row with row stride gdec.stride(0) when it has R elements).
+torch::Tensor nvfp4_dequantize(torch::Tensor data, torch::Tensor scales, torch::Tensor gdec,
+                               at::ScalarType out_dtype) {
+  using namespace nvfp4;
+  TORCH_CHECK(data.is_cuda() && data.dim() == 2 && data.scalar_type() == at::kByte && data.stride(1) == 1,
+              "data must be a 2D uint8 CUDA tensor with unit column stride");
+  TORCH_CHECK(scales.is_cuda() && scales.dim() == 2 && scales.scalar_type() == at::kByte && scales.stride(1) == 1 &&
+                  scales.device() == data.device() && scales.size(0) == data.size(0) &&
+                  scales.size(1) * (kBlock / 2) == data.size(1),
+              "scales must be uint8 [R, C / 16] on data's device with unit column stride");
+  TORCH_CHECK(gdec.is_cuda() && gdec.device() == data.device() && gdec.scalar_type() == at::kFloat,
+              "gdec must be fp32 on data's device");
+  TORCH_CHECK(out_dtype == at::kBFloat16 || out_dtype == at::kFloat, "out_dtype must be bfloat16 or float32");
+  const int64_t R = data.size(0), nb = scales.size(1);
+  int64_t gdec_ld = 0;
+  if (gdec.numel() != 1) {
+    TORCH_CHECK(gdec.numel() == R && gdec.dim() >= 1, "gdec must have 1 or R elements");
+    gdec_ld = gdec.stride(0);
+  }
+  const c10::cuda::CUDAGuard guard(data.device());
+  auto out = torch::empty({R, nb * kBlock}, data.options().dtype(out_dtype));
+  if (R == 0 || nb == 0) return out;
+  const int threads = 256;
+  const int64_t n = R * nb;
+  const int grid = static_cast<int>((n + threads - 1) / threads);
+  auto stream = at::cuda::getCurrentCUDAStream();
+  if (out_dtype == at::kFloat)
+    dequantize_kernel<float><<<grid, threads, 0, stream>>>(data.data_ptr<uint8_t>(), data.stride(0),
+                                                           scales.data_ptr<uint8_t>(), scales.stride(0),
+                                                           gdec.data_ptr<float>(), gdec_ld, out.data_ptr<float>(), R, nb);
+  else
+    dequantize_kernel<__nv_bfloat16><<<grid, threads, 0, stream>>>(
+        data.data_ptr<uint8_t>(), data.stride(0), scales.data_ptr<uint8_t>(), scales.stride(0), gdec.data_ptr<float>(),
+        gdec_ld, reinterpret_cast<__nv_bfloat16*>(out.data_ptr()), R, nb);
+  C10_CUDA_KERNEL_LAUNCH_CHECK();
+  return out;
+}
 
 // Returns {data uint8 [R_out, C_out/2], scales uint8 [R_out, C_out/16], gdec fp32 [1]}.
 std::vector<torch::Tensor> nvfp4_quantize(torch::Tensor x, bool transpose, bool block_2d, bool stochastic,
