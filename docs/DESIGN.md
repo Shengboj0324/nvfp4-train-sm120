@@ -701,11 +701,13 @@ The MoE layer around it (`nvfp4/moe.py`):
     sender's position in that node: the "rails" (one per position, N ranks each) carry only inter-node
     traffic, which on rail-optimized clusters is one NIC per position. The receiving rank routes the
     token again, once per rank of its node holding one of its experts, and on the way back sums its
-    node's rows, so the return crosses nodes once per (token, node) too. Both stages are all-to-alls over
-    the whole group's communicator with zero-size splits to every rank outside the rail or node: a first
-    version used rail and node sub-groups, and with chunks their collectives were in flight at once next to
-    the persistent GEMMs and stalled each other (2.4x slower than unchunked); one communicator serializes
-    them in one order. Tested with four
+    node's rows, so the return crosses nodes once per (token, node) too. The stages run over rail and node
+    sub-groups (created once per (group, L), shared by all layers). Running both over the whole group's
+    communicator instead, with zero-size splits to the other ranks, was tried and measured 3x slower on the
+    four-GPU host (284 vs 96 ms per step; its 4-rank all-to-alls are slow even when half the pairs send
+    nothing). With chunks the two sub-groups' collectives are in flight at the same time next to the
+    persistent GEMMs; on the final measurement that was 2.4x slower than unchunked (233 vs 96 ms; an earlier
+    run with the unfused combine had it 8% faster), so `ep_chunks` stays at 1 with nodes. Tested with four
     processes as two nodes of two on one GPU (gloo) and over NCCL on four GPUs against the single-process
     layer. No multi-node machine was available; it was timed on one host whose GPUs sit in pairs behind
     separate PCIe host bridges, the pairs as nodes (RESULTS.md §8.2).

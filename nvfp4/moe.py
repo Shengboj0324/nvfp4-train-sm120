@@ -631,6 +631,25 @@ def _gather_sum(rows: torch.Tensor, pos: torch.Tensor) -> torch.Tensor:
     return g.float().sum(1).to(rows.dtype) if k > 1 else g[:, 0]
 
 
+_SUBGROUPS: dict = {}
+
+
+def _ep_subgroups(group, L: int):
+    """(node group, rail group) of this rank for nodes of L consecutive ranks of ``group``: the L ranks of its
+    node, and the ranks with its position in every node. Created once per (group, L) (new_group is collective:
+    every rank of the default group builds the same layers in the same order)."""
+    ranks = dist.get_process_group_ranks(group)
+    key = (tuple(ranks), L)
+    if key not in _SUBGROUPS:
+        N = len(ranks) // L
+        nodes = [dist.new_group([ranks[m * L + l] for l in range(L)]) for m in range(N)]
+        rails = [dist.new_group([ranks[m * L + l] for m in range(N)]) for l in range(L)]
+        _SUBGROUPS[key] = (nodes, rails)
+    nodes, rails = _SUBGROUPS[key]
+    r = dist.get_rank(group)
+    return nodes[r // L], rails[r % L]
+
+
 def _combine(ys: torch.Tensor, pos: torch.Tensor, w: torch.Tensor) -> torch.Tensor:
     """y[t] = sum_j w[t, j] ys[pos[t, j]]: a gather and a k-term weighted sum (deterministic; the gather's
     backward writes every row once, except the always-zero row dropped slots point to, which gets zeros)."""
@@ -703,12 +722,16 @@ class MoE(nn.Module):
         if ep_node_size < 1:
             raise ValueError(f"ep_node_size must be >= 1, got {ep_node_size}")
         self.ep_group, self.ep_size, self.ep_rank, self.ep_node_size = ep_group, 1, 0, ep_node_size
+        self._node_group = self._rail_group = None
         if ep_group is not None:
             self.ep_size, self.ep_rank = dist.get_world_size(ep_group), dist.get_rank(ep_group)
             if n_experts % self.ep_size:
                 raise ValueError(f"{n_experts} experts do not split over {self.ep_size} ranks")
             if self.ep_size % ep_node_size:
                 raise ValueError(f"{self.ep_size} ranks do not split into nodes of {ep_node_size}")
+            self._rail_group = ep_group
+            if ep_node_size > 1:
+                self._node_group, self._rail_group = _ep_subgroups(ep_group, ep_node_size)
         elif ep_node_size != 1:
             raise ValueError("ep_node_size needs ep_group")
         self.d, self.d_ff, self.n_experts, self.top_k = d, d_ff, n_experts, top_k
@@ -787,7 +810,7 @@ class MoE(nn.Module):
         deepcopy refuses; none belongs to the module's state) and the process group (not copyable)."""
         state = self.__dict__.copy()
         state["aux_loss"] = state["_counts"] = state["_dropped"] = None
-        state["ep_group"] = None
+        state["ep_group"] = state["_node_group"] = state["_rail_group"] = None
         return state
 
     @property
@@ -1019,34 +1042,26 @@ class MoE(nn.Module):
         x_amax = got[:, -1].max().to(torch.int32).reshape(1).view(torch.float32) if nvfp4 else None
         host = torch.cat([msg, got]).tolist()
         sent, recvd = host[:W], host[W:]
-        rail = [m * L + me_l for m in range(N)]  # the EP ranks of this rank's rail
-        node = [self.ep_rank // L * L + l for l in range(L)]  # and of its node
-
-        def full(vals, ranks):  # splits over the whole group (zero to everyone else): one communicator, so
-            out = [0] * W        # every exchange of both stages runs in one order on one stream (two
-            for v, r in zip(vals, ranks):  # communicators in flight at once stalled each other's kernels)
-                out[r] = v
-            return out
+        rail = [m * L + me_l for m in range(N)]  # the EP ranks of this rank's rail (rail group order)
         plans = []
         for c in range(n):
             o = c * F
-            p = dict(send1=full([sent[r][o + El + 1] for r in rail], rail),
-                     recv1=full([recvd[r][o + El + 1] for r in rail], rail),
+            p = dict(send1=[sent[r][o + El + 1] for r in rail], recv1=[recvd[r][o + El + 1] for r in rail],
                      slots=sum(sum(recvd[r][o:o + El]) for r in range(W)))
             if L > 1:
-                p["send2"] = full([sum(recvd[r][o + El + 2 + l] for r in rail) for l in range(L)], node)
-                p["recv2"] = full([sum(recvd[r][o + El] for r in range(W) if r % L == l) for l in range(L)], node)
+                p["send2"] = [sum(recvd[r][o + El + 2 + l] for r in rail) for l in range(L)]
+                p["recv2"] = [sum(recvd[r][o + El] for r in range(W) if r % L == l) for l in range(L)]
             plans.append(p)
         # rows this rank sends to other ranks: over the rails (to other nodes) and within the node
-        self.last_ep_rows = (sum(v for c in range(n) for r, v in enumerate(plans[c]["send1"]) if r != self.ep_rank),
-                             sum(v for c in range(n) for r, v in enumerate(plans[c].get("send2", ())) if r != self.ep_rank))
+        self.last_ep_rows = (sum(v for c in range(n) for m, v in enumerate(plans[c]["send1"]) if m != self.ep_rank // L),
+                             sum(v for c in range(n) for l, v in enumerate(plans[c].get("send2", ())) if l != me_l))
         ws, bs = self.experts_weights(), self.experts_biases()
         xs_c, ids_c, w_c = xin.split(sizes), idx.split(sizes), w.split(sizes)
 
         def run(c):  # one chunk; yields after starting each exchange but the last, returns the chunk's output
             p = plans[c]
             r1 = _route(ids_c[c], N, El * L, sum(p["send1"]))
-            d1 = _Xchg(group, p["send1"], p["recv1"], d, xin.dtype, k, w=True, ids=True, wire=wire,
+            d1 = _Xchg(self._rail_group, p["send1"], p["recv1"], d, xin.dtype, k, w=True, ids=True, wire=wire,
                        amax=x_amax)
             h = d1.start(_Dispatch.apply(xs_c[c], r1.src, r1.pos)[:r1.rows.shape[0]],
                          w_c[c].index_select(0, r1.rows) * r1.mask, r1.ids)
@@ -1055,7 +1070,7 @@ class MoE(nn.Module):
             box = _Box()
             if L > 1:  # forward within the node
                 r2 = _route(ie, L, El, sum(p["send2"]))
-                d2 = _Xchg(group, p["send2"], p["recv2"], d, xin.dtype, k, w=True, ids=True, wire=wire,
+                d2 = _Xchg(self._node_group, p["send2"], p["recv2"], d, xin.dtype, k, w=True, ids=True, wire=wire,
                            amax=x_amax)
                 h = d2.start(_Dispatch.apply(xe, r2.src, r2.pos)[:r2.rows.shape[0]],
                              we.index_select(0, r2.rows) * r2.mask, r2.ids)
@@ -1066,12 +1081,12 @@ class MoE(nn.Module):
                                 p["slots"], True, ws, bs, self._caches, x_amax)
             part = _combine(ys, pos, we)  # this rank's experts' weighted sum for every row
             if L > 1:
-                back = _Xchg(group, p["recv2"], p["send2"], d, part.dtype, wire_grad=wire_grad,
+                back = _Xchg(self._node_group, p["recv2"], p["send2"], d, part.dtype, wire_grad=wire_grad,
                              grad_amax=box)
                 h = back.start(part)
                 yield
                 part = _gather_sum(back.finish(h)[0], r2.pos)  # the node's sum for every row
-            back = _Xchg(group, p["recv1"], p["send1"], d, part.dtype, wire_grad=wire_grad,
+            back = _Xchg(self._rail_group, p["recv1"], p["send1"], d, part.dtype, wire_grad=wire_grad,
                          grad_amax=group, box=box)
             h = back.start(part)
             yield

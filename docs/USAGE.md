@@ -184,7 +184,9 @@ loss = loss + 0.01 * moe.aux_loss             # Switch load-balancing loss (1.0 
   - `ep_node_size=L` (constructor; v0.17): ranks r L … r L + L − 1 form a node. A token crosses to another
     node once per node, to the rank with the sender's position there, which forwards it within its node
     and sums the node's rows on the way back: two-stage exchanges for clusters (or hosts) whose links
-    between groups of GPUs are slower than within them.
+    between groups of GPUs are slower than within them. Every rank of the default group must construct
+    the layers (the rail and node sub-groups are created collectively, once per (group, L)). Keep
+    `ep_chunks = 1` with nodes (RESULTS.md §8.2).
   - `moe.ep_chunks = n` (v0.17): the tokens go in n chunks, the next chunk's rows travelling while this
     chunk's experts run. It pays when the exchange dominates (RESULTS.md §8.2); on fast links it costs a
     few percent. `nvfp4.ops.set_sm_margin(k)` leaves k SMs free in the persistent GEMMs for the transfers.

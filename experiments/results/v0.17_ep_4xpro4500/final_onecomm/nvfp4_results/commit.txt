@@ -1,0 +1,1 @@
+9b9bcdb MoE: two-stage exchanges over the EP group's one communicator (zero splits outside rail / node; sub-groups stalled each other under chunks); docs

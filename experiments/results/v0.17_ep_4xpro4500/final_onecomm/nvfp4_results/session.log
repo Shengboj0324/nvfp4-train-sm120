@@ -1,0 +1,124 @@
+== session start 2026-11-26T03:18:14Z
+
+==================== env ====================
+Thu Nov 26 03:18:14 2026       
++-----------------------------------------------------------------------------------------+
+| NVIDIA-SMI 595.112.07             Driver Version: 595.112.07     CUDA Version: 13.2     |
++-----------------------------------------+------------------------+----------------------+
+| GPU  Name                 Persistence-M | Bus-Id          Disp.A | Volatile Uncorr. ECC |
+| Fan  Temp   Perf          Pwr:Usage/Cap |           Memory-Usage | GPU-Util  Compute M. |
+|                                         |                        |               MIG M. |
+|=========================================+========================+======================|
+|   0  NVIDIA RTX PRO 4500 Blac...    On  |   00000000:01:00.0 Off |                  Off |
+| 30%   27C    P8              5W /  200W |       2MiB /  32623MiB |      0%      Default |
+|                                         |                        |                  N/A |
++-----------------------------------------+------------------------+----------------------+
+|   1  NVIDIA RTX PRO 4500 Blac...    On  |   00000000:81:00.0 Off |                  Off |
+| 30%   28C    P8             13W /  200W |       2MiB /  32623MiB |      0%      Default |
+|                                         |                        |                  N/A |
++-----------------------------------------+------------------------+----------------------+
+|   2  NVIDIA RTX PRO 4500 Blac...    On  |   00000000:82:00.0 Off |                  Off |
+| 30%   27C    P8              9W /  200W |       2MiB /  32623MiB |      0%      Default |
+|                                         |                        |                  N/A |
++-----------------------------------------+------------------------+----------------------+
+|   3  NVIDIA RTX PRO 4500 Blac...    On  |   00000000:C1:00.0 Off |                  Off |
+| 30%   27C    P8              4W /  200W |       2MiB /  32623MiB |      0%      Default |
+|                                         |                        |                  N/A |
++-----------------------------------------+------------------------+----------------------+
+
++-----------------------------------------------------------------------------------------+
+| Processes:                                                                              |
+|  GPU   GI   CI              PID   Type   Process name                        GPU Memory |
+|        ID   ID                                                               Usage      |
+|=========================================================================================|
+|  No running processes found                                                             |
++-----------------------------------------------------------------------------------------+
+index, name, compute_cap, memory.total [MiB], power.limit [W], clocks.max.sm [MHz], pcie.link.gen.max, pcie.link.width.max
+0, NVIDIA RTX PRO 4500 Blackwell, 12.0, 32623 MiB, 200.00 W, 3090 MHz, 4, 16
+1, NVIDIA RTX PRO 4500 Blackwell, 12.0, 32623 MiB, 200.00 W, 3090 MHz, 4, 16
+2, NVIDIA RTX PRO 4500 Blackwell, 12.0, 32623 MiB, 200.00 W, 3090 MHz, 4, 16
+3, NVIDIA RTX PRO 4500 Blackwell, 12.0, 32623 MiB, 200.00 W, 3090 MHz, 4, 16
+	[4mGPU0	GPU1	GPU2	GPU3	CPU Affinity	NUMA Affinity	GPU NUMA ID[0m
+GPU0	 X 	NODE	NODE	NODE	0-111	0		N/A
+GPU1	NODE	 X 	PHB	NODE	0-111	0		N/A
+GPU2	NODE	PHB	 X 	NODE	0-111	0		N/A
+GPU3	NODE	NODE	NODE	 X 	0-111	0		N/A
+
+Legend:
+
+  X    = Self
+  SYS  = Connection traversing PCIe as well as the SMP interconnect between NUMA nodes (e.g., QPI/UPI)
+  NODE = Connection traversing PCIe as well as the interconnect between PCIe Host Bridges within a NUMA node
+  PHB  = Connection traversing PCIe as well as a PCIe Host Bridge (typically the CPU)
+  PXB  = Connection traversing multiple PCIe bridges (without traversing the PCIe Host Bridge)
+  PIX  = Connection traversing at most a single PCIe bridge
+  NV#  = Connection traversing a bonded set of # NVLinks
+driver supports CUDA 13.2
+nvcc 12.8 at /usr/local/cuda
+ERROR: Could not find a version that satisfies the requirement torch==2.14.1 (from versions: 2.7.0+cu128, 2.7.1+cu128, 2.8.0+cu128, 2.9.0+cu128, 2.9.1+cu128, 2.10.0+cu128, 2.11.0+cu128)
+ERROR: No matching distribution found for torch==2.14.1
+torch 2.11.0+cu128 cuda 12.8 ['NVIDIA RTX PRO 4500 Blackwell', 'NVIDIA RTX PRO 4500 Blackwell', 'NVIDIA RTX PRO 4500 Blackwell', 'NVIDIA RTX PRO 4500 Blackwell']
+9b9bcdb MoE: two-stage exchanges over the EP group's one communicator (zero splits outside rail / node; sub-groups stalled each other under chunks); docs
+== env: ok (122 s)
+
+==================== build ====================
+ptxas info    : Used 56 registers, used 1 barriers, 18968 bytes smem
+    8 bytes stack frame, 8 bytes spill stores, 12 bytes spill loads
+ptxas info    : Used 80 registers, used 1 barriers, 8 bytes cumulative stack size, 18968 bytes smem
+ptxas info    : Used 48 registers, used 1 barriers, 16680 bytes smem
+ptxas info    : Used 80 registers, used 1 barriers, 16688 bytes smem
+ptxas info    : Used 51 registers, used 1 barriers, 18968 bytes smem
+ptxas info    : Used 80 registers, used 1 barriers, 16 bytes cumulative stack size, 18968 bytes smem
+ptxas info    : Used 48 registers, used 1 barriers, 16680 bytes smem
+ptxas info    : Used 80 registers, used 1 barriers, 16688 bytes smem
+ptxas info    : Used 56 registers, used 1 barriers, 18968 bytes smem
+ptxas info    : Used 89 registers, used 1 barriers, 18968 bytes smem
+ptxas info    : Used 38 registers, used 1 barriers, 32 bytes smem
+ptxas info    : Used 48 registers, used 1 barriers, 16680 bytes smem
+ptxas info    : Used 80 registers, used 1 barriers, 16688 bytes smem
+ptxas info    : Used 54 registers, used 1 barriers, 18968 bytes smem
+ptxas info    : Used 89 registers, used 1 barriers, 18968 bytes smem
+ptxas info    : Used 30 registers, used 1 barriers, 32 bytes smem
+ptxas info    : Used 48 registers, used 1 barriers, 16680 bytes smem
+ptxas info    : Used 80 registers, used 1 barriers, 16688 bytes smem
+x86_64-linux-gnu-g++ -shared -Wl,-O1 -Wl,-Bsymbolic-functions -Wl,-Bsymbolic-functions -g -fwrapv -O2 -Wl,-Bsymbolic-functions -g -fwrapv -O2 -g -fstack-protector-strong -Wformat -Werror=format-security -Wdate-time -D_FORTIFY_SOURCE=2 /workspace/nvfp4-train-sm120/build/temp.linux-x86_64-3.10/csrc/attention.o /workspace/nvfp4-train-sm120/build/temp.linux-x86_64-3.10/csrc/bindings.o /workspace/nvfp4-train-sm120/build/temp.linux-x86_64-3.10/csrc/gemm.o /workspace/nvfp4-train-sm120/build/temp.linux-x86_64-3.10/csrc/gemm_tma.o /workspace/nvfp4-train-sm120/build/temp.linux-x86_64-3.10/csrc/moe_combine.o /workspace/nvfp4-train-sm120/build/temp.linux-x86_64-3.10/csrc/norm.o /workspace/nvfp4-train-sm120/build/temp.linux-x86_64-3.10/csrc/quantize.o /workspace/nvfp4-train-sm120/build/temp.linux-x86_64-3.10/csrc/quantize_dual.o -L/workspace/venv/lib/python3.10/site-packages/torch/lib -L/usr/local/cuda/lib64 -lc10 -ltorch -ltorch_cpu -ltorch_python -lcudart -lc10_cuda -ltorch_cuda -o build/lib.linux-x86_64-3.10/nvfp4/_C.cpython-310-x86_64-linux-gnu.so
+== build: ok (78 s)
+
+==================== ep ====================
+97 passed in 41.94s
+W1126 03:22:21.358000 5972 torch/distributed/run.py:851] 
+W1126 03:22:21.358000 5972 torch/distributed/run.py:851] *****************************************
+W1126 03:22:21.358000 5972 torch/distributed/run.py:851] Setting OMP_NUM_THREADS environment variable for each process to be 1 in default, to avoid your system being overloaded, please further tune the variable for optimal performance in your application as needed. 
+W1126 03:22:21.358000 5972 torch/distributed/run.py:851] *****************************************
+d=1024 d_ff=2816 E=8 k=2 T=16384 shared=0 bf16  local 19.78 ms  ep cap 1.25 34.68 ms  ep dropless 25.37 ms  ep dropless chunks 2 24.43 ms  ep dropless chunks 4 29.12 ms  ep dropless chunks 2 margin 8 24.44 ms  ep dropless chunks 4 margin 8 29.11 ms
+d=1024 d_ff=2816 E=8 k=2 T=16384 shared=0 nvfp4 local 12.60 ms  ep cap 1.25 22.99 ms  ep dropless 19.33 ms  ep dropless chunks 2 19.12 ms  ep dropless chunks 4 25.66 ms  ep dropless chunks 2 margin 8 18.95 ms  ep dropless chunks 4 margin 8 26.01 ms  ep wire nvfp4 18.90 ms  ep wire nvfp4 chunks 2 19.67 ms  ep wire nvfp4+grad chunks 2 20.16 ms  ep wire nvfp4 chunks 2 margin 8 19.47 ms  ep wire nvfp4 chunks 4 margin 8 26.73 ms
+  a2a of 80 MiB: 2.01 ms (19.4 GiB/s sent per GPU); all-reduce of 132 MiB expert gradients: 7.26 ms
+d=2048 d_ff=1408 E=32 k=4 T=16384 shared=2816 bf16  local 61.26 ms  ep cap 1.25 107.26 ms  ep cap serial 116.89 ms  ep dropless 64.36 ms  ep dropless chunks 2 68.33 ms  ep dropless chunks 4 80.31 ms  ep dropless chunks 2 margin 8 68.45 ms  ep dropless chunks 4 margin 8 80.42 ms
+d=2048 d_ff=1408 E=32 k=4 T=16384 shared=2816 nvfp4 local 38.27 ms  ep cap 1.25 72.49 ms  ep cap serial 76.32 ms  ep dropless 47.27 ms  ep dropless chunks 2 51.37 ms  ep dropless chunks 4 63.76 ms  ep dropless chunks 2 margin 8 50.13 ms  ep dropless chunks 4 margin 8 62.43 ms  ep wire nvfp4 47.07 ms  ep wire nvfp4 chunks 2 51.52 ms  ep wire nvfp4+grad chunks 2 52.74 ms  ep wire nvfp4 chunks 2 margin 8 50.33 ms  ep wire nvfp4 chunks 4 margin 8 63.57 ms
+  a2a of 320 MiB: 7.97 ms (19.6 GiB/s sent per GPU); all-reduce of 528 MiB expert gradients: 26.86 ms
+[guard] elapsed 85s | peak GPU temp 60C, power 203W, GPU mem 11810MB | min host mem avail 236048MB | cooldown 0s
+W1126 03:23:46.172000 6238 torch/distributed/run.py:851] 
+W1126 03:23:46.172000 6238 torch/distributed/run.py:851] *****************************************
+W1126 03:23:46.172000 6238 torch/distributed/run.py:851] Setting OMP_NUM_THREADS environment variable for each process to be 1 in default, to avoid your system being overloaded, please further tune the variable for optimal performance in your application as needed. 
+W1126 03:23:46.172000 6238 torch/distributed/run.py:851] *****************************************
+d=1024 d_ff=2816 E=8 k=2 T=16384 shared=0 bf16  local 20.00 ms  ep cap 1.25 123.14 ms  ep dropless 86.87 ms  ep dropless chunks 2 61.43 ms  ep dropless chunks 4 58.09 ms  ep dropless chunks 2 margin 8 61.26 ms  ep dropless chunks 4 margin 8 58.24 ms  ep nodes 2 112.52 ms  ep nodes 2 chunks 2 margin 8 85.28 ms
+d=1024 d_ff=2816 E=8 k=2 T=16384 shared=0 nvfp4 local 12.68 ms  ep cap 1.25 82.06 ms  ep dropless 80.51 ms  ep dropless chunks 2 60.41 ms  ep dropless chunks 4 56.55 ms  ep dropless chunks 2 margin 8 60.01 ms  ep dropless chunks 4 margin 8 56.31 ms  ep wire nvfp4 73.86 ms  ep wire nvfp4 chunks 2 55.73 ms  ep wire nvfp4+grad chunks 2 50.19 ms  ep wire nvfp4 chunks 2 margin 8 55.36 ms  ep wire nvfp4 chunks 4 margin 8 50.87 ms  ep nodes 2 106.18 ms  ep nodes 2 chunks 2 margin 8 83.00 ms  ep nodes 2 wire nvfp4 chunks 2 margin 8 71.71 ms
+  a2a of 80 MiB: 16.88 ms (3.5 GiB/s sent per GPU); all-reduce of 132 MiB expert gradients: 35.73 ms
+d=2048 d_ff=1408 E=32 k=4 T=16384 shared=2816 bf16  local 61.67 ms  ep cap 1.25 434.02 ms  ep cap serial 462.03 ms  ep dropless 191.14 ms  ep dropless chunks 2 151.68 ms  ep dropless chunks 4 154.85 ms  ep dropless chunks 2 margin 8 150.54 ms  ep dropless chunks 4 margin 8 154.66 ms  ep nodes 2 289.70 ms  ep nodes 2 chunks 2 margin 8 223.63 ms
+d=2048 d_ff=1408 E=32 k=4 T=16384 shared=2816 nvfp4 local 38.45 ms  ep cap 1.25 289.65 ms  ep cap serial 305.73 ms  ep dropless 179.70 ms  ep dropless chunks 2 149.95 ms  ep dropless chunks 4 151.40 ms  ep dropless chunks 2 margin 8 149.31 ms  ep dropless chunks 4 margin 8 151.24 ms  ep wire nvfp4 158.05 ms  ep wire nvfp4 chunks 2 135.08 ms  ep wire nvfp4+grad chunks 2 126.55 ms  ep wire nvfp4 chunks 2 margin 8 134.37 ms  ep wire nvfp4 chunks 4 margin 8 138.33 ms  ep nodes 2 284.49 ms  ep nodes 2 chunks 2 margin 8 222.11 ms  ep nodes 2 wire nvfp4 chunks 2 margin 8 190.81 ms
+  a2a of 320 MiB: 66.20 ms (3.5 GiB/s sent per GPU); all-reduce of 528 MiB expert gradients: 147.18 ms
+[guard] elapsed 220s | peak GPU temp 58C, power 203W, GPU mem 11762MB | min host mem avail 227923MB | cooldown 0s
+/workspace/venv/lib/python3.10/site-packages/torch/autograd/graph.py:869: UserWarning: The AccumulateGrad node's stream does not match the stream of the node that produced the incoming gradient. This may incur unnecessary synchronization and break CUDA graph capture if the AccumulateGrad node's stream is the default stream. This mismatch is caused by an AccumulateGrad node created prior to the current iteration being kept alive. This can happen if the autograd graph is still being kept alive by tensors such as the loss, or if you are using DDP, which will stash a reference to the node. To resolve the mismatch, delete all references to the autograd graph or ensure that DDP initialization is performed under the same stream as subsequent forwards. If the mismatch is intentional, you can use torch.autograd.graph.set_warn_on_accumulate_grad_stream_mismatch(False) to suppress this warning. (Triggered internally at /pytorch/torch/csrc/autograd/input_buffer.cpp:240.)
+  return Variable._execution_engine.run_backward(  # Calls into the C++ engine to run the backward pass
+{"d": 1024, "d_ff": 2816, "experts": 8, "top_k": 2, "activation": "swiglu", "tokens": 16384, "bf16_ms": 21.665, "bf16_grouped_ms": 21.081, "bf16_grouped_graph_ms": 21.0, "nvfp4_ms": 12.453, "nvfp4_graph_ms": 12.326, "speedup": 1.74, "speedup_graph": 1.758, "speedup_vs_grouped": 1.693, "speedup_graph_vs_grouped": 1.704}
+{"d": 2048, "d_ff": 5632, "experts": 8, "top_k": 2, "activation": "swiglu", "tokens": 16384, "bf16_ms": 70.591, "bf16_grouped_ms": 70.479, "bf16_grouped_graph_ms": 70.323, "nvfp4_ms": 34.834, "nvfp4_graph_ms": 34.712, "speedup": 2.027, "speedup_graph": 2.034, "speedup_vs_grouped": 2.023, "speedup_graph_vs_grouped": 2.026}
+{"d": 2048, "d_ff": 1408, "experts": 32, "top_k": 4, "activation": "swiglu", "tokens": 16384, "bf16_ms": 53.311, "bf16_grouped_ms": 48.714, "bf16_grouped_graph_ms": 48.572, "nvfp4_ms": 27.834, "nvfp4_graph_ms": 27.67, "speedup": 1.915, "speedup_graph": 1.927, "speedup_vs_grouped": 1.75, "speedup_graph_vs_grouped": 1.755}
+{"d": 768, "d_ff": 1536, "experts": 8, "top_k": 2, "activation": "gelu_tanh", "tokens": 16384, "bf16_ms": 7.178, "bf16_grouped_ms": 6.768, "bf16_grouped_graph_ms": 6.504, "nvfp4_ms": 4.749, "nvfp4_graph_ms": 4.513, "speedup": 1.512, "speedup_graph": 1.591, "speedup_vs_grouped": 1.425, "speedup_graph_vs_grouped": 1.441}
+{"d": 2048, "d_ff": 1408, "experts": 32, "top_k": 4, "activation": "swiglu", "tokens": 16384, "capacity_factor": 1.25, "shared_d_ff": 2816, "bf16_ms": 71.632, "bf16_grouped_ms": 66.366, "bf16_grouped_graph_ms": 66.269, "nvfp4_ms": 37.577, "nvfp4_graph_ms": 37.357, "speedup": 1.906, "speedup_graph": 1.917, "speedup_vs_grouped": 1.766, "speedup_graph_vs_grouped": 1.774}
+[guard] elapsed 36s | peak GPU temp 65C, power 203W, GPU mem 19698MB | min host mem avail 238331MB | cooldown 0s
+== ep: ok (386 s)
+
+== summary
+  env: ok
+  build: ok
+  ep: ok
