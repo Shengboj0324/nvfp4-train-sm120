@@ -145,7 +145,7 @@ y = ops.gemm_grouped(qa, qw_stacked, "m", tile_group, group_rows=N)  # per-group
 | [`nvfp4.linear`](nvfp4/linear.py) | `NVFP4Linear`, `convert_linears`, `WeightQuantCache`, `invalidate_weight_caches` |
 | [`nvfp4.fused`](nvfp4/fused.py) | `layernorm_linear`, `layernorm_mlp`, `gelu_mlp`, `rmsnorm_linear`, `rmsnorm_swiglu_mlp`, `swiglu_mlp` |
 | [`nvfp4.attention`](nvfp4/attention.py) | `attention(q, k, v, *, causal, scale, smooth_k, backward)` (falls back to SDPA outside its coverage) |
-| [`nvfp4.moe`](nvfp4/moe.py) | `MoE(d, d_ff, n_experts, top_k, activation, normalize_weights, bias, capacity_factor, shared_d_ff, ep_group)`, `.to_nvfp4(...)`, `.aux_loss`, `.last_counts`, `.last_dropped`, `.bf16_impl` |
+| [`nvfp4.moe`](nvfp4/moe.py) | `MoE(d, d_ff, n_experts, top_k, activation, normalize_weights, bias, capacity_factor, shared_d_ff, ep_group, ep_node_size)`, `.to_nvfp4(...)`, `.aux_loss`, `.last_counts`, `.last_dropped`, `.bf16_impl`, `.ep_dispatch` / `.ep_chunks` / `.ep_wire` / `.ep_wire_grad` / `.ep_overlap`; `ignore_expert_parameters_in_ddp`, `scale_expert_grads` |
 | [`nvfp4.ops`](nvfp4/ops.py) | `quantize`, `quantize_dual` (+ `layernorm_` / `rmsnorm_` / `gelu_` / `swiglu_` fused variants and backwards), `gemm`, `gemm_grouped`, `stack_transposed`, `norm_backward`, recipe switches, `available` |
 | [`nvfp4.reference`](nvfp4/reference.py) | pure-PyTorch spec: `quantize`, `quantize_dual`, `dequantize`, `apply_rht`, `e2m1_round_stochastic`, ... |
 
@@ -242,7 +242,7 @@ nvfp4/fused.py          fused transformer sub-blocks (autograd functions)
 nvfp4/attention.py      attention() with both backwards and the SDPA fallback
 nvfp4/moe.py            MoE layer: routing, deterministic dispatch / combine, grouped NVFP4 expert MLPs
 nvfp4/_bf16_grouped.py  grouped BF16 GEMMs (Triton) for the MoE layer's high-precision path
-tests/                  999 tests: bit-exact vs spec, autograd, compile / graphs, DDP / FSDP, MoE, attention
+tests/                  1031 tests: bit-exact vs spec, autograd, compile / graphs, DDP / FSDP, MoE, attention
 bench/, experiments/    benchmarks and pretraining runs, each with results/ (raw JSON / JSONL)
 tools/                  build, check, guard, sanitize, soak, WSL setup, Runpod session script
 docs/                   USAGE.md, DESIGN.md, RESULTS.md, research/ (survey of open problems, Nov 2026)
@@ -258,14 +258,18 @@ The full list is in [DESIGN.md §6](docs/DESIGN.md#6-known-limitations-and-next-
   BF16 speed, and P·V needs two e4m3 terms. Coverage is causal or full masks and head dims 64 / 128;
   everything else falls back to SDPA.
 - **MoE coverage.** Top-k routing, dropless or with a capacity; SwiGLU / GELU experts with or without
-  biases; a shared expert; expert parallelism, dropless or with a capacity. On two PCIe RTX 5090s expert
-  parallelism is slower per step than data parallelism (the exchanges are not hidden, except behind the
-  shared expert); it saves memory (RESULTS.md §8.1). Without Triton (PyTorch's native Windows wheels)
-  the BF16 experts run as a loop that reads the expert sizes on the host.
+  biases; a shared expert; expert parallelism (each token once per rank or, with `ep_node_size`, once per
+  node; chunked overlap; NVFP4 messages; with DDP over the rest). On four RTX PRO 4500 whose GPU pairs are
+  linked slowly, two-stage expert parallelism is 2.0× faster per layer step than data parallelism and
+  trains a MoE GPT 1.27× faster with less memory; on a fast pair it ties or beats data parallelism
+  (RESULTS.md §8.2). Not timed on a real multi-node cluster. Chunks do not combine well with nodes
+  (keep `ep_chunks = 1` there). Without Triton (PyTorch's native Windows wheels) the BF16 experts run as a
+  loop that reads the expert sizes on the host.
 - **Stochastic rounding is software** (no `cvt.rs` on sm_120a), at about 12 extra instructions per
   element.
-- **Hardware coverage.** Tested on the RTX 5090 Laptop and the desktop RTX 5090 (two over NCCL), not yet
-  on the smaller RTX 50 parts.
+- **Hardware coverage.** Tested on the RTX 5090 Laptop, the desktop RTX 5090 (two over NCCL) and the RTX
+  PRO 4500 Blackwell (four over NCCL; RESULTS.md §9), not yet on the smaller GeForce parts. On the RTX PRO
+  4500 the 8-bit attention is no faster than SDPA.
 
 ## License
 

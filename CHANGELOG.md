@@ -1,5 +1,43 @@
 # Changelog
 
+## 0.17.0 — MoE: variable-size, node-aware, chunked expert parallelism with NVFP4 messages; fused combine; RTX PRO 4500 (2026-11-26)
+
+- **Each token once per rank** (`ep_dispatch="variable"`, the default without a capacity): a token goes once
+  to every rank holding one of its experts, with their ids and routing weights in the same byte message,
+  and that rank returns the weighted sum of its experts' outputs (DeepEP's layout). One all-to-all of
+  counts per forward (one host read) sizes every message. Dropped slots (capacity) are not sent. v0.16's
+  per-slot dropless path is replaced; the fixed-size capacity path stays (CUDA-graph capturable).
+- **Nodes** (`MoE(..., ep_node_size=L)`): tokens cross to another node once per node, to the rank with the
+  sender's position (rail sub-groups), which forwards them within its node (node sub-groups) and sums the
+  node's rows on the way back.
+- **Chunks** (`moe.ep_chunks = n`): the tokens go in n chunks in a wavefront, the next chunk's exchanges
+  overlapping this chunk's experts, forward and backward. `ops.set_sm_margin(k)` leaves k SMs free in the
+  persistent GEMMs (bit-identical results).
+- **NVFP4 messages** (`moe.ep_wire = "nvfp4"`, `moe.ep_wire_grad = "nvfp4"`): activations (and gradients,
+  stochastically rounded) travel as NVFP4 with the group's tensor scale, 3.6× fewer bytes. New:
+  `ops.quantize_dual(amax_floor=)` (a shared tensor scale) and `ops.dequantize` (a kernel). Re-quantizing
+  the received rows reproduces the codes, so the forward and input gradient are bit-identical to bf16
+  messages. Loss over two seeds: +0.05% (activations), +0.23% (+ gradients), both within run-to-run noise.
+- **Expert parallelism with DDP:** `nvfp4.moe.ignore_expert_parameters_in_ddp`, `scale_expert_grads`
+  (tested against one process); `train_gpt.py --moe-ep` (`--moe-ep-chunks`, `--moe-ep-node-size`,
+  `--moe-ep-wire`, `--sm-margin`).
+- **Fused gather / combine** (`csrc/moe_combine.cu`): the MoE combine, the expert-parallel partial sums and
+  the dispatch's backward in one kernel each (fp32 accumulation, gather-based deterministic backward),
+  replacing index_select + bmm + scatter-add: the single-GPU MoE layer is 8–15% faster in NVFP4 and uses
+  ~2 GB less; an expert-parallel step 31% faster on two GPUs. `NVFP4_MOE_FUSED_COMBINE=0` restores the old
+  path.
+- **Measured on 4× RTX PRO 4500 Blackwell** (RESULTS.md §8.2, §9): layer B (32 experts, top-4) on four GPUs
+  322.8 ms (fixed-size) → 196.4 (once per rank) → 96.1 (two stages), vs data parallelism 196.3; a MoE GPT
+  trains at 103.9k tokens/s with two-stage expert parallelism vs 81.9k with DDP, in 10.5 vs 12.7 GB per GPU.
+  Chunks with nodes were slower (233 ms); both stages over one communicator 3× slower (reverted).
+  `bench/profile_moe_ep.py` shows where a step's time goes.
+- **RTX PRO 4500 Blackwell validated** (82 SMs, 200 W): tests, sanitizers, soak pass; GEMM up to 493
+  TFLOPS (0.98–2.0× cuBLASLt); the 8-bit attention is no faster than SDPA there.
+- **Fixes for PyTorch 2.11's torch.compile:** the attention backward's flash-attention check is decided at
+  import (setting a global in the backward broke `fullgraph=True`); the MoE compile test compares
+  numerically before PyTorch 2.14.
+- `tools/pod_session.sh`: `ep` on four GPUs (with nodes of two), `eprof`, `moegpt` phases.
+
 ## 0.16.0 — MoE: dropless expert parallelism, overlapped exchange, measured on two GPUs; native Windows rerun (2026-11-25)
 
 - **Dropless expert parallelism** (`MoE(..., ep_group=g)` without `capacity_factor`): the row counts go

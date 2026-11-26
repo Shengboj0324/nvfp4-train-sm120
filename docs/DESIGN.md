@@ -894,9 +894,9 @@ accumulation.
    PyTorch 2.11, CUDA 12.8), the first sm_120 part besides the RTX 5090s: all pass (after two fixes for
    PyTorch 2.11's torch.compile: the attention backward's flash check is now decided at import, and the MoE
    compile test compares numerically before 2.14, whose inductor rounds bf16 casts like eager). The GEMM
-   reaches 491 TFLOPS there, 1.0–2.0x cuBLASLt's NVFP4, and the training-step gains match the larger parts
-   (RESULTS.md §9). The 8-bit attention does not pay there: 0.77–1.01x SDPA forward + backward (it was
-   tuned on the 5090's 170 SMs and power budget).
+   reaches 493 TFLOPS there, 0.98–2.0x cuBLASLt's NVFP4, and the training-step gains match the larger parts
+   (RESULTS.md §9). The 8-bit attention does not pay there: 0.85–1.04x SDPA forward + backward with the
+   default exact backward, 0.77–0.88x with the 8-bit one.
 
 ## 7. 8-bit attention (`csrc/attention.cu`, `nvfp4/attention.py`, v0.9)
 

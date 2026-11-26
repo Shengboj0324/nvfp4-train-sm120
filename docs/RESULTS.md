@@ -510,7 +510,7 @@ on the activations of a model trained at 4096 tokens (`bench/attention_real_erro
 [0.7–2.3%], dQ 0.4–2.0% [0.3–0.6%; v0.9.0: 0.4–24%], dK 1.2–6.9% [2.8–7.1%], dV 0.2–2.1% [2.5–3.1%].
 GPT-124M (attention a small share of the step) trains at the same speed with either.
 
-## 8. Mixture of experts (v0.11–v0.16, `bench/results/moe.json`, `experiments/results/v0.12_moe/`, `…/v0.13_moe/`, `…/v0.14_moe/`, `…/v0.16_ep_2x5090/`)
+## 8. Mixture of experts (v0.11–v0.17, `bench/results/moe.json`, `experiments/results/v0.12_moe/`, `…/v0.13_moe/`, `…/v0.14_moe/`, `…/v0.16_ep_2x5090/`, `…/v0.17_*/`)
 
 `nvfp4.moe.MoE` layer, one training step (forward + backward, autocast BF16, 16,384 tokens), BF16 experts
 vs the same experts converted to NVFP4 (`bench/bench_moe.py`). v0.11 ran each expert's fused MLP in turn;
@@ -637,11 +637,120 @@ separately). Milliseconds per step:
   about 2.2 GB with fp32 weights, gradients and Adam states). With NVLink or larger expert counts the balance shifts. Fewer tokens per step
   shrink the exchanges, not the gradients.
 - **NVFP4 makes the exchange a larger share** (the experts are 1.8× faster): sending the rows in NVFP4
-  (4.5 bits instead of 16) would cut the traffic about 3.5×; not done (the experts' column quantization
-  for the weight gradient needs the bf16 rows, so the receiver would need both).
+  (4.5 bits instead of 16) would cut the traffic about 3.5× (done in v0.17, §8.2–8.3).
 
 The same machine's single-GPU MoE benchmark (`moe.json`): NVFP4 is 1.47–2.36× the grouped BF16 experts
 and 1.84–3.79× the BF16 loop (the laptop: 1.54–2.55× and 1.64–2.65×; the desktop GPU gains more over the BF16 loop).
+
+### 8.2 Expert parallelism v0.17 on four RTX PRO 4500 Blackwell (`experiments/results/v0.17_ep_4xpro4500/`)
+
+A rented Secure-Cloud machine (2026-11-26): 4× RTX PRO 4500 Blackwell (sm_120, 82 SMs, 32 GB, 200 W),
+PCIe; `nvidia-smi topo` pairs GPUs 0–1 and 2–3 behind separate host bridges (PHB within a pair, NODE
+across), PyTorch 2.11.0+cu128, CUDA 12.8, NCCL. The two GPUs of a pair exchanged an all-to-all at 19.7 GiB/s
+per GPU; all four at 3.2 GiB/s (80 MiB in 18.5 ms): a host whose links between the pairs are slow, like two
+nodes. The MoE tests passed there (97, including the v0.17 expert-parallel tests over NCCL on four GPUs as
+two nodes of two). Same benchmark as §8.1, `bench/bench_moe_ep.py`, 16,384 tokens per GPU, v0.17 as
+released (`final/`); milliseconds per step, NVFP4 experts (the BF16 rows are in the JSON):
+
+| | 2 GPUs (one pair), layer A | 2 GPUs, layer B | 4 GPUs, layer A | 4 GPUs, layer B |
+|---|---|---|---|---|
+| local (all experts on every GPU) | 12.6 | 38.1 | 12.6 | 38.2 |
+| DP: local + all-reduce of the expert gradients | 20.0 | 65.6 | 51.2 | 196.3 |
+| EP, fixed-size per-slot exchanges, capacity 1.25 (v0.16) | 23.0 | 72.6 | 88.0 | 322.8 |
+| EP, each token once per rank (v0.17) | 19.3 | 47.3 | 86.4 | 196.4 |
+| … in 2 chunks | 19.0 | 51.3 | 65.6 | 162.4 |
+| … NVFP4 activation messages | 18.8 | 47.0 | 80.4 | 170.1 |
+| … NVFP4 activation messages, 2 chunks | 19.6 | 51.3 | 60.8 | 147.2 |
+| … NVFP4 activation + gradient messages, 2 chunks | 19.8 | 52.5 | 53.9 | 136.9 |
+| … two stages over the pairs as nodes (`ep_node_size=2`) | – | – | **38.2** | **96.1** |
+
+Layer A: d 1024, d_ff 2816, 8 experts, top-2. Layer B: d 2048, d_ff 1408, 32 experts, top-4, shared
+expert 2816. BF16 experts: layer B on four GPUs 491.9 (capacity) → 207.9 (once per rank) → 161.6 (2 chunks)
+→ 110.6 (nodes), local 61.3, DP 219.4.
+
+- **Once per rank** sends 34,481 rows per rank and forward for layer B on four GPUs instead of the
+  ~49,000 off-rank slots (top-4: a token's 4 experts sit on 2.8 of 4 ranks on average, 2.1 of them other ranks), and the partial
+  sums come back once per (token, rank). With the fused combine (§8.4) it beats the fixed-size exchanges
+  by 16–39% (2% on four GPUs for layer A, whose top-2 leaves little to deduplicate), and on one pair it
+  beats data parallelism for layer B (47.3 vs 65.6 ms) and ties it for layer A (19.3 vs 20.0).
+- **Two stages over the pairs** are the largest win on the slow four-GPU links: 15,468 rows per rank cross
+  between the pairs (the other 22,980 go within a pair) instead of 34,481, and the return crosses once per
+  (token, pair). Layer B: 196.4 → 96.1 ms, 3.4× faster than the fixed-size exchanges and 2.0× faster than
+  data parallelism; layer A 38.2 vs DP 51.2.
+- **Chunks** help when the exchange dominates (four GPUs, flat: 17–24%) and change −2% to +8% when it
+  does not (one pair; 4 chunks cost more). A profile (`bench/profile_moe_ep.py`, `profile_ep4/`) shows why
+  not more: on four GPUs the flat step idles its compute stream 158 of 200 ms waiting for NCCL; with 2
+  chunks the idle time drops to 109 ms, but the expert GEMMs run ~1.3–1.7× slower beside the NCCL
+  copies (memory and SM contention), and an SM margin (`ops.set_sm_margin(8)`) changes that by under
+  1%. With nodes, chunks were slower in the final run (233 vs 96 ms; an earlier run with the old combine:
+  114 vs 123), so keep `ep_chunks = 1` there. Running both stages over the whole group's communicator
+  (zero-size splits to the other ranks) instead of rail and node sub-groups was 3× slower (284 ms,
+  `final_onecomm/`) and was reverted.
+- **NVFP4 messages** cut the activation messages 3.6× and the gradient messages likewise: 7–13% faster
+  steps where the links are slow (four GPUs), nothing on the fast pair, where the step is compute-bound.
+  The combine direction stays bf16.
+- **MoE GPT on four GPUs** (`nvfp4_results2/moegpt_*`, 8 experts, top-2, d 768, 12 layers, 16 sequences of
+  512 tokens per GPU, 600 steps, the v0.17 code before the fused combine): data parallelism (DDP,
+  replicated experts) 81.9k tokens/s and 12.7 GB per GPU; expert parallelism with DDP over the rest
+  (`--moe-ep`) 67.0k; with 2 chunks, NVFP4 messages and an SM margin of 8, 80.0k; **with two stages over
+  the pairs 103.9k tokens/s (1.27× DDP) and 10.5 GB per GPU**. Validation losses at step 600: 1.9587,
+  1.9504, 1.9432, 1.9447 (one seed each, within this model's run-to-run spread).
+
+### 8.3 NVFP4 messages: the loss (`experiments/results/v0.17_ep_wire/`)
+
+The MoE GPT of §8 (NVFP4, 8 experts, top-2, 3000 steps, TinyStories) on one GPU with its MoE layers on
+the expert-parallel path over a one-process group (`--moe-ep-wire`; the encoding and decoding run as on a
+cluster), two seeds:
+
+| messages | seed 0 | seed 1 | mean | vs bf16 |
+|---|---|---|---|---|
+| bf16 | 1.4987 | 1.4996 | 1.4991 | – |
+| NVFP4 activations (`ep_wire="nvfp4"`) | 1.5004 | 1.4995 | 1.4999 | +0.05% |
+| NVFP4 activations and gradients (+ `ep_wire_grad="nvfp4"`) | 1.4989 | 1.5063 | 1.5026 | +0.23% |
+
+Single MoE GPT runs vary by ±0.33% (§8, v0.14), so neither difference is resolved. The activation messages
+leave the forward and the input gradient bit-identical (the receiver re-quantizes to the same codes) and
+only add a second rounding to the weight gradients' operand; the gradient messages round the experts'
+output gradients twice (both unbiased). Activation messages look free; gradient messages need more seeds
+before being called that. (The bf16 messages on one process match the plain layer: 1.4987 vs 1.4993 in
+v0.14, run-to-run noise.)
+
+### 8.4 The fused gather / combine (`experiments/results/v0.17_combine_laptop/`)
+
+The single-GPU MoE benchmark on the laptop, `NVFP4_MOE_FUSED_COMBINE=0` (the v0.16 index_select + bmm
+combine) vs the default, milliseconds per training step (16,384 tokens):
+
+| layer | NVFP4, bmm | NVFP4, fused | BF16 grouped, bmm | BF16 grouped, fused |
+|---|---|---|---|---|
+| d 1024, d_ff 2816, 8 experts, top-2 | 14.89 | 13.60 (−9%) | 30.95 | 28.78 |
+| d 2048, d_ff 5632, 8 experts, top-2 | 42.66 | 39.14 (−8%) | 108.27 | 105.72 |
+| d 2048, d_ff 1408, 32 experts, top-4 | 35.28 | 31.26 (−11%) | 72.39 | 68.07 |
+| d 768, d_ff 1536, 8 experts, top-2, GELU | 6.84 | 5.82 (−15%) | 10.03 | 9.35 |
+| 32 experts, top-4, capacity 1.25, shared 2816 | 45.80 | 41.07 (−10%) | 99.69 | 95.50 |
+
+NVFP4 is now 1.61–2.70× the grouped BF16 experts on the laptop (was 1.47–2.54×), and peak memory drops by
+~2 GB at d 2048. On expert parallelism the fused combine took the two-GPU layer-B step from 71.1 to
+49.2 ms in the profile (compute stream busy 62.5 → 40.0 ms), since it also replaces the partial sums and
+the dispatch's backward. On the RTX PRO 4500 the layer is 1.45–2.02× grouped BF16.
+
+## 9. RTX PRO 4500 Blackwell (v0.17, `experiments/results/v0.17_ep_4xpro4500/nvfp4_results2/`)
+
+The first sm_120 part besides the RTX 5090s: 82 SMs (the 5090 Laptop also has 82, at a 175 W limit), 200 W,
+32 GB GDDR7, PCIe 5.0; PyTorch 2.11.0+cu128, CUDA 12.8. The full suite ran there: 993 passed, 16 skipped
+and 9 failed. The 9 were PyTorch 2.11's `torch.compile`: the attention backward set a module global (an
+untraceable side effect), and the MoE compile-versus-eager check relied on 2.14's inductor rounding bf16
+casts like eager. Both were fixed (`r3/`: 165 passed in those files); compute-sanitizer (4 tools, 0
+findings) and the 5-minute soak (13,345 iterations, 6,675 bit-exact replays) passed.
+
+- **GEMM** (`gemm.json`): 305–493 TFLOPS NVFP4, 0.98–2.0× cuBLASLt's NVFP4 (8192³: 491 vs 467; 8192 × 3072
+  × 768: 305 vs 152; 2304 × 768 × 8192: 392 vs 400) and 2.0–3.1× cuBLAS BF16 (147–173 TFLOPS).
+- **Training steps** (`train_step.json`, `llama_block.json`): GPT blocks 1.04× (d 768) to 2.46× (d 4096,
+  fused, residual, cached) BF16; Llama blocks 1.36–2.56×; long-context blocks (d 2048, 2k–16k tokens per
+  sequence) 1.51–2.00×.
+- **8-bit attention does not pay here** (`attention.json`): forward + backward 0.85–1.04× SDPA with the
+  default exact backward (`backward="bf16"`; forward alone 0.38–1.15×, faster only from 4k tokens) and
+  0.77–0.88× with `backward="8bit"`, against 1.07–1.12× on the laptop. It was tuned on the laptop and the
+  5090; this part's 200 W budget and SDPA's relative speed leave no margin.
 
 ## Reproduce
 
