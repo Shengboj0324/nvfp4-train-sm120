@@ -73,7 +73,18 @@ class _AttentionFn(torch.autograd.Function):
 
 
 _LN2 = 0.6931471805599453
-_FLASH_BWD: bool | None = None  # PyTorch's flash-attention backward is available (None: not tried yet)
+
+def _flash_available() -> bool:
+    """PyTorch was built with flash attention (its Windows wheels are not). Decided once, at import: a global
+    set inside the backward would be a side effect torch.compile cannot trace."""
+    f = getattr(torch.backends.cuda, "is_flash_attention_available", None)
+    try:
+        return bool(f()) if f is not None else True
+    except Exception:  # pragma: no cover
+        return True
+
+
+_FLASH_BWD = _flash_available()
 
 
 def _math_backward(do, q, k, v, o, lse, causal: bool, scale: float, rows: int = 512):
@@ -125,25 +136,17 @@ class _AttentionBf16BwdFn(torch.autograd.Function):
 
     @staticmethod
     def backward(ctx, do):
-        global _FLASH_BWD
         qd, kd, vd, o, lse = ctx.saved_tensors
         causal, scale = ctx.cfg
         rep = qd.shape[1] // kd.shape[1]
         ke, ve = (kd.repeat_interleave(rep, 1), vd.repeat_interleave(rep, 1)) if rep > 1 else (kd, vd)
         do = do.to(qd.dtype)
-        dq = None
-        if _FLASH_BWD is not False:
+        if _FLASH_BWD:
             zero = torch.zeros((), dtype=torch.uint64, device=qd.device)
-            try:
-                dq, dk, dv = torch.ops.aten._scaled_dot_product_flash_attention_backward(
-                    do, qd, ke, ve, o, lse, None, None, qd.shape[2], kd.shape[2], 0.0, causal,
-                    torch.zeros(2, dtype=torch.uint64, device=qd.device), zero, scale=scale)
-                _FLASH_BWD = True
-            except RuntimeError as e:  # PyTorch built without flash attention (its Windows wheels)
-                if _FLASH_BWD or "FLASH" not in str(e).upper():
-                    raise
-                _FLASH_BWD = False
-        if dq is None:
+            dq, dk, dv = torch.ops.aten._scaled_dot_product_flash_attention_backward(
+                do, qd, ke, ve, o, lse, None, None, qd.shape[2], kd.shape[2], 0.0, causal,
+                torch.zeros(2, dtype=torch.uint64, device=qd.device), zero, scale=scale)
+        else:  # PyTorch built without flash attention (its Windows wheels)
             dq, dk, dv = _math_backward(do, qd, ke, ve, o, lse, causal, scale)
         if rep > 1:
             B, Hk, N, D = kd.shape
