@@ -1,0 +1,7 @@
+{"d": 2048, "t": 512, "tokens": 16384, "bf16_ms": 47.672, "nvfp4_ms": 22.513, "nvfp4_attn8_ms": 23.723, "nvfp4_attn8_8bitbwd_ms": 23.274, "speedup_nvfp4": 2.118, "speedup_nvfp4_attn8": 2.01, "attn8_gain": 0.949, "attn8_8bitbwd_gain": 0.967}
+{"d": 2048, "t": 1024, "tokens": 16384, "bf16_ms": 48.667, "nvfp4_ms": 23.426, "nvfp4_attn8_ms": 24.566, "nvfp4_attn8_8bitbwd_ms": 24.379, "speedup_nvfp4": 2.077, "speedup_nvfp4_attn8": 1.981, "attn8_gain": 0.954, "attn8_8bitbwd_gain": 0.961}
+{"d": 2048, "t": 2048, "tokens": 16384, "bf16_ms": 50.45, "nvfp4_ms": 25.191, "nvfp4_attn8_ms": 26.215, "nvfp4_attn8_8bitbwd_ms": 26.469, "speedup_nvfp4": 2.003, "speedup_nvfp4_attn8": 1.924, "attn8_gain": 0.961, "attn8_8bitbwd_gain": 0.952}
+{"d": 2048, "t": 4096, "tokens": 16384, "bf16_ms": 53.928, "nvfp4_ms": 28.7, "nvfp4_attn8_ms": 29.505, "nvfp4_attn8_8bitbwd_ms": 30.664, "speedup_nvfp4": 1.879, "speedup_nvfp4_attn8": 1.828, "attn8_gain": 0.973, "attn8_8bitbwd_gain": 0.936}
+{"d": 2048, "t": 8192, "tokens": 16384, "bf16_ms": 60.891, "nvfp4_ms": 35.673, "nvfp4_attn8_ms": 35.971, "nvfp4_attn8_8bitbwd_ms": 38.987, "speedup_nvfp4": 1.707, "speedup_nvfp4_attn8": 1.693, "attn8_gain": 0.992, "attn8_8bitbwd_gain": 0.915}
+{"d": 2048, "t": 16384, "tokens": 16384, "bf16_ms": 74.638, "nvfp4_ms": 49.475, "nvfp4_attn8_ms": 48.777, "nvfp4_attn8_8bitbwd_ms": 55.105, "speedup_nvfp4": 1.509, "speedup_nvfp4_attn8": 1.53, "attn8_gain": 1.014, "attn8_8bitbwd_gain": 0.898}
+[guard] elapsed 69s | peak GPU temp 73C, power 203W, GPU mem 4964MB | min host mem avail 242159MB | cooldown 0s

@@ -1,0 +1,1 @@
+db7a7f2 MoE: variable-size expert-parallel exchanges (once per rank / node), NVFP4 messages, chunked wavefront; GEMM SM margin

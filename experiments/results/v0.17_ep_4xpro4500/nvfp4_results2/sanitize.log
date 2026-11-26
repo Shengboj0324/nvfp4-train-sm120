@@ -1,0 +1,20 @@
+=== memcheck
+DRIVE_OK
+========= ERROR SUMMARY: 0 errors
+[guard] elapsed 10s | peak GPU temp 36C, power 46W, GPU mem 2346MB | min host mem avail 240764MB | cooldown 0s
+exit=0
+=== racecheck
+DRIVE_OK
+========= RACECHECK SUMMARY: 0 hazards displayed (0 errors, 0 warnings)
+[guard] elapsed 30s | peak GPU temp 38C, power 54W, GPU mem 2324MB | min host mem avail 234284MB | cooldown 0s
+exit=0
+=== synccheck
+DRIVE_OK
+========= ERROR SUMMARY: 0 errors
+[guard] elapsed 7s | peak GPU temp 37C, power 46W, GPU mem 2328MB | min host mem avail 240738MB | cooldown 0s
+exit=0
+=== initcheck
+DRIVE_OK
+========= ERROR SUMMARY: 0 errors
+[guard] elapsed 7s | peak GPU temp 37C, power 41W, GPU mem 2354MB | min host mem avail 240713MB | cooldown 0s
+exit=0

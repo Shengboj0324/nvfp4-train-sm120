@@ -1,0 +1,16 @@
+W1126 01:48:23.280000 11362 torch/distributed/run.py:851] 
+W1126 01:48:23.280000 11362 torch/distributed/run.py:851] *****************************************
+W1126 01:48:23.280000 11362 torch/distributed/run.py:851] Setting OMP_NUM_THREADS environment variable for each process to be 1 in default, to avoid your system being overloaded, please further tune the variable for optimal performance in your application as needed. 
+W1126 01:48:23.280000 11362 torch/distributed/run.py:851] *****************************************
+{'config': {'precision': 'nvfp4', 'd': 768, 'layers': 12, 'heads': 12, 'ctx': 512, 'batch': 64, 'micro_batch': 16, 'steps': 600, 'lr': 0.0006, 'warmup': 200, 'eval_every': 200, 'hp_last': 2, 'no_rht': False, 'fuse_wgrad': True, 'fuse_producers': True, 'attn': 'sdpa', 'attn_backward': 'bf16', 'four_six': False, 'weight_1d': False, 'ms_eden_dgrad': False, 'ms_eden': False, 'moe_experts': 8, 'moe_topk': 2, 'moe_dff': 0, 'moe_aux': 0.01, 'moe_capacity': 0.0, 'moe_shared': 0, 'moe_ep': True, 'moe_ep_wire': '', 'moe_ep_chunks': 1, 'moe_ep_node_size': 1, 'sm_margin': 0, 'bf16_tail': 0.0, 'hp_modules': '', 'seed': 0, 'data': '/workspace/nvfp4_data', 'out': '/workspace/nvfp4_results2/moegpt_ep.jsonl'}, 'params': 124073472, 'nvfp4_linears': 30, 'torch': '2.11.0+cu128', 'device': 'NVIDIA RTX PRO 4500 Blackwell', 'world_size': 4}
+{'step': 0, 'val_loss': 10.960322165489197, 'elapsed_s': 8.595598074025474}
+{'step': 0, 'loss': 11.10153579711914, 'grad_norm': 19.163467407226562, 'lr': 2.9999999999999997e-06, 'tok_per_s': None, 'max_mem_gb': 8.976733684539795}
+{'step': 100, 'loss': 3.9791393280029297, 'grad_norm': 0.5492558479309082, 'lr': 0.00028473256380600817, 'tok_per_s': 66869.12230534901, 'max_mem_gb': 10.481626510620117}
+{'step': 200, 'val_loss': 3.098274493217468, 'elapsed_s': 114.34788898006082}
+{'step': 200, 'loss': 3.2683768272399902, 'grad_norm': 0.7073416113853455, 'lr': 0.00046499999999999997, 'tok_per_s': 65066.115282106584, 'max_mem_gb': 10.481626510620117}
+{'step': 300, 'loss': 2.5797736644744873, 'grad_norm': 0.4500664472579956, 'lr': 0.00033, 'tok_per_s': 67021.6655167156, 'max_mem_gb': 10.481626510620117}
+{'step': 400, 'val_loss': 2.18601371049881, 'elapsed_s': 219.2007719130488}
+{'step': 400, 'loss': 2.344053030014038, 'grad_norm': 0.3848995268344879, 'lr': 0.00019499999999999992, 'tok_per_s': 66923.01222462693, 'max_mem_gb': 10.481626510620117}
+{'step': 500, 'loss': 2.230394124984741, 'grad_norm': 0.36657392978668213, 'lr': 9.617314097820161e-05, 'tok_per_s': 67194.91801094383, 'max_mem_gb': 10.481626510620117}
+{'step': 600, 'val_loss': 1.9503762871026993, 'elapsed_s': 323.8318780900445}
+[guard] elapsed 332s | peak GPU temp 61C, power 106W, GPU mem 15286MB | min host mem avail 234663MB | cooldown 0s

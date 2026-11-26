@@ -43,6 +43,7 @@ from __future__ import annotations
 
 import contextlib
 import math
+import os
 from typing import NamedTuple
 
 import torch
@@ -51,6 +52,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 from nvfp4 import _bf16_grouped, ops
+from nvfp4 import _library as _lib
 from nvfp4._bf16_grouped import GroupedLinear, expert_sums
 from nvfp4.linear import ALIGN, WeightQuantCache, _accumulation_target, dgrad_weight_operand, draw_seeds
 
@@ -86,6 +88,53 @@ def _bias_grad(partial: torch.Tensor, tiles: torch.Tensor, bias: torch.Tensor) -
     return expert_sums(partial, tiles.repeat_interleave(_ROWS // 64), bias.shape[0]).to(bias.dtype)
 
 
+_FUSED_COMBINE = os.environ.get("NVFP4_MOE_FUSED_COMBINE", "1") != "0"  # 0: the index_select + bmm path (ablations)
+
+
+def _fused(t: torch.Tensor) -> bool:
+    """The gather / combine kernels apply: a CUDA tensor on an sm_120 GPU with the extension built (the device
+    check is cached by the first eager call; under torch.compile an unchecked device takes the PyTorch path)."""
+    if not t.is_cuda or _lib._C is None or not _FUSED_COMBINE:
+        return False
+    idx = t.device.index if t.device.index is not None else torch.cuda.current_device()
+    ok = _lib._device_ok.get(idx)
+    if ok is None and not torch.compiler.is_compiling():
+        ok = _lib._device_ok[idx] = torch.cuda.get_device_capability(idx) == _lib._SUPPORTED_CAPABILITY
+    return bool(ok)
+
+
+class _GatherCombine(torch.autograd.Function):
+    """out[r] = sum_j w[r, j] rows[pos[r, j]] (w None: weight 1; pos outside [0, len(rows)): nothing), in fp32
+    with one rounding to rows' dtype, by one kernel that reads each row once (csrc/moe_combine.cu). Backward by
+    gathers, deterministic: each row's gradient comes from the one (r, j) that reads it (every row is read by at
+    most one choice with a nonzero weight, as in this layer), the weights' from per-choice dot products."""
+
+    @staticmethod
+    def forward(ctx, rows, pos, w):
+        w32 = None if w is None else w.float().contiguous()
+        out = _lib.combine_fwd(rows, pos.contiguous(), w32)
+        ctx.save_for_backward(rows if w is not None and ctx.needs_input_grad[2] else None, pos, w32)
+        ctx.m, ctx.w_dtype = rows.shape[0], None if w is None else w.dtype
+        return out
+
+    @staticmethod
+    def backward(ctx, g):
+        rows, pos, w32 = ctx.saved_tensors
+        R, k = pos.shape
+        drows = dw = None
+        g = g.contiguous()
+        if ctx.needs_input_grad[0]:
+            flat = pos.reshape(-1)
+            valid = (flat >= 0) & (flat < ctx.m)
+            # the slot reading each row (integer max: deterministic; duplicates only among zero-weight slots)
+            inv = torch.full((ctx.m + 1,), -1, device=g.device, dtype=torch.long).scatter_reduce_(
+                0, torch.where(valid, flat, ctx.m), torch.arange(R * k, device=g.device), "amax")[:ctx.m]
+            drows = _lib.combine_bwd_rows(g, inv.contiguous(), w32, k)
+        if rows is not None:
+            dw = _lib.combine_bwd_w(g, rows if rows.stride(1) == 1 else rows.contiguous(), pos).to(ctx.w_dtype)
+        return drows, None, dw
+
+
 class _Dispatch(torch.autograd.Function):
     """rows[i] = x[src[i]] (src[i] == T: a zero row), with a deterministic backward: each token's gradient is
     the sum of its k slots' rows, gathered (``pos`` [T, k]: the rows of token t's slots), not scatter-added
@@ -100,6 +149,8 @@ class _Dispatch(torch.autograd.Function):
     def backward(ctx, g):
         (pos,) = ctx.saved_tensors
         T, k = pos.shape
+        if _fused(g):
+            return _lib.combine_fwd(g.contiguous(), pos.contiguous(), None), None, None
         dx = g.index_select(0, pos.reshape(-1)).view(T, k, g.shape[1])
         return (dx.float().sum(1).to(g.dtype) if k > 1 else dx[:, 0]), None, None
 
@@ -573,6 +624,8 @@ def _gather_sum(rows: torch.Tensor, pos: torch.Tensor) -> torch.Tensor:
     """out[r] = sum_j rows'[pos[r, j]], rows' = rows plus a zero row at index len(rows) (deterministic: each
     real row is read once)."""
     R, k = pos.shape
+    if _fused(rows):
+        return _GatherCombine.apply(rows, pos, None)
     rows = torch.cat([rows, rows.new_zeros(1, rows.shape[1])])
     g = rows.index_select(0, pos.reshape(-1)).view(R, k, rows.shape[1])
     return g.float().sum(1).to(rows.dtype) if k > 1 else g[:, 0]
@@ -601,6 +654,8 @@ def _combine(ys: torch.Tensor, pos: torch.Tensor, w: torch.Tensor) -> torch.Tens
     """y[t] = sum_j w[t, j] ys[pos[t, j]]: a gather and a k-term weighted sum (deterministic; the gather's
     backward writes every row once, except the always-zero row dropped slots point to, which gets zeros)."""
     T, k = pos.shape
+    if _fused(ys):  # weights rounded to the rows' dtype first, as the bmm below takes them
+        return _GatherCombine.apply(ys, pos, w.to(ys.dtype))
     g = ys.index_select(0, pos.reshape(-1)).view(T, k, ys.shape[1])
     return torch.bmm(w.to(g.dtype).unsqueeze(1), g).squeeze(1)
 

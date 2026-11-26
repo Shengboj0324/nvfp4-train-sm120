@@ -1,0 +1,4 @@
+........................................................................ [ 87%]
+..........                                                               [100%]
+82 passed in 37.27s
+[guard] elapsed 41s | peak GPU temp 33C, power 49W, GPU mem 10849MB | min host mem avail 232442MB | cooldown 0s

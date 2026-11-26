@@ -1,0 +1,34 @@
+........................................................................ [ 43%]
+........................................................................ [ 87%]
+.....................                                                    [100%]
+=============================== warnings summary ===============================
+tests/test_attention_cuda.py: 14 warnings
+  /workspace/venv/lib/python3.10/site-packages/torch/jit/_script.py:365: DeprecationWarning: `torch.jit.script_method` is deprecated. Please switch to `torch.compile` or `torch.export`.
+    warnings.warn(
+
+tests/test_moe_integration_cuda.py::test_forward_backward_has_no_host_sync[swiglu]
+  /workspace/venv/lib/python3.10/site-packages/torch/cuda/__init__.py:1270: UserWarning: Synchronization debug mode is a prototype feature and does not yet detect all synchronizing operations (Triggered internally at /pytorch/torch/csrc/cuda/Module.cpp:1003.)
+    torch._C._cuda_set_sync_debug_mode(debug_mode)
+
+tests/test_moe_integration_cuda.py::test_cuda_graph_full_training_step_learns[swiglu]
+  /workspace/venv/lib/python3.10/site-packages/torch/autograd/graph.py:869: UserWarning: The AccumulateGrad node's stream does not match the stream of the node that produced the incoming gradient. This may incur unnecessary synchronization and break CUDA graph capture if the AccumulateGrad node's stream is the default stream. This mismatch is caused by an AccumulateGrad node created prior to the current iteration being kept alive. This can happen if the autograd graph is still being kept alive by tensors such as the loss, or if you are using DDP, which will stash a reference to the node. To resolve the mismatch, delete all references to the autograd graph or ensure that DDP initialization is performed under the same stream as subsequent forwards. If the mismatch is intentional, you can use torch.autograd.graph.set_warn_on_accumulate_grad_stream_mismatch(False) to suppress this warning. (Triggered internally at /pytorch/torch/csrc/autograd/input_buffer.cpp:240.)
+    return Variable._execution_engine.run_backward(  # Calls into the C++ engine to run the backward pass
+
+tests/test_moe_integration_cuda.py::test_compile_fullgraph_matches_eager[swiglu]
+tests/test_moe_integration_cuda.py::test_compile_fullgraph_matches_eager[gelu_tanh]
+tests/test_moe_integration_cuda.py::test_compile_fullgraph_matches_eager[swiglu-bias]
+tests/test_moe_integration_cuda.py::test_compile_fullgraph_matches_eager[gelu_tanh-bias]
+tests/test_moe_integration_cuda.py::test_compile_fullgraph_matches_eager[swiglu-bf16]
+tests/test_moe_integration_cuda.py::test_compile_fullgraph_matches_eager[gelu_tanh-bias-bf16]
+tests/test_moe_integration_cuda.py::test_compile_fullgraph_matches_eager[swiglu-cap-shared]
+tests/test_moe_integration_cuda.py::test_compile_fullgraph_matches_eager[gelu_tanh-cap-shared-bias-bf16]
+  /workspace/venv/lib/python3.10/site-packages/torch/_inductor/lowering.py:7836: UserWarning: 
+  Online softmax is disabled on the fly since Inductor decides to
+  split the reduction. Cut an issue to PyTorch if this is an
+  important use case and you want to speed it up with online
+  softmax.
+  
+    warnings.warn(
+
+-- Docs: https://docs.pytest.org/en/stable/how-to/capture-warnings.html
+165 passed, 24 warnings in 135.38s (0:02:15)

@@ -1,0 +1,241 @@
+{
+ "meta": {
+  "gpus": [
+   "NVIDIA RTX PRO 4500 Blackwell",
+   "NVIDIA RTX PRO 4500 Blackwell"
+  ],
+  "torch": "2.11.0+cu128"
+ },
+ "rows": [
+  {
+   "d": 1024,
+   "d_ff": 2816,
+   "E": 8,
+   "k": 2,
+   "T": 16384,
+   "shared": 0,
+   "W": 2,
+   "precision": "bf16",
+   "local": 22.377381896972658,
+   "ep cap 1.25": 36.83497009277344,
+   "ep dropless": 31.933349609375,
+   "ep dropless chunks 2": 30.465670776367187,
+   "ep dropless chunks 4": 32.415679931640625,
+   "ep dropless chunks 2 margin 8": 30.456115722656254,
+   "ep dropless chunks 4 margin 8": 32.35361328125,
+   "rows_sent": {
+    "ep dropless": [
+     12940,
+     0
+    ],
+    "ep dropless chunks 2": [
+     12940,
+     0
+    ],
+    "ep dropless chunks 4": [
+     12940,
+     0
+    ],
+    "ep dropless chunks 2 margin 8": [
+     12940,
+     0
+    ],
+    "ep dropless chunks 4 margin 8": [
+     12940,
+     0
+    ]
+   }
+  },
+  {
+   "d": 1024,
+   "d_ff": 2816,
+   "E": 8,
+   "k": 2,
+   "T": 16384,
+   "shared": 0,
+   "W": 2,
+   "precision": "nvfp4",
+   "local": 15.537747192382813,
+   "ep cap 1.25": 25.647045898437497,
+   "ep dropless": 26.202239990234375,
+   "ep dropless chunks 2": 24.962483215332032,
+   "ep dropless chunks 4": 30.76629638671875,
+   "ep dropless chunks 2 margin 8": 24.839833068847657,
+   "ep dropless chunks 4 margin 8": 29.039712524414064,
+   "ep wire nvfp4": 25.593855285644533,
+   "ep wire nvfp4 chunks 2": 25.05589752197266,
+   "ep wire nvfp4+grad chunks 2": 25.276325988769536,
+   "ep wire nvfp4 chunks 2 margin 8": 25.242405700683598,
+   "ep wire nvfp4 chunks 4 margin 8": 29.733279418945315,
+   "rows_sent": {
+    "ep dropless": [
+     12940,
+     0
+    ],
+    "ep dropless chunks 2": [
+     12940,
+     0
+    ],
+    "ep dropless chunks 4": [
+     12940,
+     0
+    ],
+    "ep dropless chunks 2 margin 8": [
+     12940,
+     0
+    ],
+    "ep dropless chunks 4 margin 8": [
+     12940,
+     0
+    ],
+    "ep wire nvfp4": [
+     12940,
+     0
+    ],
+    "ep wire nvfp4 chunks 2": [
+     12940,
+     0
+    ],
+    "ep wire nvfp4+grad chunks 2": [
+     12940,
+     0
+    ],
+    "ep wire nvfp4 chunks 2 margin 8": [
+     12940,
+     0
+    ],
+    "ep wire nvfp4 chunks 4 margin 8": [
+     12940,
+     0
+    ]
+   }
+  },
+  {
+   "d": 1024,
+   "E": 8,
+   "k": 2,
+   "T": 16384,
+   "W": 2,
+   "a2a_ms": 1.9742528915405273,
+   "a2a_MiB": 80.0,
+   "allreduce_ms": 6.960266749064127,
+   "allreduce_MiB": 132.0
+  },
+  {
+   "d": 2048,
+   "d_ff": 1408,
+   "E": 32,
+   "k": 4,
+   "T": 16384,
+   "shared": 2816,
+   "W": 2,
+   "precision": "bf16",
+   "local": 68.25309448242187,
+   "ep cap 1.25": 112.77410888671875,
+   "ep cap serial": 122.0677734375,
+   "ep dropless": 87.30025634765624,
+   "ep dropless chunks 2": 91.01792602539064,
+   "ep dropless chunks 4": 102.0380615234375,
+   "ep dropless chunks 2 margin 8": 91.06827392578124,
+   "ep dropless chunks 4 margin 8": 102.20004272460939,
+   "rows_sent": {
+    "ep dropless": [
+     15468,
+     0
+    ],
+    "ep dropless chunks 2": [
+     15468,
+     0
+    ],
+    "ep dropless chunks 4": [
+     15468,
+     0
+    ],
+    "ep dropless chunks 2 margin 8": [
+     15468,
+     0
+    ],
+    "ep dropless chunks 4 margin 8": [
+     15468,
+     0
+    ]
+   }
+  },
+  {
+   "d": 2048,
+   "d_ff": 1408,
+   "E": 32,
+   "k": 4,
+   "T": 16384,
+   "shared": 2816,
+   "W": 2,
+   "precision": "nvfp4",
+   "local": 46.43736877441406,
+   "ep cap 1.25": 79.70912475585936,
+   "ep cap serial": 83.26872558593749,
+   "ep dropless": 70.01021728515624,
+   "ep dropless chunks 2": 73.03184814453125,
+   "ep dropless chunks 4": 84.14548339843749,
+   "ep dropless chunks 2 margin 8": 72.53532104492187,
+   "ep dropless chunks 4 margin 8": 83.99560546875,
+   "ep wire nvfp4": 69.89750366210937,
+   "ep wire nvfp4 chunks 2": 73.14954833984375,
+   "ep wire nvfp4+grad chunks 2": 74.45531616210937,
+   "ep wire nvfp4 chunks 2 margin 8": 72.71751708984375,
+   "ep wire nvfp4 chunks 4 margin 8": 84.81329345703125,
+   "rows_sent": {
+    "ep dropless": [
+     15468,
+     0
+    ],
+    "ep dropless chunks 2": [
+     15468,
+     0
+    ],
+    "ep dropless chunks 4": [
+     15468,
+     0
+    ],
+    "ep dropless chunks 2 margin 8": [
+     15468,
+     0
+    ],
+    "ep dropless chunks 4 margin 8": [
+     15468,
+     0
+    ],
+    "ep wire nvfp4": [
+     15468,
+     0
+    ],
+    "ep wire nvfp4 chunks 2": [
+     15468,
+     0
+    ],
+    "ep wire nvfp4+grad chunks 2": [
+     15468,
+     0
+    ],
+    "ep wire nvfp4 chunks 2 margin 8": [
+     15468,
+     0
+    ],
+    "ep wire nvfp4 chunks 4 margin 8": [
+     15468,
+     0
+    ]
+   }
+  },
+  {
+   "d": 2048,
+   "E": 32,
+   "k": 4,
+   "T": 16384,
+   "W": 2,
+   "a2a_ms": 7.813587188720704,
+   "a2a_MiB": 320.0,
+   "allreduce_ms": 25.699134826660156,
+   "allreduce_MiB": 528.0
+  }
+ ]
+}

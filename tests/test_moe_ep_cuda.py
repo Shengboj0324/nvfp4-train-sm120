@@ -355,3 +355,64 @@ def test_ddp_with_expert_parallelism():
         pytest.skip("gloo all_reduce of CUDA tensors crashes in this PyTorch build")
     os.environ.setdefault("OMP_NUM_THREADS", "2")
     mp.spawn(_ddp_ep_worker, args=(2, _free_port()), nprocs=2, join=True)
+
+
+# --- the fused gather / combine kernels (v0.17) ------------------------------------------------------------------
+
+@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float32, torch.float16])
+@pytest.mark.parametrize("weighted", [True, False])
+@pytest.mark.parametrize("d", [256, 200])  # 200: not a multiple of the 16-byte vector (scalar path)
+def test_combine_kernels_match_reference(dtype, weighted, d):
+    from nvfp4 import _library as lib
+    from nvfp4.moe import _GatherCombine
+    g = torch.Generator(device=DEV).manual_seed(d)
+    M, R, k = 300, 97, 3
+    rows = torch.randn(M, d, device=DEV, generator=g).to(dtype)
+    perm = torch.randperm(M, device=DEV, generator=g)[:R * k].view(R, k)
+    pos = torch.where(torch.rand(R, k, device=DEV, generator=g) < 0.2, M + 5, perm)  # some choices read nothing
+    w = torch.rand(R, k, device=DEV, generator=g) if weighted else None
+    # forward: fp32, j in order, one rounding (bit for bit)
+    acc = torch.zeros(R, d, device=DEV)
+    for j in range(k):
+        v = pos[:, j] < M
+        x = torch.where(v[:, None], rows.index_select(0, pos[:, j].clamp(max=M - 1)).float(), 0.0)
+        acc = acc + (x * w[:, j:j + 1] if weighted else x)
+    out = lib.combine_fwd(rows, pos, w)
+    assert out.dtype == dtype and torch.equal(out, acc.to(dtype))
+    # strided rows (a view inside a wider message)
+    wide = torch.zeros(M, d + 8, device=DEV, dtype=dtype)
+    wide[:, :d] = rows
+    assert torch.equal(lib.combine_fwd(wide[:, :d], pos, w), out)
+    # autograd against the PyTorch formulation
+    rr = rows.float().clone().requires_grad_()
+    ww = (w if weighted else torch.ones(R, k, device=DEV)).clone().requires_grad_()
+    ref = (torch.where((pos < M)[..., None], torch.cat([rr, rr.new_zeros(1, d)]).index_select(
+        0, pos.clamp(max=M).reshape(-1)).view(R, k, d), 0.0) * ww[..., None]).sum(1)
+    go = torch.randn(R, d, device=DEV, generator=g)
+    ref.backward(go)
+    r2 = rows.float().clone().requires_grad_()
+    w2 = ww.detach().clone().requires_grad_() if weighted else None
+    _GatherCombine.apply(r2, pos, w2).backward(go)
+    torch.testing.assert_close(r2.grad, rr.grad, rtol=1e-6, atol=1e-6)
+    if weighted:
+        torch.testing.assert_close(w2.grad, ww.grad, rtol=1e-5, atol=1e-4)
+
+
+def test_moe_combine_matches_bmm_path(monkeypatch):
+    """The layer with the fused combine == the index_select + bmm path, fp32 experts (outputs and gradients)."""
+    from nvfp4 import moe as moe_mod
+    torch.manual_seed(0)
+    m = MoE(256, 256, 8, top_k=3, shared_d_ff=256, bias=True, capacity_factor=0.75).to(DEV)
+    x = torch.randn(200, 256, device=DEV)
+
+    def run():
+        xg = x.clone().requires_grad_()
+        m.zero_grad(set_to_none=True)
+        y = m(xg)
+        y.square().sum().backward()
+        return [y.detach(), xg.grad] + [p.grad.clone() for p in m.parameters()]
+    fused = run()
+    monkeypatch.setattr(moe_mod, "_fused", lambda t: False)
+    plain = run()
+    for a, b in zip(fused, plain):
+        torch.testing.assert_close(a, b, rtol=1e-5, atol=1e-5)

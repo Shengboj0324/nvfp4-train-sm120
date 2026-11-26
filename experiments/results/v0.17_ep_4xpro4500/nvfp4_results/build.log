@@ -1,0 +1,972 @@
+running build_ext
+building 'nvfp4._C' extension
+creating /workspace/nvfp4-train-sm120/build
+creating /workspace/nvfp4-train-sm120/build/temp.linux-x86_64-3.10
+creating /workspace/nvfp4-train-sm120/build/temp.linux-x86_64-3.10/csrc
+[1/7] /usr/local/cuda/bin/nvcc -MD -MF /workspace/nvfp4-train-sm120/build/temp.linux-x86_64-3.10/csrc/gemm_tma.o.d -I/workspace/venv/lib/python3.10/site-packages/torch/include -I/workspace/venv/lib/python3.10/site-packages/torch/include/torch/csrc/api/include -I/usr/local/cuda/include -I/workspace/venv/include -I/usr/include/python3.10 -c -c /workspace/nvfp4-train-sm120/csrc/gemm_tma.cu -o /workspace/nvfp4-train-sm120/build/temp.linux-x86_64-3.10/csrc/gemm_tma.o -D__CUDA_NO_HALF_OPERATORS__ -D__CUDA_NO_HALF_CONVERSIONS__ -D__CUDA_NO_BFLOAT16_CONVERSIONS__ -D__CUDA_NO_HALF2_OPERATORS__ --expt-relaxed-constexpr --compiler-options ''"'"'-fPIC'"'"'' -O3 -std=c++20 -gencode=arch=compute_120a,code=sm_120a --expt-relaxed-constexpr -lineinfo -Xptxas=-v,-warn-spills -DTORCH_API_INCLUDE_EXTENSION_H -DTORCH_EXTENSION_NAME=_C
+ptxas warning : Registers are spilled to local memory in function '_ZN5nvfp44gemm3tma21nvfp4_gemm_tma_kernelI13__nv_bfloat16Lb0ELb1EEEvNS0_4ArgsE14CUtensorMap_stS5_S5_S5_', 24 bytes spill stores, 36 bytes spill loads
+ptxas warning : Registers are spilled to local memory in function '_ZN5nvfp44gemm3tma21nvfp4_gemm_tma_kernelIfLb0ELb1EEEvNS0_4ArgsE14CUtensorMap_stS4_S4_S4_', 24 bytes spill stores, 36 bytes spill loads
+ptxas warning : Registers are spilled to local memory in function '_ZN5nvfp44gemm3tma21nvfp4_gemm_tma_kernelIfLb1ELb1EEEvNS0_4ArgsE14CUtensorMap_stS4_S4_S4_', 24 bytes spill stores, 36 bytes spill loads
+ptxas info    : 0 bytes gmem
+ptxas info    : Compiling entry function '_ZN5nvfp44gemm3tma21nvfp4_gemm_tma_kernelI13__nv_bfloat16Lb0ELb0EEEvNS0_4ArgsE14CUtensorMap_stS5_S5_S5_' for 'sm_120a'
+ptxas info    : Function properties for _ZN5nvfp44gemm3tma21nvfp4_gemm_tma_kernelI13__nv_bfloat16Lb0ELb0EEEvNS0_4ArgsE14CUtensorMap_stS5_S5_S5_
+    8 bytes stack frame, 0 bytes spill stores, 0 bytes spill loads
+ptxas info    : Used 254 registers, used 2 barriers, 8 bytes cumulative stack size
+ptxas info    : Compile time = 591.853 ms
+ptxas info    : Compiling entry function '_ZN5nvfp44gemm3tma21nvfp4_gemm_tma_kernelIfLb0ELb0EEEvNS0_4ArgsE14CUtensorMap_stS4_S4_S4_' for 'sm_120a'
+ptxas info    : Function properties for _ZN5nvfp44gemm3tma21nvfp4_gemm_tma_kernelIfLb0ELb0EEEvNS0_4ArgsE14CUtensorMap_stS4_S4_S4_
+    8 bytes stack frame, 0 bytes spill stores, 0 bytes spill loads
+ptxas info    : Used 254 registers, used 2 barriers, 8 bytes cumulative stack size
+ptxas info    : Compile time = 578.152 ms
+ptxas info    : Compiling entry function '_ZN5nvfp44gemm3tma21nvfp4_gemm_tma_kernelIfLb1ELb0EEEvNS0_4ArgsE14CUtensorMap_stS4_S4_S4_' for 'sm_120a'
+ptxas info    : Function properties for _ZN5nvfp44gemm3tma21nvfp4_gemm_tma_kernelIfLb1ELb0EEEvNS0_4ArgsE14CUtensorMap_stS4_S4_S4_
+    8 bytes stack frame, 0 bytes spill stores, 0 bytes spill loads
+ptxas info    : Used 254 registers, used 2 barriers, 8 bytes cumulative stack size
+ptxas info    : Compile time = 526.751 ms
+ptxas info    : Compiling entry function '_ZN5nvfp44gemm3tma21nvfp4_gemm_tma_kernelI13__nv_bfloat16Lb0ELb1EEEvNS0_4ArgsE14CUtensorMap_stS5_S5_S5_' for 'sm_120a'
+ptxas info    : Function properties for _ZN5nvfp44gemm3tma21nvfp4_gemm_tma_kernelI13__nv_bfloat16Lb0ELb1EEEvNS0_4ArgsE14CUtensorMap_stS5_S5_S5_
+    24 bytes stack frame, 24 bytes spill stores, 36 bytes spill loads
+ptxas info    : Used 255 registers, used 2 barriers, 24 bytes cumulative stack size
+ptxas info    : Compile time = 864.375 ms
+ptxas info    : Compiling entry function '_ZN5nvfp44gemm3tma21nvfp4_gemm_tma_kernelIfLb0ELb1EEEvNS0_4ArgsE14CUtensorMap_stS4_S4_S4_' for 'sm_120a'
+ptxas info    : Function properties for _ZN5nvfp44gemm3tma21nvfp4_gemm_tma_kernelIfLb0ELb1EEEvNS0_4ArgsE14CUtensorMap_stS4_S4_S4_
+    24 bytes stack frame, 24 bytes spill stores, 36 bytes spill loads
+ptxas info    : Used 255 registers, used 2 barriers, 24 bytes cumulative stack size
+ptxas info    : Compile time = 838.340 ms
+ptxas info    : Compiling entry function '_ZN5nvfp44gemm3tma21nvfp4_gemm_tma_kernelIfLb1ELb1EEEvNS0_4ArgsE14CUtensorMap_stS4_S4_S4_' for 'sm_120a'
+ptxas info    : Function properties for _ZN5nvfp44gemm3tma21nvfp4_gemm_tma_kernelIfLb1ELb1EEEvNS0_4ArgsE14CUtensorMap_stS4_S4_S4_
+    24 bytes stack frame, 24 bytes spill stores, 36 bytes spill loads
+ptxas info    : Used 255 registers, used 2 barriers, 24 bytes cumulative stack size
+ptxas info    : Compile time = 777.130 ms
+[2/7] c++ -MMD -MF /workspace/nvfp4-train-sm120/build/temp.linux-x86_64-3.10/csrc/bindings.o.d -Wno-unused-result -Wsign-compare -DNDEBUG -g -fwrapv -O2 -Wall -g -fstack-protector-strong -Wformat -Werror=format-security -g -fwrapv -O2 -g -fstack-protector-strong -Wformat -Werror=format-security -Wdate-time -D_FORTIFY_SOURCE=2 -fPIC -I/workspace/venv/lib/python3.10/site-packages/torch/include -I/workspace/venv/lib/python3.10/site-packages/torch/include/torch/csrc/api/include -I/usr/local/cuda/include -I/workspace/venv/include -I/usr/include/python3.10 -c -c /workspace/nvfp4-train-sm120/csrc/bindings.cpp -o /workspace/nvfp4-train-sm120/build/temp.linux-x86_64-3.10/csrc/bindings.o -O3 -std=c++20 -DTORCH_API_INCLUDE_EXTENSION_H -DTORCH_EXTENSION_NAME=_C
+[3/7] /usr/local/cuda/bin/nvcc -MD -MF /workspace/nvfp4-train-sm120/build/temp.linux-x86_64-3.10/csrc/quantize.o.d -I/workspace/venv/lib/python3.10/site-packages/torch/include -I/workspace/venv/lib/python3.10/site-packages/torch/include/torch/csrc/api/include -I/usr/local/cuda/include -I/workspace/venv/include -I/usr/include/python3.10 -c -c /workspace/nvfp4-train-sm120/csrc/quantize.cu -o /workspace/nvfp4-train-sm120/build/temp.linux-x86_64-3.10/csrc/quantize.o -D__CUDA_NO_HALF_OPERATORS__ -D__CUDA_NO_HALF_CONVERSIONS__ -D__CUDA_NO_BFLOAT16_CONVERSIONS__ -D__CUDA_NO_HALF2_OPERATORS__ --expt-relaxed-constexpr --compiler-options ''"'"'-fPIC'"'"'' -O3 -std=c++20 -gencode=arch=compute_120a,code=sm_120a --expt-relaxed-constexpr -lineinfo -Xptxas=-v,-warn-spills -DTORCH_API_INCLUDE_EXTENSION_H -DTORCH_EXTENSION_NAME=_C
+/workspace/venv/lib/python3.10/site-packages/torch/include/torch/csrc/api/include/torch/nn/modules/container/any_module_holder.h(93): warning #3189-D: "module" is parsed as an identifier rather than a keyword because the tokens that follow it do not match those of a preprocessor directive
+            module->_forward_populate_default_args(std::move(arguments)));
+            ^
+
+Remark: The warnings can be suppressed with "-diag-suppress <warning-number>"
+
+/workspace/venv/lib/python3.10/site-packages/torch/include/torch/csrc/api/include/torch/python.h(93): warning #3189-D: "module" is parsed as an identifier rather than a keyword because the tokens that follow it do not match those of a preprocessor directive
+    module.attr(name) = wrapper_class;
+    ^
+
+/workspace/venv/lib/python3.10/site-packages/torch/include/torch/csrc/api/include/torch/python.h(155): warning #3189-D: "module" is parsed as an identifier rather than a keyword because the tokens that follow it do not match those of a preprocessor directive
+                module.to(
+                ^
+
+/workspace/venv/lib/python3.10/site-packages/torch/include/torch/csrc/api/include/torch/python.h(159): warning #3189-D: "module" is parsed as an identifier rather than a keyword because the tokens that follow it do not match those of a preprocessor directive
+                module.to(detail::py_object_to_dtype(object), non_blocking);
+                ^
+
+/workspace/venv/lib/python3.10/site-packages/torch/include/torch/csrc/api/include/torch/python.h(170): warning #3189-D: "module" is parsed as an identifier rather than a keyword because the tokens that follow it do not match those of a preprocessor directive
+                  module.to(detail::py_object_to_dtype(dtype), non_blocking);
+                  ^
+
+/workspace/venv/lib/python3.10/site-packages/torch/include/torch/csrc/api/include/torch/python.h(172): warning #3189-D: "module" is parsed as an identifier rather than a keyword because the tokens that follow it do not match those of a preprocessor directive
+                  module.to(detail::py_object_to_device(device), non_blocking);
+                  ^
+
+/workspace/venv/lib/python3.10/site-packages/torch/include/torch/csrc/api/include/torch/python.h(174): warning #3189-D: "module" is parsed as an identifier rather than a keyword because the tokens that follow it do not match those of a preprocessor directive
+                  module.to(
+                  ^
+
+/workspace/venv/lib/python3.10/site-packages/torch/include/torch/csrc/api/include/torch/nn/modules/container/any_module_holder.h(93): warning #3189-D: "module" is parsed as an identifier rather than a keyword because the tokens that follow it do not match those of a preprocessor directive
+            module->_forward_populate_default_args(std::move(arguments)));
+            ^
+
+Remark: The warnings can be suppressed with "-diag-suppress <warning-number>"
+
+/workspace/venv/lib/python3.10/site-packages/torch/include/torch/csrc/api/include/torch/python.h(93): warning #3189-D: "module" is parsed as an identifier rather than a keyword because the tokens that follow it do not match those of a preprocessor directive
+    module.attr(name) = wrapper_class;
+    ^
+
+/workspace/venv/lib/python3.10/site-packages/torch/include/torch/csrc/api/include/torch/python.h(155): warning #3189-D: "module" is parsed as an identifier rather than a keyword because the tokens that follow it do not match those of a preprocessor directive
+                module.to(
+                ^
+
+/workspace/venv/lib/python3.10/site-packages/torch/include/torch/csrc/api/include/torch/python.h(159): warning #3189-D: "module" is parsed as an identifier rather than a keyword because the tokens that follow it do not match those of a preprocessor directive
+                module.to(detail::py_object_to_dtype(object), non_blocking);
+                ^
+
+/workspace/venv/lib/python3.10/site-packages/torch/include/torch/csrc/api/include/torch/python.h(170): warning #3189-D: "module" is parsed as an identifier rather than a keyword because the tokens that follow it do not match those of a preprocessor directive
+                  module.to(detail::py_object_to_dtype(dtype), non_blocking);
+                  ^
+
+/workspace/venv/lib/python3.10/site-packages/torch/include/torch/csrc/api/include/torch/python.h(172): warning #3189-D: "module" is parsed as an identifier rather than a keyword because the tokens that follow it do not match those of a preprocessor directive
+                  module.to(detail::py_object_to_device(device), non_blocking);
+                  ^
+
+/workspace/venv/lib/python3.10/site-packages/torch/include/torch/csrc/api/include/torch/python.h(174): warning #3189-D: "module" is parsed as an identifier rather than a keyword because the tokens that follow it do not match those of a preprocessor directive
+                  module.to(
+                  ^
+
+ptxas info    : 11 bytes gmem
+ptxas info    : Compiling entry function '_ZN5nvfp415quantize_kernelIfLb0ELb0EEEvPKT_NS_7QParamsEPKjPhS7_Pfm' for 'sm_120a'
+ptxas info    : Function properties for _ZN5nvfp415quantize_kernelIfLb0ELb0EEEvPKT_NS_7QParamsEPKjPhS7_Pfm
+    0 bytes stack frame, 0 bytes spill stores, 0 bytes spill loads
+ptxas info    : Used 40 registers, used 0 barriers
+ptxas info    : Compile time = 47.920 ms
+ptxas info    : Compiling entry function '_ZN5nvfp415quantize_kernelIfLb0ELb1EEEvPKT_NS_7QParamsEPKjPhS7_Pfm' for 'sm_120a'
+ptxas info    : Function properties for _ZN5nvfp415quantize_kernelIfLb0ELb1EEEvPKT_NS_7QParamsEPKjPhS7_Pfm
+    0 bytes stack frame, 0 bytes spill stores, 0 bytes spill loads
+ptxas info    : Used 40 registers, used 0 barriers
+ptxas info    : Compile time = 29.525 ms
+ptxas info    : Compiling entry function '_ZN5nvfp415quantize_kernelIfLb1ELb0EEEvPKT_NS_7QParamsEPKjPhS7_Pfm' for 'sm_120a'
+ptxas info    : Function properties for _ZN5nvfp415quantize_kernelIfLb1ELb0EEEvPKT_NS_7QParamsEPKjPhS7_Pfm
+    0 bytes stack frame, 0 bytes spill stores, 0 bytes spill loads
+ptxas info    : Used 40 registers, used 0 barriers
+ptxas info    : Compile time = 45.548 ms
+ptxas info    : Compiling entry function '_ZN5nvfp415quantize_kernelIfLb1ELb1EEEvPKT_NS_7QParamsEPKjPhS7_Pfm' for 'sm_120a'
+ptxas info    : Function properties for _ZN5nvfp415quantize_kernelIfLb1ELb1EEEvPKT_NS_7QParamsEPKjPhS7_Pfm
+    0 bytes stack frame, 0 bytes spill stores, 0 bytes spill loads
+ptxas info    : Used 40 registers, used 0 barriers
+ptxas info    : Compile time = 31.828 ms
+ptxas info    : Compiling entry function '_ZN5nvfp411amax_kernelIfEEvPKT_NS_7QParamsEPj' for 'sm_120a'
+ptxas info    : Function properties for _ZN5nvfp411amax_kernelIfEEvPKT_NS_7QParamsEPj
+    0 bytes stack frame, 0 bytes spill stores, 0 bytes spill loads
+ptxas info    : Used 55 registers, used 1 barriers, 128 bytes smem
+ptxas info    : Compile time = 20.102 ms
+ptxas info    : Compiling entry function '_ZN5nvfp415quantize_kernelI13__nv_bfloat16Lb0ELb0EEEvPKT_NS_7QParamsEPKjPhS8_Pfm' for 'sm_120a'
+ptxas info    : Function properties for _ZN5nvfp415quantize_kernelI13__nv_bfloat16Lb0ELb0EEEvPKT_NS_7QParamsEPKjPhS8_Pfm
+    0 bytes stack frame, 0 bytes spill stores, 0 bytes spill loads
+ptxas info    : Used 40 registers, used 0 barriers
+ptxas info    : Compile time = 44.534 ms
+ptxas info    : Compiling entry function '_ZN5nvfp415quantize_kernelI13__nv_bfloat16Lb0ELb1EEEvPKT_NS_7QParamsEPKjPhS8_Pfm' for 'sm_120a'
+ptxas info    : Function properties for _ZN5nvfp415quantize_kernelI13__nv_bfloat16Lb0ELb1EEEvPKT_NS_7QParamsEPKjPhS8_Pfm
+    0 bytes stack frame, 0 bytes spill stores, 0 bytes spill loads
+ptxas info    : Used 40 registers, used 0 barriers
+ptxas info    : Compile time = 31.274 ms
+ptxas info    : Compiling entry function '_ZN5nvfp415quantize_kernelI13__nv_bfloat16Lb1ELb0EEEvPKT_NS_7QParamsEPKjPhS8_Pfm' for 'sm_120a'
+ptxas info    : Function properties for _ZN5nvfp415quantize_kernelI13__nv_bfloat16Lb1ELb0EEEvPKT_NS_7QParamsEPKjPhS8_Pfm
+    0 bytes stack frame, 0 bytes spill stores, 0 bytes spill loads
+ptxas info    : Used 40 registers, used 0 barriers
+ptxas info    : Compile time = 45.499 ms
+ptxas info    : Compiling entry function '_ZN5nvfp415quantize_kernelI13__nv_bfloat16Lb1ELb1EEEvPKT_NS_7QParamsEPKjPhS8_Pfm' for 'sm_120a'
+ptxas info    : Function properties for _ZN5nvfp415quantize_kernelI13__nv_bfloat16Lb1ELb1EEEvPKT_NS_7QParamsEPKjPhS8_Pfm
+    0 bytes stack frame, 0 bytes spill stores, 0 bytes spill loads
+ptxas info    : Used 40 registers, used 0 barriers
+ptxas info    : Compile time = 30.918 ms
+ptxas info    : Compiling entry function '_ZN5nvfp411amax_kernelI13__nv_bfloat16EEvPKT_NS_7QParamsEPj' for 'sm_120a'
+ptxas info    : Function properties for _ZN5nvfp411amax_kernelI13__nv_bfloat16EEvPKT_NS_7QParamsEPj
+    0 bytes stack frame, 0 bytes spill stores, 0 bytes spill loads
+ptxas info    : Used 56 registers, used 1 barriers, 128 bytes smem
+ptxas info    : Compile time = 20.447 ms
+ptxas info    : Compiling entry function '_ZN5nvfp417dequantize_kernelI13__nv_bfloat16EEvPKhlS3_lPKflPT_ll' for 'sm_120a'
+ptxas info    : Function properties for _ZN5nvfp417dequantize_kernelI13__nv_bfloat16EEvPKhlS3_lPKflPT_ll
+    32 bytes stack frame, 0 bytes spill stores, 0 bytes spill loads
+ptxas info    : Used 38 registers, used 0 barriers, 32 bytes cumulative stack size
+ptxas info    : Compile time = 12.443 ms
+ptxas info    : Compiling entry function '_ZN5nvfp417dequantize_kernelIfEEvPKhlS2_lPKflPT_ll' for 'sm_120a'
+ptxas info    : Function properties for _ZN5nvfp417dequantize_kernelIfEEvPKhlS2_lPKflPT_ll
+    32 bytes stack frame, 0 bytes spill stores, 0 bytes spill loads
+ptxas info    : Used 40 registers, used 0 barriers, 32 bytes cumulative stack size
+ptxas info    : Compile time = 11.753 ms
+[4/7] /usr/local/cuda/bin/nvcc -MD -MF /workspace/nvfp4-train-sm120/build/temp.linux-x86_64-3.10/csrc/gemm.o.d -I/workspace/venv/lib/python3.10/site-packages/torch/include -I/workspace/venv/lib/python3.10/site-packages/torch/include/torch/csrc/api/include -I/usr/local/cuda/include -I/workspace/venv/include -I/usr/include/python3.10 -c -c /workspace/nvfp4-train-sm120/csrc/gemm.cu -o /workspace/nvfp4-train-sm120/build/temp.linux-x86_64-3.10/csrc/gemm.o -D__CUDA_NO_HALF_OPERATORS__ -D__CUDA_NO_HALF_CONVERSIONS__ -D__CUDA_NO_BFLOAT16_CONVERSIONS__ -D__CUDA_NO_HALF2_OPERATORS__ --expt-relaxed-constexpr --compiler-options ''"'"'-fPIC'"'"'' -O3 -std=c++20 -gencode=arch=compute_120a,code=sm_120a --expt-relaxed-constexpr -lineinfo -Xptxas=-v,-warn-spills -DTORCH_API_INCLUDE_EXTENSION_H -DTORCH_EXTENSION_NAME=_C
+/workspace/venv/lib/python3.10/site-packages/torch/include/torch/csrc/api/include/torch/nn/modules/container/any_module_holder.h(93): warning #3189-D: "module" is parsed as an identifier rather than a keyword because the tokens that follow it do not match those of a preprocessor directive
+            module->_forward_populate_default_args(std::move(arguments)));
+            ^
+
+Remark: The warnings can be suppressed with "-diag-suppress <warning-number>"
+
+/workspace/venv/lib/python3.10/site-packages/torch/include/torch/csrc/api/include/torch/python.h(93): warning #3189-D: "module" is parsed as an identifier rather than a keyword because the tokens that follow it do not match those of a preprocessor directive
+    module.attr(name) = wrapper_class;
+    ^
+
+/workspace/venv/lib/python3.10/site-packages/torch/include/torch/csrc/api/include/torch/python.h(155): warning #3189-D: "module" is parsed as an identifier rather than a keyword because the tokens that follow it do not match those of a preprocessor directive
+                module.to(
+                ^
+
+/workspace/venv/lib/python3.10/site-packages/torch/include/torch/csrc/api/include/torch/python.h(159): warning #3189-D: "module" is parsed as an identifier rather than a keyword because the tokens that follow it do not match those of a preprocessor directive
+                module.to(detail::py_object_to_dtype(object), non_blocking);
+                ^
+
+/workspace/venv/lib/python3.10/site-packages/torch/include/torch/csrc/api/include/torch/python.h(170): warning #3189-D: "module" is parsed as an identifier rather than a keyword because the tokens that follow it do not match those of a preprocessor directive
+                  module.to(detail::py_object_to_dtype(dtype), non_blocking);
+                  ^
+
+/workspace/venv/lib/python3.10/site-packages/torch/include/torch/csrc/api/include/torch/python.h(172): warning #3189-D: "module" is parsed as an identifier rather than a keyword because the tokens that follow it do not match those of a preprocessor directive
+                  module.to(detail::py_object_to_device(device), non_blocking);
+                  ^
+
+/workspace/venv/lib/python3.10/site-packages/torch/include/torch/csrc/api/include/torch/python.h(174): warning #3189-D: "module" is parsed as an identifier rather than a keyword because the tokens that follow it do not match those of a preprocessor directive
+                  module.to(
+                  ^
+
+/workspace/venv/lib/python3.10/site-packages/torch/include/torch/csrc/api/include/torch/nn/modules/container/any_module_holder.h(93): warning #3189-D: "module" is parsed as an identifier rather than a keyword because the tokens that follow it do not match those of a preprocessor directive
+            module->_forward_populate_default_args(std::move(arguments)));
+            ^
+
+Remark: The warnings can be suppressed with "-diag-suppress <warning-number>"
+
+/workspace/venv/lib/python3.10/site-packages/torch/include/torch/csrc/api/include/torch/python.h(93): warning #3189-D: "module" is parsed as an identifier rather than a keyword because the tokens that follow it do not match those of a preprocessor directive
+    module.attr(name) = wrapper_class;
+    ^
+
+/workspace/venv/lib/python3.10/site-packages/torch/include/torch/csrc/api/include/torch/python.h(155): warning #3189-D: "module" is parsed as an identifier rather than a keyword because the tokens that follow it do not match those of a preprocessor directive
+                module.to(
+                ^
+
+/workspace/venv/lib/python3.10/site-packages/torch/include/torch/csrc/api/include/torch/python.h(159): warning #3189-D: "module" is parsed as an identifier rather than a keyword because the tokens that follow it do not match those of a preprocessor directive
+                module.to(detail::py_object_to_dtype(object), non_blocking);
+                ^
+
+/workspace/venv/lib/python3.10/site-packages/torch/include/torch/csrc/api/include/torch/python.h(170): warning #3189-D: "module" is parsed as an identifier rather than a keyword because the tokens that follow it do not match those of a preprocessor directive
+                  module.to(detail::py_object_to_dtype(dtype), non_blocking);
+                  ^
+
+/workspace/venv/lib/python3.10/site-packages/torch/include/torch/csrc/api/include/torch/python.h(172): warning #3189-D: "module" is parsed as an identifier rather than a keyword because the tokens that follow it do not match those of a preprocessor directive
+                  module.to(detail::py_object_to_device(device), non_blocking);
+                  ^
+
+/workspace/venv/lib/python3.10/site-packages/torch/include/torch/csrc/api/include/torch/python.h(174): warning #3189-D: "module" is parsed as an identifier rather than a keyword because the tokens that follow it do not match those of a preprocessor directive
+                  module.to(
+                  ^
+
+ptxas info    : 11 bytes gmem
+ptxas info    : Compiling entry function '_ZN5nvfp44gemm6legacy17nvfp4_gemm_kernelI13__nv_bfloat16Lb0EEEvNS0_4ArgsE' for 'sm_120a'
+ptxas info    : Function properties for _ZN5nvfp44gemm6legacy17nvfp4_gemm_kernelI13__nv_bfloat16Lb0EEEvNS0_4ArgsE
+    0 bytes stack frame, 0 bytes spill stores, 0 bytes spill loads
+ptxas info    : Used 237 registers, used 2 barriers
+ptxas info    : Compile time = 267.635 ms
+ptxas info    : Compiling entry function '_ZN5nvfp44gemm6legacy17nvfp4_gemm_kernelIfLb0EEEvNS0_4ArgsE' for 'sm_120a'
+ptxas info    : Function properties for _ZN5nvfp44gemm6legacy17nvfp4_gemm_kernelIfLb0EEEvNS0_4ArgsE
+    0 bytes stack frame, 0 bytes spill stores, 0 bytes spill loads
+ptxas info    : Used 237 registers, used 2 barriers
+ptxas info    : Compile time = 254.045 ms
+ptxas info    : Compiling entry function '_ZN5nvfp44gemm6legacy17nvfp4_gemm_kernelIfLb1EEEvNS0_4ArgsE' for 'sm_120a'
+ptxas info    : Function properties for _ZN5nvfp44gemm6legacy17nvfp4_gemm_kernelIfLb1EEEvNS0_4ArgsE
+    0 bytes stack frame, 0 bytes spill stores, 0 bytes spill loads
+ptxas info    : Used 239 registers, used 2 barriers
+ptxas info    : Compile time = 212.430 ms
+[5/7] /usr/local/cuda/bin/nvcc -MD -MF /workspace/nvfp4-train-sm120/build/temp.linux-x86_64-3.10/csrc/norm.o.d -I/workspace/venv/lib/python3.10/site-packages/torch/include -I/workspace/venv/lib/python3.10/site-packages/torch/include/torch/csrc/api/include -I/usr/local/cuda/include -I/workspace/venv/include -I/usr/include/python3.10 -c -c /workspace/nvfp4-train-sm120/csrc/norm.cu -o /workspace/nvfp4-train-sm120/build/temp.linux-x86_64-3.10/csrc/norm.o -D__CUDA_NO_HALF_OPERATORS__ -D__CUDA_NO_HALF_CONVERSIONS__ -D__CUDA_NO_BFLOAT16_CONVERSIONS__ -D__CUDA_NO_HALF2_OPERATORS__ --expt-relaxed-constexpr --compiler-options ''"'"'-fPIC'"'"'' -O3 -std=c++20 -gencode=arch=compute_120a,code=sm_120a --expt-relaxed-constexpr -lineinfo -Xptxas=-v,-warn-spills -DTORCH_API_INCLUDE_EXTENSION_H -DTORCH_EXTENSION_NAME=_C
+/workspace/venv/lib/python3.10/site-packages/torch/include/torch/csrc/api/include/torch/nn/modules/container/any_module_holder.h(93): warning #3189-D: "module" is parsed as an identifier rather than a keyword because the tokens that follow it do not match those of a preprocessor directive
+            module->_forward_populate_default_args(std::move(arguments)));
+            ^
+
+Remark: The warnings can be suppressed with "-diag-suppress <warning-number>"
+
+/workspace/venv/lib/python3.10/site-packages/torch/include/torch/csrc/api/include/torch/python.h(93): warning #3189-D: "module" is parsed as an identifier rather than a keyword because the tokens that follow it do not match those of a preprocessor directive
+    module.attr(name) = wrapper_class;
+    ^
+
+/workspace/venv/lib/python3.10/site-packages/torch/include/torch/csrc/api/include/torch/python.h(155): warning #3189-D: "module" is parsed as an identifier rather than a keyword because the tokens that follow it do not match those of a preprocessor directive
+                module.to(
+                ^
+
+/workspace/venv/lib/python3.10/site-packages/torch/include/torch/csrc/api/include/torch/python.h(159): warning #3189-D: "module" is parsed as an identifier rather than a keyword because the tokens that follow it do not match those of a preprocessor directive
+                module.to(detail::py_object_to_dtype(object), non_blocking);
+                ^
+
+/workspace/venv/lib/python3.10/site-packages/torch/include/torch/csrc/api/include/torch/python.h(170): warning #3189-D: "module" is parsed as an identifier rather than a keyword because the tokens that follow it do not match those of a preprocessor directive
+                  module.to(detail::py_object_to_dtype(dtype), non_blocking);
+                  ^
+
+/workspace/venv/lib/python3.10/site-packages/torch/include/torch/csrc/api/include/torch/python.h(172): warning #3189-D: "module" is parsed as an identifier rather than a keyword because the tokens that follow it do not match those of a preprocessor directive
+                  module.to(detail::py_object_to_device(device), non_blocking);
+                  ^
+
+/workspace/venv/lib/python3.10/site-packages/torch/include/torch/csrc/api/include/torch/python.h(174): warning #3189-D: "module" is parsed as an identifier rather than a keyword because the tokens that follow it do not match those of a preprocessor directive
+                  module.to(
+                  ^
+
+/workspace/venv/lib/python3.10/site-packages/torch/include/torch/csrc/api/include/torch/nn/modules/container/any_module_holder.h(93): warning #3189-D: "module" is parsed as an identifier rather than a keyword because the tokens that follow it do not match those of a preprocessor directive
+            module->_forward_populate_default_args(std::move(arguments)));
+            ^
+
+Remark: The warnings can be suppressed with "-diag-suppress <warning-number>"
+
+/workspace/venv/lib/python3.10/site-packages/torch/include/torch/csrc/api/include/torch/python.h(93): warning #3189-D: "module" is parsed as an identifier rather than a keyword because the tokens that follow it do not match those of a preprocessor directive
+    module.attr(name) = wrapper_class;
+    ^
+
+/workspace/venv/lib/python3.10/site-packages/torch/include/torch/csrc/api/include/torch/python.h(155): warning #3189-D: "module" is parsed as an identifier rather than a keyword because the tokens that follow it do not match those of a preprocessor directive
+                module.to(
+                ^
+
+/workspace/venv/lib/python3.10/site-packages/torch/include/torch/csrc/api/include/torch/python.h(159): warning #3189-D: "module" is parsed as an identifier rather than a keyword because the tokens that follow it do not match those of a preprocessor directive
+                module.to(detail::py_object_to_dtype(object), non_blocking);
+                ^
+
+/workspace/venv/lib/python3.10/site-packages/torch/include/torch/csrc/api/include/torch/python.h(170): warning #3189-D: "module" is parsed as an identifier rather than a keyword because the tokens that follow it do not match those of a preprocessor directive
+                  module.to(detail::py_object_to_dtype(dtype), non_blocking);
+                  ^
+
+/workspace/venv/lib/python3.10/site-packages/torch/include/torch/csrc/api/include/torch/python.h(172): warning #3189-D: "module" is parsed as an identifier rather than a keyword because the tokens that follow it do not match those of a preprocessor directive
+                  module.to(detail::py_object_to_device(device), non_blocking);
+                  ^
+
+/workspace/venv/lib/python3.10/site-packages/torch/include/torch/csrc/api/include/torch/python.h(174): warning #3189-D: "module" is parsed as an identifier rather than a keyword because the tokens that follow it do not match those of a preprocessor directive
+                  module.to(
+                  ^
+
+ptxas info    : 11 bytes gmem
+ptxas info    : Compiling entry function '_ZN5nvfp44norm18norm_bwd_dw_kernelIfLb0EEEvPKfPKT_S3_S3_iiPfS7_' for 'sm_120a'
+ptxas info    : Function properties for _ZN5nvfp44norm18norm_bwd_dw_kernelIfLb0EEEvPKfPKT_S3_S3_iiPfS7_
+    0 bytes stack frame, 0 bytes spill stores, 0 bytes spill loads
+ptxas info    : Used 48 registers, used 0 barriers
+ptxas info    : Compile time = 8.407 ms
+ptxas info    : Compiling entry function '_ZN5nvfp44norm18norm_bwd_dx_kernelIfLb0EEEvPKfPKT_S3_S3_S3_S6_PS4_ii' for 'sm_120a'
+ptxas info    : Function properties for _ZN5nvfp44norm18norm_bwd_dx_kernelIfLb0EEEvPKfPKT_S3_S3_S3_S6_PS4_ii
+    0 bytes stack frame, 0 bytes spill stores, 0 bytes spill loads
+ptxas info    : Used 46 registers, used 0 barriers
+ptxas info    : Compile time = 16.542 ms
+ptxas info    : Compiling entry function '_ZN5nvfp44norm19norm_bwd_row_kernelIfLb0ELi4EEEvPKfPKT_S3_S3_S3_S6_PS4_PfS8_ii' for 'sm_120a'
+ptxas info    : Function properties for _ZN5nvfp44norm19norm_bwd_row_kernelIfLb0ELi4EEEvPKfPKT_S3_S3_S3_S6_PS4_PfS8_ii
+    0 bytes stack frame, 0 bytes spill stores, 0 bytes spill loads
+ptxas info    : Used 164 registers, used 1 barriers, 72 bytes smem
+ptxas info    : Compile time = 89.558 ms
+ptxas info    : Compiling entry function '_ZN5nvfp44norm19norm_bwd_row_kernelIfLb0ELi2EEEvPKfPKT_S3_S3_S3_S6_PS4_PfS8_ii' for 'sm_120a'
+ptxas info    : Function properties for _ZN5nvfp44norm19norm_bwd_row_kernelIfLb0ELi2EEEvPKfPKT_S3_S3_S3_S6_PS4_PfS8_ii
+    0 bytes stack frame, 0 bytes spill stores, 0 bytes spill loads
+ptxas info    : Used 117 registers, used 1 barriers, 72 bytes smem
+ptxas info    : Compile time = 43.433 ms
+ptxas info    : Compiling entry function '_ZN5nvfp44norm19norm_bwd_row_kernelIfLb0ELi1EEEvPKfPKT_S3_S3_S3_S6_PS4_PfS8_ii' for 'sm_120a'
+ptxas info    : Function properties for _ZN5nvfp44norm19norm_bwd_row_kernelIfLb0ELi1EEEvPKfPKT_S3_S3_S3_S6_PS4_PfS8_ii
+    0 bytes stack frame, 0 bytes spill stores, 0 bytes spill loads
+ptxas info    : Used 64 registers, used 1 barriers, 72 bytes smem
+ptxas info    : Compile time = 17.026 ms
+ptxas info    : Compiling entry function '_ZN5nvfp44norm18norm_bwd_dw_kernelIfLb1EEEvPKfPKT_S3_S3_iiPfS7_' for 'sm_120a'
+ptxas info    : Function properties for _ZN5nvfp44norm18norm_bwd_dw_kernelIfLb1EEEvPKfPKT_S3_S3_iiPfS7_
+    0 bytes stack frame, 0 bytes spill stores, 0 bytes spill loads
+ptxas info    : Used 40 registers, used 0 barriers
+ptxas info    : Compile time = 6.009 ms
+ptxas info    : Compiling entry function '_ZN5nvfp44norm18norm_bwd_dx_kernelIfLb1EEEvPKfPKT_S3_S3_S3_S6_PS4_ii' for 'sm_120a'
+ptxas info    : Function properties for _ZN5nvfp44norm18norm_bwd_dx_kernelIfLb1EEEvPKfPKT_S3_S3_S3_S6_PS4_ii
+    0 bytes stack frame, 0 bytes spill stores, 0 bytes spill loads
+ptxas info    : Used 48 registers, used 0 barriers
+ptxas info    : Compile time = 19.465 ms
+ptxas info    : Compiling entry function '_ZN5nvfp44norm19norm_bwd_row_kernelIfLb1ELi4EEEvPKfPKT_S3_S3_S3_S6_PS4_PfS8_ii' for 'sm_120a'
+ptxas info    : Function properties for _ZN5nvfp44norm19norm_bwd_row_kernelIfLb1ELi4EEEvPKfPKT_S3_S3_S3_S6_PS4_PfS8_ii
+    0 bytes stack frame, 0 bytes spill stores, 0 bytes spill loads
+ptxas info    : Used 165 registers, used 1 barriers, 68 bytes smem
+ptxas info    : Compile time = 81.447 ms
+ptxas info    : Compiling entry function '_ZN5nvfp44norm19norm_bwd_row_kernelIfLb1ELi2EEEvPKfPKT_S3_S3_S3_S6_PS4_PfS8_ii' for 'sm_120a'
+ptxas info    : Function properties for _ZN5nvfp44norm19norm_bwd_row_kernelIfLb1ELi2EEEvPKfPKT_S3_S3_S3_S6_PS4_PfS8_ii
+    0 bytes stack frame, 0 bytes spill stores, 0 bytes spill loads
+ptxas info    : Used 113 registers, used 1 barriers, 68 bytes smem
+ptxas info    : Compile time = 37.071 ms
+ptxas info    : Compiling entry function '_ZN5nvfp44norm19norm_bwd_row_kernelIfLb1ELi1EEEvPKfPKT_S3_S3_S3_S6_PS4_PfS8_ii' for 'sm_120a'
+ptxas info    : Function properties for _ZN5nvfp44norm19norm_bwd_row_kernelIfLb1ELi1EEEvPKfPKT_S3_S3_S3_S6_PS4_PfS8_ii
+    0 bytes stack frame, 0 bytes spill stores, 0 bytes spill loads
+ptxas info    : Used 61 registers, used 1 barriers, 68 bytes smem
+ptxas info    : Compile time = 15.695 ms
+ptxas info    : Compiling entry function '_ZN5nvfp44norm18norm_bwd_dw_kernelI13__nv_bfloat16Lb0EEEvPKfPKT_S4_S4_iiPfS8_' for 'sm_120a'
+ptxas info    : Function properties for _ZN5nvfp44norm18norm_bwd_dw_kernelI13__nv_bfloat16Lb0EEEvPKfPKT_S4_S4_iiPfS8_
+    0 bytes stack frame, 0 bytes spill stores, 0 bytes spill loads
+ptxas info    : Used 40 registers, used 0 barriers
+ptxas info    : Compile time = 7.462 ms
+ptxas info    : Compiling entry function '_ZN5nvfp44norm18norm_bwd_dx_kernelI13__nv_bfloat16Lb0EEEvPKfPKT_S4_S4_S4_S7_PS5_ii' for 'sm_120a'
+ptxas info    : Function properties for _ZN5nvfp44norm18norm_bwd_dx_kernelI13__nv_bfloat16Lb0EEEvPKfPKT_S4_S4_S4_S7_PS5_ii
+    0 bytes stack frame, 0 bytes spill stores, 0 bytes spill loads
+ptxas info    : Used 40 registers, used 0 barriers
+ptxas info    : Compile time = 17.059 ms
+ptxas info    : Compiling entry function '_ZN5nvfp44norm19norm_bwd_row_kernelI13__nv_bfloat16Lb0ELi4EEEvPKfPKT_S4_S4_S4_S7_PS5_PfS9_ii' for 'sm_120a'
+ptxas info    : Function properties for _ZN5nvfp44norm19norm_bwd_row_kernelI13__nv_bfloat16Lb0ELi4EEEvPKfPKT_S4_S4_S4_S7_PS5_PfS9_ii
+    0 bytes stack frame, 0 bytes spill stores, 0 bytes spill loads
+ptxas info    : Used 171 registers, used 1 barriers, 72 bytes smem
+ptxas info    : Compile time = 98.661 ms
+ptxas info    : Compiling entry function '_ZN5nvfp44norm19norm_bwd_row_kernelI13__nv_bfloat16Lb0ELi2EEEvPKfPKT_S4_S4_S4_S7_PS5_PfS9_ii' for 'sm_120a'
+ptxas info    : Function properties for _ZN5nvfp44norm19norm_bwd_row_kernelI13__nv_bfloat16Lb0ELi2EEEvPKfPKT_S4_S4_S4_S7_PS5_PfS9_ii
+    0 bytes stack frame, 0 bytes spill stores, 0 bytes spill loads
+ptxas info    : Used 110 registers, used 1 barriers, 72 bytes smem
+ptxas info    : Compile time = 47.064 ms
+ptxas info    : Compiling entry function '_ZN5nvfp44norm19norm_bwd_row_kernelI13__nv_bfloat16Lb0ELi1EEEvPKfPKT_S4_S4_S4_S7_PS5_PfS9_ii' for 'sm_120a'
+ptxas info    : Function properties for _ZN5nvfp44norm19norm_bwd_row_kernelI13__nv_bfloat16Lb0ELi1EEEvPKfPKT_S4_S4_S4_S7_PS5_PfS9_ii
+    0 bytes stack frame, 0 bytes spill stores, 0 bytes spill loads
+ptxas info    : Used 64 registers, used 1 barriers, 72 bytes smem
+ptxas info    : Compile time = 17.887 ms
+ptxas info    : Compiling entry function '_ZN5nvfp44norm18norm_bwd_dw_kernelI13__nv_bfloat16Lb1EEEvPKfPKT_S4_S4_iiPfS8_' for 'sm_120a'
+ptxas info    : Function properties for _ZN5nvfp44norm18norm_bwd_dw_kernelI13__nv_bfloat16Lb1EEEvPKfPKT_S4_S4_iiPfS8_
+    0 bytes stack frame, 0 bytes spill stores, 0 bytes spill loads
+ptxas info    : Used 40 registers, used 0 barriers
+ptxas info    : Compile time = 6.734 ms
+ptxas info    : Compiling entry function '_ZN5nvfp44norm18norm_bwd_dx_kernelI13__nv_bfloat16Lb1EEEvPKfPKT_S4_S4_S4_S7_PS5_ii' for 'sm_120a'
+ptxas info    : Function properties for _ZN5nvfp44norm18norm_bwd_dx_kernelI13__nv_bfloat16Lb1EEEvPKfPKT_S4_S4_S4_S7_PS5_ii
+    0 bytes stack frame, 0 bytes spill stores, 0 bytes spill loads
+ptxas info    : Used 40 registers, used 0 barriers
+ptxas info    : Compile time = 14.899 ms
+ptxas info    : Compiling entry function '_ZN5nvfp44norm19norm_bwd_row_kernelI13__nv_bfloat16Lb1ELi4EEEvPKfPKT_S4_S4_S4_S7_PS5_PfS9_ii' for 'sm_120a'
+ptxas info    : Function properties for _ZN5nvfp44norm19norm_bwd_row_kernelI13__nv_bfloat16Lb1ELi4EEEvPKfPKT_S4_S4_S4_S7_PS5_PfS9_ii
+    0 bytes stack frame, 0 bytes spill stores, 0 bytes spill loads
+ptxas info    : Used 169 registers, used 1 barriers, 68 bytes smem
+ptxas info    : Compile time = 87.689 ms
+ptxas info    : Compiling entry function '_ZN5nvfp44norm19norm_bwd_row_kernelI13__nv_bfloat16Lb1ELi2EEEvPKfPKT_S4_S4_S4_S7_PS5_PfS9_ii' for 'sm_120a'
+ptxas info    : Function properties for _ZN5nvfp44norm19norm_bwd_row_kernelI13__nv_bfloat16Lb1ELi2EEEvPKfPKT_S4_S4_S4_S7_PS5_PfS9_ii
+    0 bytes stack frame, 0 bytes spill stores, 0 bytes spill loads
+ptxas info    : Used 107 registers, used 1 barriers, 68 bytes smem
+ptxas info    : Compile time = 40.055 ms
+ptxas info    : Compiling entry function '_ZN5nvfp44norm19norm_bwd_row_kernelI13__nv_bfloat16Lb1ELi1EEEvPKfPKT_S4_S4_S4_S7_PS5_PfS9_ii' for 'sm_120a'
+ptxas info    : Function properties for _ZN5nvfp44norm19norm_bwd_row_kernelI13__nv_bfloat16Lb1ELi1EEEvPKfPKT_S4_S4_S4_S7_PS5_PfS9_ii
+    0 bytes stack frame, 0 bytes spill stores, 0 bytes spill loads
+ptxas info    : Used 63 registers, used 1 barriers, 68 bytes smem
+ptxas info    : Compile time = 15.170 ms
+[6/7] /usr/local/cuda/bin/nvcc -MD -MF /workspace/nvfp4-train-sm120/build/temp.linux-x86_64-3.10/csrc/attention.o.d -I/workspace/venv/lib/python3.10/site-packages/torch/include -I/workspace/venv/lib/python3.10/site-packages/torch/include/torch/csrc/api/include -I/usr/local/cuda/include -I/workspace/venv/include -I/usr/include/python3.10 -c -c /workspace/nvfp4-train-sm120/csrc/attention.cu -o /workspace/nvfp4-train-sm120/build/temp.linux-x86_64-3.10/csrc/attention.o -D__CUDA_NO_HALF_OPERATORS__ -D__CUDA_NO_HALF_CONVERSIONS__ -D__CUDA_NO_BFLOAT16_CONVERSIONS__ -D__CUDA_NO_HALF2_OPERATORS__ --expt-relaxed-constexpr --compiler-options ''"'"'-fPIC'"'"'' -O3 -std=c++20 -gencode=arch=compute_120a,code=sm_120a --expt-relaxed-constexpr -lineinfo -Xptxas=-v,-warn-spills -DTORCH_API_INCLUDE_EXTENSION_H -DTORCH_EXTENSION_NAME=_C
+/workspace/venv/lib/python3.10/site-packages/torch/include/torch/csrc/api/include/torch/nn/modules/container/any_module_holder.h(93): warning #3189-D: "module" is parsed as an identifier rather than a keyword because the tokens that follow it do not match those of a preprocessor directive
+            module->_forward_populate_default_args(std::move(arguments)));
+            ^
+
+Remark: The warnings can be suppressed with "-diag-suppress <warning-number>"
+
+/workspace/venv/lib/python3.10/site-packages/torch/include/torch/csrc/api/include/torch/python.h(93): warning #3189-D: "module" is parsed as an identifier rather than a keyword because the tokens that follow it do not match those of a preprocessor directive
+    module.attr(name) = wrapper_class;
+    ^
+
+/workspace/venv/lib/python3.10/site-packages/torch/include/torch/csrc/api/include/torch/python.h(155): warning #3189-D: "module" is parsed as an identifier rather than a keyword because the tokens that follow it do not match those of a preprocessor directive
+                module.to(
+                ^
+
+/workspace/venv/lib/python3.10/site-packages/torch/include/torch/csrc/api/include/torch/python.h(159): warning #3189-D: "module" is parsed as an identifier rather than a keyword because the tokens that follow it do not match those of a preprocessor directive
+                module.to(detail::py_object_to_dtype(object), non_blocking);
+                ^
+
+/workspace/venv/lib/python3.10/site-packages/torch/include/torch/csrc/api/include/torch/python.h(170): warning #3189-D: "module" is parsed as an identifier rather than a keyword because the tokens that follow it do not match those of a preprocessor directive
+                  module.to(detail::py_object_to_dtype(dtype), non_blocking);
+                  ^
+
+/workspace/venv/lib/python3.10/site-packages/torch/include/torch/csrc/api/include/torch/python.h(172): warning #3189-D: "module" is parsed as an identifier rather than a keyword because the tokens that follow it do not match those of a preprocessor directive
+                  module.to(detail::py_object_to_device(device), non_blocking);
+                  ^
+
+/workspace/venv/lib/python3.10/site-packages/torch/include/torch/csrc/api/include/torch/python.h(174): warning #3189-D: "module" is parsed as an identifier rather than a keyword because the tokens that follow it do not match those of a preprocessor directive
+                  module.to(
+                  ^
+
+/workspace/venv/lib/python3.10/site-packages/torch/include/torch/csrc/api/include/torch/nn/modules/container/any_module_holder.h(93): warning #3189-D: "module" is parsed as an identifier rather than a keyword because the tokens that follow it do not match those of a preprocessor directive
+            module->_forward_populate_default_args(std::move(arguments)));
+            ^
+
+Remark: The warnings can be suppressed with "-diag-suppress <warning-number>"
+
+/workspace/venv/lib/python3.10/site-packages/torch/include/torch/csrc/api/include/torch/python.h(93): warning #3189-D: "module" is parsed as an identifier rather than a keyword because the tokens that follow it do not match those of a preprocessor directive
+    module.attr(name) = wrapper_class;
+    ^
+
+/workspace/venv/lib/python3.10/site-packages/torch/include/torch/csrc/api/include/torch/python.h(155): warning #3189-D: "module" is parsed as an identifier rather than a keyword because the tokens that follow it do not match those of a preprocessor directive
+                module.to(
+                ^
+
+/workspace/venv/lib/python3.10/site-packages/torch/include/torch/csrc/api/include/torch/python.h(159): warning #3189-D: "module" is parsed as an identifier rather than a keyword because the tokens that follow it do not match those of a preprocessor directive
+                module.to(detail::py_object_to_dtype(object), non_blocking);
+                ^
+
+/workspace/venv/lib/python3.10/site-packages/torch/include/torch/csrc/api/include/torch/python.h(170): warning #3189-D: "module" is parsed as an identifier rather than a keyword because the tokens that follow it do not match those of a preprocessor directive
+                  module.to(detail::py_object_to_dtype(dtype), non_blocking);
+                  ^
+
+/workspace/venv/lib/python3.10/site-packages/torch/include/torch/csrc/api/include/torch/python.h(172): warning #3189-D: "module" is parsed as an identifier rather than a keyword because the tokens that follow it do not match those of a preprocessor directive
+                  module.to(detail::py_object_to_device(device), non_blocking);
+                  ^
+
+/workspace/venv/lib/python3.10/site-packages/torch/include/torch/csrc/api/include/torch/python.h(174): warning #3189-D: "module" is parsed as an identifier rather than a keyword because the tokens that follow it do not match those of a preprocessor directive
+                  module.to(
+                  ^
+
+ptxas warning : Registers are spilled to local memory in function '_ZN5nvfp44attn14attn_dq_kernelI6__halfLi128ELi8EEEvNS0_7BwdArgsE', 92 bytes spill stores, 84 bytes spill loads
+ptxas warning : Registers are spilled to local memory in function '_ZN5nvfp44attn14attn_dq_kernelI6__halfLi64ELi8EEEvNS0_7BwdArgsE', 4 bytes spill stores, 4 bytes spill loads
+ptxas warning : Registers are spilled to local memory in function '_ZN5nvfp44attn14attn_dq_kernelI13__nv_bfloat16Li128ELi8EEEvNS0_7BwdArgsE', 92 bytes spill stores, 84 bytes spill loads
+ptxas warning : Registers are spilled to local memory in function '_ZN5nvfp44attn14attn_dq_kernelI13__nv_bfloat16Li64ELi8EEEvNS0_7BwdArgsE', 4 bytes spill stores, 4 bytes spill loads
+ptxas warning : Registers are spilled to local memory in function '_ZN5nvfp44attn15attn_fwd_kernelI6__halfLi128ELi2ELi4ELb1EEEvNS0_7FwdArgsE', 16 bytes spill stores, 16 bytes spill loads
+ptxas warning : Registers are spilled to local memory in function '_ZN5nvfp44attn15attn_fwd_kernelI13__nv_bfloat16Li128ELi2ELi4ELb1EEEvNS0_7FwdArgsE', 16 bytes spill stores, 16 bytes spill loads
+ptxas warning : Registers are spilled to local memory in function '_ZN5nvfp44attn15attn_fwd_kernelI6__halfLi128ELi2ELi4ELb0EEEvNS0_7FwdArgsE', 8 bytes spill stores, 8 bytes spill loads
+ptxas warning : Registers are spilled to local memory in function '_ZN5nvfp44attn15attn_fwd_kernelI13__nv_bfloat16Li128ELi2ELi4ELb0EEEvNS0_7FwdArgsE', 8 bytes spill stores, 8 bytes spill loads
+ptxas info    : 11 bytes gmem
+ptxas info    : Compiling entry function '_ZN5nvfp44attn16attn_dkdv_kernelI6__halfLi128ELi8EEEvNS0_7BwdArgsE' for 'sm_120a'
+ptxas info    : Function properties for _ZN5nvfp44attn16attn_dkdv_kernelI6__halfLi128ELi8EEEvNS0_7BwdArgsE
+    0 bytes stack frame, 0 bytes spill stores, 0 bytes spill loads
+ptxas info    : Used 254 registers, used 1 barriers
+ptxas info    : Compile time = 90.372 ms
+ptxas info    : Compiling entry function '_ZN5nvfp44attn14attn_dq_kernelI6__halfLi128ELi8EEEvNS0_7BwdArgsE' for 'sm_120a'
+ptxas info    : Function properties for _ZN5nvfp44attn14attn_dq_kernelI6__halfLi128ELi8EEEvNS0_7BwdArgsE
+    80 bytes stack frame, 92 bytes spill stores, 84 bytes spill loads
+ptxas info    : Used 255 registers, used 1 barriers, 80 bytes cumulative stack size
+ptxas info    : Compile time = 163.699 ms
+ptxas info    : Compiling entry function '_ZN5nvfp44attn16attn_dkdv_kernelI6__halfLi64ELi8EEEvNS0_7BwdArgsE' for 'sm_120a'
+ptxas info    : Function properties for _ZN5nvfp44attn16attn_dkdv_kernelI6__halfLi64ELi8EEEvNS0_7BwdArgsE
+    0 bytes stack frame, 0 bytes spill stores, 0 bytes spill loads
+ptxas info    : Used 194 registers, used 1 barriers
+ptxas info    : Compile time = 61.615 ms
+ptxas info    : Compiling entry function '_ZN5nvfp44attn14attn_dq_kernelI6__halfLi64ELi8EEEvNS0_7BwdArgsE' for 'sm_120a'
+ptxas info    : Function properties for _ZN5nvfp44attn14attn_dq_kernelI6__halfLi64ELi8EEEvNS0_7BwdArgsE
+    8 bytes stack frame, 4 bytes spill stores, 4 bytes spill loads
+ptxas info    : Used 255 registers, used 1 barriers, 8 bytes cumulative stack size
+ptxas info    : Compile time = 89.093 ms
+ptxas info    : Compiling entry function '_ZN5nvfp44attn16attn_dkdv_kernelI13__nv_bfloat16Li128ELi8EEEvNS0_7BwdArgsE' for 'sm_120a'
+ptxas info    : Function properties for _ZN5nvfp44attn16attn_dkdv_kernelI13__nv_bfloat16Li128ELi8EEEvNS0_7BwdArgsE
+    0 bytes stack frame, 0 bytes spill stores, 0 bytes spill loads
+ptxas info    : Used 254 registers, used 1 barriers
+ptxas info    : Compile time = 89.140 ms
+ptxas info    : Compiling entry function '_ZN5nvfp44attn14attn_dq_kernelI13__nv_bfloat16Li128ELi8EEEvNS0_7BwdArgsE' for 'sm_120a'
+ptxas info    : Function properties for _ZN5nvfp44attn14attn_dq_kernelI13__nv_bfloat16Li128ELi8EEEvNS0_7BwdArgsE
+    80 bytes stack frame, 92 bytes spill stores, 84 bytes spill loads
+ptxas info    : Used 255 registers, used 1 barriers, 80 bytes cumulative stack size
+ptxas info    : Compile time = 168.638 ms
+ptxas info    : Compiling entry function '_ZN5nvfp44attn16attn_dkdv_kernelI13__nv_bfloat16Li64ELi8EEEvNS0_7BwdArgsE' for 'sm_120a'
+ptxas info    : Function properties for _ZN5nvfp44attn16attn_dkdv_kernelI13__nv_bfloat16Li64ELi8EEEvNS0_7BwdArgsE
+    0 bytes stack frame, 0 bytes spill stores, 0 bytes spill loads
+ptxas info    : Used 194 registers, used 1 barriers
+ptxas info    : Compile time = 60.441 ms
+ptxas info    : Compiling entry function '_ZN5nvfp44attn14attn_dq_kernelI13__nv_bfloat16Li64ELi8EEEvNS0_7BwdArgsE' for 'sm_120a'
+ptxas info    : Function properties for _ZN5nvfp44attn14attn_dq_kernelI13__nv_bfloat16Li64ELi8EEEvNS0_7BwdArgsE
+    8 bytes stack frame, 4 bytes spill stores, 4 bytes spill loads
+ptxas info    : Used 255 registers, used 1 barriers, 8 bytes cumulative stack size
+ptxas info    : Compile time = 90.970 ms
+ptxas info    : Compiling entry function '_ZN5nvfp44attn15attn_fwd_kernelI6__halfLi128ELi2ELi4ELb1EEEvNS0_7FwdArgsE' for 'sm_120a'
+ptxas info    : Function properties for _ZN5nvfp44attn15attn_fwd_kernelI6__halfLi128ELi2ELi4ELb1EEEvNS0_7FwdArgsE
+    16 bytes stack frame, 16 bytes spill stores, 16 bytes spill loads
+ptxas info    : Used 255 registers, used 1 barriers, 16 bytes cumulative stack size
+ptxas info    : Compile time = 193.604 ms
+ptxas info    : Compiling entry function '_ZN5nvfp44attn15attn_fwd_kernelI6__halfLi64ELi2ELi4ELb1EEEvNS0_7FwdArgsE' for 'sm_120a'
+ptxas info    : Function properties for _ZN5nvfp44attn15attn_fwd_kernelI6__halfLi64ELi2ELi4ELb1EEEvNS0_7FwdArgsE
+    0 bytes stack frame, 0 bytes spill stores, 0 bytes spill loads
+ptxas info    : Used 227 registers, used 1 barriers
+ptxas info    : Compile time = 126.643 ms
+ptxas info    : Compiling entry function '_ZN5nvfp44attn15attn_fwd_kernelI13__nv_bfloat16Li128ELi2ELi4ELb1EEEvNS0_7FwdArgsE' for 'sm_120a'
+ptxas info    : Function properties for _ZN5nvfp44attn15attn_fwd_kernelI13__nv_bfloat16Li128ELi2ELi4ELb1EEEvNS0_7FwdArgsE
+    16 bytes stack frame, 16 bytes spill stores, 16 bytes spill loads
+ptxas info    : Used 255 registers, used 1 barriers, 16 bytes cumulative stack size
+ptxas info    : Compile time = 186.911 ms
+ptxas info    : Compiling entry function '_ZN5nvfp44attn15attn_fwd_kernelI13__nv_bfloat16Li64ELi2ELi4ELb1EEEvNS0_7FwdArgsE' for 'sm_120a'
+ptxas info    : Function properties for _ZN5nvfp44attn15attn_fwd_kernelI13__nv_bfloat16Li64ELi2ELi4ELb1EEEvNS0_7FwdArgsE
+    0 bytes stack frame, 0 bytes spill stores, 0 bytes spill loads
+ptxas info    : Used 227 registers, used 1 barriers
+ptxas info    : Compile time = 121.893 ms
+ptxas info    : Compiling entry function '_ZN5nvfp44attn15attn_fwd_kernelI6__halfLi128ELi2ELi4ELb0EEEvNS0_7FwdArgsE' for 'sm_120a'
+ptxas info    : Function properties for _ZN5nvfp44attn15attn_fwd_kernelI6__halfLi128ELi2ELi4ELb0EEEvNS0_7FwdArgsE
+    8 bytes stack frame, 8 bytes spill stores, 8 bytes spill loads
+ptxas info    : Used 255 registers, used 1 barriers, 8 bytes cumulative stack size
+ptxas info    : Compile time = 175.120 ms
+ptxas info    : Compiling entry function '_ZN5nvfp44attn15attn_fwd_kernelI6__halfLi64ELi2ELi4ELb0EEEvNS0_7FwdArgsE' for 'sm_120a'
+ptxas info    : Function properties for _ZN5nvfp44attn15attn_fwd_kernelI6__halfLi64ELi2ELi4ELb0EEEvNS0_7FwdArgsE
+    0 bytes stack frame, 0 bytes spill stores, 0 bytes spill loads
+ptxas info    : Used 214 registers, used 1 barriers
+ptxas info    : Compile time = 97.596 ms
+ptxas info    : Compiling entry function '_ZN5nvfp44attn15attn_fwd_kernelI13__nv_bfloat16Li128ELi2ELi4ELb0EEEvNS0_7FwdArgsE' for 'sm_120a'
+ptxas info    : Function properties for _ZN5nvfp44attn15attn_fwd_kernelI13__nv_bfloat16Li128ELi2ELi4ELb0EEEvNS0_7FwdArgsE
+    8 bytes stack frame, 8 bytes spill stores, 8 bytes spill loads
+ptxas info    : Used 255 registers, used 1 barriers, 8 bytes cumulative stack size
+ptxas info    : Compile time = 175.055 ms
+ptxas info    : Compiling entry function '_ZN5nvfp44attn15attn_fwd_kernelI13__nv_bfloat16Li64ELi2ELi4ELb0EEEvNS0_7FwdArgsE' for 'sm_120a'
+ptxas info    : Function properties for _ZN5nvfp44attn15attn_fwd_kernelI13__nv_bfloat16Li64ELi2ELi4ELb0EEEvNS0_7FwdArgsE
+    0 bytes stack frame, 0 bytes spill stores, 0 bytes spill loads
+ptxas info    : Used 214 registers, used 1 barriers
+ptxas info    : Compile time = 97.201 ms
+ptxas info    : Compiling entry function '_ZN5nvfp44attn17attn_quant_kernelI6__halfLi128EEEvNS0_9QuantArgsE' for 'sm_120a'
+ptxas info    : Function properties for _ZN5nvfp44attn17attn_quant_kernelI6__halfLi128EEEvNS0_9QuantArgsE
+    0 bytes stack frame, 0 bytes spill stores, 0 bytes spill loads
+ptxas info    : Used 48 registers, used 1 barriers, 33024 bytes smem
+ptxas info    : Compile time = 68.445 ms
+ptxas info    : Compiling entry function '_ZN5nvfp44attn17attn_quant_kernelI6__halfLi64EEEvNS0_9QuantArgsE' for 'sm_120a'
+ptxas info    : Function properties for _ZN5nvfp44attn17attn_quant_kernelI6__halfLi64EEEvNS0_9QuantArgsE
+    0 bytes stack frame, 0 bytes spill stores, 0 bytes spill loads
+ptxas info    : Used 48 registers, used 1 barriers, 16640 bytes smem
+ptxas info    : Compile time = 42.542 ms
+ptxas info    : Compiling entry function '_ZN5nvfp44attn17attn_quant_kernelI13__nv_bfloat16Li128EEEvNS0_9QuantArgsE' for 'sm_120a'
+ptxas info    : Function properties for _ZN5nvfp44attn17attn_quant_kernelI13__nv_bfloat16Li128EEEvNS0_9QuantArgsE
+    0 bytes stack frame, 0 bytes spill stores, 0 bytes spill loads
+ptxas info    : Used 48 registers, used 1 barriers, 33024 bytes smem
+ptxas info    : Compile time = 68.730 ms
+ptxas info    : Compiling entry function '_ZN5nvfp44attn17attn_quant_kernelI13__nv_bfloat16Li64EEEvNS0_9QuantArgsE' for 'sm_120a'
+ptxas info    : Function properties for _ZN5nvfp44attn17attn_quant_kernelI13__nv_bfloat16Li64EEEvNS0_9QuantArgsE
+    0 bytes stack frame, 0 bytes spill stores, 0 bytes spill loads
+ptxas info    : Used 48 registers, used 1 barriers, 16640 bytes smem
+ptxas info    : Compile time = 42.928 ms
+[7/7] /usr/local/cuda/bin/nvcc -MD -MF /workspace/nvfp4-train-sm120/build/temp.linux-x86_64-3.10/csrc/quantize_dual.o.d -I/workspace/venv/lib/python3.10/site-packages/torch/include -I/workspace/venv/lib/python3.10/site-packages/torch/include/torch/csrc/api/include -I/usr/local/cuda/include -I/workspace/venv/include -I/usr/include/python3.10 -c -c /workspace/nvfp4-train-sm120/csrc/quantize_dual.cu -o /workspace/nvfp4-train-sm120/build/temp.linux-x86_64-3.10/csrc/quantize_dual.o -D__CUDA_NO_HALF_OPERATORS__ -D__CUDA_NO_HALF_CONVERSIONS__ -D__CUDA_NO_BFLOAT16_CONVERSIONS__ -D__CUDA_NO_HALF2_OPERATORS__ --expt-relaxed-constexpr --compiler-options ''"'"'-fPIC'"'"'' -O3 -std=c++20 -gencode=arch=compute_120a,code=sm_120a --expt-relaxed-constexpr -lineinfo -Xptxas=-v,-warn-spills -DTORCH_API_INCLUDE_EXTENSION_H -DTORCH_EXTENSION_NAME=_C
+/workspace/venv/lib/python3.10/site-packages/torch/include/torch/csrc/api/include/torch/nn/modules/container/any_module_holder.h(93): warning #3189-D: "module" is parsed as an identifier rather than a keyword because the tokens that follow it do not match those of a preprocessor directive
+            module->_forward_populate_default_args(std::move(arguments)));
+            ^
+
+Remark: The warnings can be suppressed with "-diag-suppress <warning-number>"
+
+/workspace/venv/lib/python3.10/site-packages/torch/include/torch/csrc/api/include/torch/python.h(93): warning #3189-D: "module" is parsed as an identifier rather than a keyword because the tokens that follow it do not match those of a preprocessor directive
+    module.attr(name) = wrapper_class;
+    ^
+
+/workspace/venv/lib/python3.10/site-packages/torch/include/torch/csrc/api/include/torch/python.h(155): warning #3189-D: "module" is parsed as an identifier rather than a keyword because the tokens that follow it do not match those of a preprocessor directive
+                module.to(
+                ^
+
+/workspace/venv/lib/python3.10/site-packages/torch/include/torch/csrc/api/include/torch/python.h(159): warning #3189-D: "module" is parsed as an identifier rather than a keyword because the tokens that follow it do not match those of a preprocessor directive
+                module.to(detail::py_object_to_dtype(object), non_blocking);
+                ^
+
+/workspace/venv/lib/python3.10/site-packages/torch/include/torch/csrc/api/include/torch/python.h(170): warning #3189-D: "module" is parsed as an identifier rather than a keyword because the tokens that follow it do not match those of a preprocessor directive
+                  module.to(detail::py_object_to_dtype(dtype), non_blocking);
+                  ^
+
+/workspace/venv/lib/python3.10/site-packages/torch/include/torch/csrc/api/include/torch/python.h(172): warning #3189-D: "module" is parsed as an identifier rather than a keyword because the tokens that follow it do not match those of a preprocessor directive
+                  module.to(detail::py_object_to_device(device), non_blocking);
+                  ^
+
+/workspace/venv/lib/python3.10/site-packages/torch/include/torch/csrc/api/include/torch/python.h(174): warning #3189-D: "module" is parsed as an identifier rather than a keyword because the tokens that follow it do not match those of a preprocessor directive
+                  module.to(
+                  ^
+
+/workspace/venv/lib/python3.10/site-packages/torch/include/torch/csrc/api/include/torch/nn/modules/container/any_module_holder.h(93): warning #3189-D: "module" is parsed as an identifier rather than a keyword because the tokens that follow it do not match those of a preprocessor directive
+            module->_forward_populate_default_args(std::move(arguments)));
+            ^
+
+Remark: The warnings can be suppressed with "-diag-suppress <warning-number>"
+
+/workspace/venv/lib/python3.10/site-packages/torch/include/torch/csrc/api/include/torch/python.h(93): warning #3189-D: "module" is parsed as an identifier rather than a keyword because the tokens that follow it do not match those of a preprocessor directive
+    module.attr(name) = wrapper_class;
+    ^
+
+/workspace/venv/lib/python3.10/site-packages/torch/include/torch/csrc/api/include/torch/python.h(155): warning #3189-D: "module" is parsed as an identifier rather than a keyword because the tokens that follow it do not match those of a preprocessor directive
+                module.to(
+                ^
+
+/workspace/venv/lib/python3.10/site-packages/torch/include/torch/csrc/api/include/torch/python.h(159): warning #3189-D: "module" is parsed as an identifier rather than a keyword because the tokens that follow it do not match those of a preprocessor directive
+                module.to(detail::py_object_to_dtype(object), non_blocking);
+                ^
+
+/workspace/venv/lib/python3.10/site-packages/torch/include/torch/csrc/api/include/torch/python.h(170): warning #3189-D: "module" is parsed as an identifier rather than a keyword because the tokens that follow it do not match those of a preprocessor directive
+                  module.to(detail::py_object_to_dtype(dtype), non_blocking);
+                  ^
+
+/workspace/venv/lib/python3.10/site-packages/torch/include/torch/csrc/api/include/torch/python.h(172): warning #3189-D: "module" is parsed as an identifier rather than a keyword because the tokens that follow it do not match those of a preprocessor directive
+                  module.to(detail::py_object_to_device(device), non_blocking);
+                  ^
+
+/workspace/venv/lib/python3.10/site-packages/torch/include/torch/csrc/api/include/torch/python.h(174): warning #3189-D: "module" is parsed as an identifier rather than a keyword because the tokens that follow it do not match those of a preprocessor directive
+                  module.to(
+                  ^
+
+ptxas warning : Registers are spilled to local memory in function '_ZN5nvfp44dual16amax_tile_kernelIfLi1ELb1EEEvPKT_NS0_6ParamsENS0_7ProArgsIS2_EEPj', 4 bytes spill stores, 4 bytes spill loads
+ptxas warning : Registers are spilled to local memory in function '_ZN5nvfp44dual20dual_quantize_kernelIfLi10ELb1EEEvPKT_NS0_6ParamsENS0_7ProArgsIS2_EEPKjS9_NS0_7OutputsE', 8 bytes spill stores, 12 bytes spill loads
+ptxas warning : Registers are spilled to local memory in function '_ZN5nvfp44dual20dual_quantize_kernelI13__nv_bfloat16Li10ELb1EEEvPKT_NS0_6ParamsENS0_7ProArgsIS3_EEPKjSA_NS0_7OutputsE', 12 bytes spill stores, 20 bytes spill loads
+ptxas info    : 11 bytes gmem
+ptxas info    : Compiling entry function '_ZN5nvfp44dual15ln_stats_kernelIfLb1EEEvPKT_iifPfS5_' for 'sm_120a'
+ptxas info    : Function properties for _ZN5nvfp44dual15ln_stats_kernelIfLb1EEEvPKT_iifPfS5_
+    0 bytes stack frame, 0 bytes spill stores, 0 bytes spill loads
+ptxas info    : Used 26 registers, used 0 barriers
+ptxas info    : Compile time = 12.027 ms
+ptxas info    : Compiling entry function '_ZN5nvfp44dual15ln_stats_kernelI13__nv_bfloat16Lb1EEEvPKT_iifPfS6_' for 'sm_120a'
+ptxas info    : Function properties for _ZN5nvfp44dual15ln_stats_kernelI13__nv_bfloat16Lb1EEEvPKT_iifPfS6_
+    0 bytes stack frame, 0 bytes spill stores, 0 bytes spill loads
+ptxas info    : Used 29 registers, used 0 barriers
+ptxas info    : Compile time = 13.344 ms
+ptxas info    : Compiling entry function '_ZN5nvfp44dual15ln_stats_kernelIfLb0EEEvPKT_iifPfS5_' for 'sm_120a'
+ptxas info    : Function properties for _ZN5nvfp44dual15ln_stats_kernelIfLb0EEEvPKT_iifPfS5_
+    0 bytes stack frame, 0 bytes spill stores, 0 bytes spill loads
+ptxas info    : Used 40 registers, used 0 barriers
+ptxas info    : Compile time = 18.647 ms
+ptxas info    : Compiling entry function '_ZN5nvfp44dual15ln_stats_kernelI13__nv_bfloat16Lb0EEEvPKT_iifPfS6_' for 'sm_120a'
+ptxas info    : Function properties for _ZN5nvfp44dual15ln_stats_kernelI13__nv_bfloat16Lb0EEEvPKT_iifPfS6_
+    0 bytes stack frame, 0 bytes spill stores, 0 bytes spill loads
+ptxas info    : Used 32 registers, used 0 barriers
+ptxas info    : Compile time = 17.535 ms
+ptxas info    : Compiling entry function '_ZN5nvfp44dual20dual_quantize_kernelI13__nv_bfloat16Li9ELb0EEEvPKT_NS0_6ParamsENS0_7ProArgsIS3_EEPKjSA_NS0_7OutputsE' for 'sm_120a'
+ptxas info    : Function properties for _ZN5nvfp44dual20dual_quantize_kernelI13__nv_bfloat16Li9ELb0EEEvPKT_NS0_6ParamsENS0_7ProArgsIS3_EEPKjSA_NS0_7OutputsE
+    0 bytes stack frame, 0 bytes spill stores, 0 bytes spill loads
+ptxas info    : Used 58 registers, used 1 barriers, 18968 bytes smem
+ptxas info    : Compile time = 183.953 ms
+ptxas info    : Compiling entry function '_ZN5nvfp44dual20dual_quantize_kernelI13__nv_bfloat16Li9ELb1EEEvPKT_NS0_6ParamsENS0_7ProArgsIS3_EEPKjSA_NS0_7OutputsE' for 'sm_120a'
+ptxas info    : Function properties for _ZN5nvfp44dual20dual_quantize_kernelI13__nv_bfloat16Li9ELb1EEEvPKT_NS0_6ParamsENS0_7ProArgsIS3_EEPKjSA_NS0_7OutputsE
+    0 bytes stack frame, 0 bytes spill stores, 0 bytes spill loads
+ptxas info    : Used 89 registers, used 1 barriers, 18968 bytes smem
+ptxas info    : Compile time = 204.343 ms
+ptxas info    : Compiling entry function '_ZN5nvfp44dual16amax_tile_kernelI13__nv_bfloat16Li9ELb0EEEvPKT_NS0_6ParamsENS0_7ProArgsIS3_EEPj' for 'sm_120a'
+ptxas info    : Function properties for _ZN5nvfp44dual16amax_tile_kernelI13__nv_bfloat16Li9ELb0EEEvPKT_NS0_6ParamsENS0_7ProArgsIS3_EEPj
+    0 bytes stack frame, 0 bytes spill stores, 0 bytes spill loads
+ptxas info    : Used 54 registers, used 1 barriers, 16680 bytes smem
+ptxas info    : Compile time = 70.398 ms
+ptxas info    : Compiling entry function '_ZN5nvfp44dual16amax_tile_kernelI13__nv_bfloat16Li9ELb1EEEvPKT_NS0_6ParamsENS0_7ProArgsIS3_EEPj' for 'sm_120a'
+ptxas info    : Function properties for _ZN5nvfp44dual16amax_tile_kernelI13__nv_bfloat16Li9ELb1EEEvPKT_NS0_6ParamsENS0_7ProArgsIS3_EEPj
+    0 bytes stack frame, 0 bytes spill stores, 0 bytes spill loads
+ptxas info    : Used 80 registers, used 1 barriers, 16688 bytes smem
+ptxas info    : Compile time = 109.606 ms
+ptxas info    : Compiling entry function '_ZN5nvfp44dual20dual_quantize_kernelI13__nv_bfloat16Li8ELb0EEEvPKT_NS0_6ParamsENS0_7ProArgsIS3_EEPKjSA_NS0_7OutputsE' for 'sm_120a'
+ptxas info    : Function properties for _ZN5nvfp44dual20dual_quantize_kernelI13__nv_bfloat16Li8ELb0EEEvPKT_NS0_6ParamsENS0_7ProArgsIS3_EEPKjSA_NS0_7OutputsE
+    0 bytes stack frame, 0 bytes spill stores, 0 bytes spill loads
+ptxas info    : Used 54 registers, used 1 barriers, 18968 bytes smem
+ptxas info    : Compile time = 178.192 ms
+ptxas info    : Compiling entry function '_ZN5nvfp44dual20dual_quantize_kernelI13__nv_bfloat16Li8ELb1EEEvPKT_NS0_6ParamsENS0_7ProArgsIS3_EEPKjSA_NS0_7OutputsE' for 'sm_120a'
+ptxas info    : Function properties for _ZN5nvfp44dual20dual_quantize_kernelI13__nv_bfloat16Li8ELb1EEEvPKT_NS0_6ParamsENS0_7ProArgsIS3_EEPKjSA_NS0_7OutputsE
+    0 bytes stack frame, 0 bytes spill stores, 0 bytes spill loads
+ptxas info    : Used 89 registers, used 1 barriers, 18968 bytes smem
+ptxas info    : Compile time = 194.803 ms
+ptxas info    : Compiling entry function '_ZN5nvfp44dual16amax_tile_kernelI13__nv_bfloat16Li8ELb0EEEvPKT_NS0_6ParamsENS0_7ProArgsIS3_EEPj' for 'sm_120a'
+ptxas info    : Function properties for _ZN5nvfp44dual16amax_tile_kernelI13__nv_bfloat16Li8ELb0EEEvPKT_NS0_6ParamsENS0_7ProArgsIS3_EEPj
+    0 bytes stack frame, 0 bytes spill stores, 0 bytes spill loads
+ptxas info    : Used 54 registers, used 1 barriers, 16680 bytes smem
+ptxas info    : Compile time = 60.512 ms
+ptxas info    : Compiling entry function '_ZN5nvfp44dual16amax_tile_kernelI13__nv_bfloat16Li8ELb1EEEvPKT_NS0_6ParamsENS0_7ProArgsIS3_EEPj' for 'sm_120a'
+ptxas info    : Function properties for _ZN5nvfp44dual16amax_tile_kernelI13__nv_bfloat16Li8ELb1EEEvPKT_NS0_6ParamsENS0_7ProArgsIS3_EEPj
+    0 bytes stack frame, 0 bytes spill stores, 0 bytes spill loads
+ptxas info    : Used 80 registers, used 1 barriers, 16688 bytes smem
+ptxas info    : Compile time = 99.210 ms
+ptxas info    : Compiling entry function '_ZN5nvfp44dual20dual_quantize_kernelI13__nv_bfloat16Li7ELb0EEEvPKT_NS0_6ParamsENS0_7ProArgsIS3_EEPKjSA_NS0_7OutputsE' for 'sm_120a'
+ptxas info    : Function properties for _ZN5nvfp44dual20dual_quantize_kernelI13__nv_bfloat16Li7ELb0EEEvPKT_NS0_6ParamsENS0_7ProArgsIS3_EEPKjSA_NS0_7OutputsE
+    0 bytes stack frame, 0 bytes spill stores, 0 bytes spill loads
+ptxas info    : Used 56 registers, used 1 barriers, 18968 bytes smem
+ptxas info    : Compile time = 175.631 ms
+ptxas info    : Compiling entry function '_ZN5nvfp44dual20dual_quantize_kernelI13__nv_bfloat16Li7ELb1EEEvPKT_NS0_6ParamsENS0_7ProArgsIS3_EEPKjSA_NS0_7OutputsE' for 'sm_120a'
+ptxas info    : Function properties for _ZN5nvfp44dual20dual_quantize_kernelI13__nv_bfloat16Li7ELb1EEEvPKT_NS0_6ParamsENS0_7ProArgsIS3_EEPKjSA_NS0_7OutputsE
+    0 bytes stack frame, 0 bytes spill stores, 0 bytes spill loads
+ptxas info    : Used 89 registers, used 1 barriers, 18968 bytes smem
+ptxas info    : Compile time = 194.173 ms
+ptxas info    : Compiling entry function '_ZN5nvfp44dual16amax_tile_kernelI13__nv_bfloat16Li7ELb0EEEvPKT_NS0_6ParamsENS0_7ProArgsIS3_EEPj' for 'sm_120a'
+ptxas info    : Function properties for _ZN5nvfp44dual16amax_tile_kernelI13__nv_bfloat16Li7ELb0EEEvPKT_NS0_6ParamsENS0_7ProArgsIS3_EEPj
+    0 bytes stack frame, 0 bytes spill stores, 0 bytes spill loads
+ptxas info    : Used 58 registers, used 1 barriers, 16680 bytes smem
+ptxas info    : Compile time = 76.890 ms
+ptxas info    : Compiling entry function '_ZN5nvfp44dual16amax_tile_kernelI13__nv_bfloat16Li7ELb1EEEvPKT_NS0_6ParamsENS0_7ProArgsIS3_EEPj' for 'sm_120a'
+ptxas info    : Function properties for _ZN5nvfp44dual16amax_tile_kernelI13__nv_bfloat16Li7ELb1EEEvPKT_NS0_6ParamsENS0_7ProArgsIS3_EEPj
+    0 bytes stack frame, 0 bytes spill stores, 0 bytes spill loads
+ptxas info    : Used 80 registers, used 1 barriers, 16688 bytes smem
+ptxas info    : Compile time = 120.897 ms
+ptxas info    : Compiling entry function '_ZN5nvfp44dual20dual_quantize_kernelI13__nv_bfloat16Li6ELb0EEEvPKT_NS0_6ParamsENS0_7ProArgsIS3_EEPKjSA_NS0_7OutputsE' for 'sm_120a'
+ptxas info    : Function properties for _ZN5nvfp44dual20dual_quantize_kernelI13__nv_bfloat16Li6ELb0EEEvPKT_NS0_6ParamsENS0_7ProArgsIS3_EEPKjSA_NS0_7OutputsE
+    0 bytes stack frame, 0 bytes spill stores, 0 bytes spill loads
+ptxas info    : Used 56 registers, used 1 barriers, 18968 bytes smem
+ptxas info    : Compile time = 183.073 ms
+ptxas info    : Compiling entry function '_ZN5nvfp44dual20dual_quantize_kernelI13__nv_bfloat16Li6ELb1EEEvPKT_NS0_6ParamsENS0_7ProArgsIS3_EEPKjSA_NS0_7OutputsE' for 'sm_120a'
+ptxas info    : Function properties for _ZN5nvfp44dual20dual_quantize_kernelI13__nv_bfloat16Li6ELb1EEEvPKT_NS0_6ParamsENS0_7ProArgsIS3_EEPKjSA_NS0_7OutputsE
+    0 bytes stack frame, 0 bytes spill stores, 0 bytes spill loads
+ptxas info    : Used 89 registers, used 1 barriers, 18968 bytes smem
+ptxas info    : Compile time = 199.758 ms
+ptxas info    : Compiling entry function '_ZN5nvfp44dual16amax_tile_kernelI13__nv_bfloat16Li6ELb0EEEvPKT_NS0_6ParamsENS0_7ProArgsIS3_EEPj' for 'sm_120a'
+ptxas info    : Function properties for _ZN5nvfp44dual16amax_tile_kernelI13__nv_bfloat16Li6ELb0EEEvPKT_NS0_6ParamsENS0_7ProArgsIS3_EEPj
+    0 bytes stack frame, 0 bytes spill stores, 0 bytes spill loads
+ptxas info    : Used 64 registers, used 1 barriers, 16680 bytes smem
+ptxas info    : Compile time = 85.226 ms
+ptxas info    : Compiling entry function '_ZN5nvfp44dual16amax_tile_kernelI13__nv_bfloat16Li6ELb1EEEvPKT_NS0_6ParamsENS0_7ProArgsIS3_EEPj' for 'sm_120a'
+ptxas info    : Function properties for _ZN5nvfp44dual16amax_tile_kernelI13__nv_bfloat16Li6ELb1EEEvPKT_NS0_6ParamsENS0_7ProArgsIS3_EEPj
+    0 bytes stack frame, 0 bytes spill stores, 0 bytes spill loads
+ptxas info    : Used 80 registers, used 1 barriers, 16688 bytes smem
+ptxas info    : Compile time = 127.141 ms
+ptxas info    : Compiling entry function '_ZN5nvfp44dual20dual_quantize_kernelI13__nv_bfloat16Li5ELb0EEEvPKT_NS0_6ParamsENS0_7ProArgsIS3_EEPKjSA_NS0_7OutputsE' for 'sm_120a'
+ptxas info    : Function properties for _ZN5nvfp44dual20dual_quantize_kernelI13__nv_bfloat16Li5ELb0EEEvPKT_NS0_6ParamsENS0_7ProArgsIS3_EEPKjSA_NS0_7OutputsE
+    0 bytes stack frame, 0 bytes spill stores, 0 bytes spill loads
+ptxas info    : Used 56 registers, used 1 barriers, 18968 bytes smem
+ptxas info    : Compile time = 173.173 ms
+ptxas info    : Compiling entry function '_ZN5nvfp44dual20dual_quantize_kernelI13__nv_bfloat16Li5ELb1EEEvPKT_NS0_6ParamsENS0_7ProArgsIS3_EEPKjSA_NS0_7OutputsE' for 'sm_120a'
+ptxas info    : Function properties for _ZN5nvfp44dual20dual_quantize_kernelI13__nv_bfloat16Li5ELb1EEEvPKT_NS0_6ParamsENS0_7ProArgsIS3_EEPKjSA_NS0_7OutputsE
+    0 bytes stack frame, 0 bytes spill stores, 0 bytes spill loads
+ptxas info    : Used 89 registers, used 1 barriers, 18968 bytes smem
+ptxas info    : Compile time = 194.081 ms
+ptxas info    : Compiling entry function '_ZN5nvfp44dual16amax_tile_kernelI13__nv_bfloat16Li5ELb0EEEvPKT_NS0_6ParamsENS0_7ProArgsIS3_EEPj' for 'sm_120a'
+ptxas info    : Function properties for _ZN5nvfp44dual16amax_tile_kernelI13__nv_bfloat16Li5ELb0EEEvPKT_NS0_6ParamsENS0_7ProArgsIS3_EEPj
+    0 bytes stack frame, 0 bytes spill stores, 0 bytes spill loads
+ptxas info    : Used 64 registers, used 1 barriers, 16680 bytes smem
+ptxas info    : Compile time = 77.946 ms
+ptxas info    : Compiling entry function '_ZN5nvfp44dual16amax_tile_kernelI13__nv_bfloat16Li5ELb1EEEvPKT_NS0_6ParamsENS0_7ProArgsIS3_EEPj' for 'sm_120a'
+ptxas info    : Function properties for _ZN5nvfp44dual16amax_tile_kernelI13__nv_bfloat16Li5ELb1EEEvPKT_NS0_6ParamsENS0_7ProArgsIS3_EEPj
+    0 bytes stack frame, 0 bytes spill stores, 0 bytes spill loads
+ptxas info    : Used 80 registers, used 1 barriers, 16688 bytes smem
+ptxas info    : Compile time = 119.638 ms
+ptxas info    : Compiling entry function '_ZN5nvfp44dual20dual_quantize_kernelIfLi4ELb0EEEvPKT_NS0_6ParamsENS0_7ProArgsIS2_EEPKjS9_NS0_7OutputsE' for 'sm_120a'
+ptxas info    : Function properties for _ZN5nvfp44dual20dual_quantize_kernelIfLi4ELb0EEEvPKT_NS0_6ParamsENS0_7ProArgsIS2_EEPKjS9_NS0_7OutputsE
+    0 bytes stack frame, 0 bytes spill stores, 0 bytes spill loads
+ptxas info    : Used 56 registers, used 1 barriers, 18968 bytes smem
+ptxas info    : Compile time = 160.580 ms
+ptxas info    : Compiling entry function '_ZN5nvfp44dual20dual_quantize_kernelIfLi4ELb1EEEvPKT_NS0_6ParamsENS0_7ProArgsIS2_EEPKjS9_NS0_7OutputsE' for 'sm_120a'
+ptxas info    : Function properties for _ZN5nvfp44dual20dual_quantize_kernelIfLi4ELb1EEEvPKT_NS0_6ParamsENS0_7ProArgsIS2_EEPKjS9_NS0_7OutputsE
+    0 bytes stack frame, 0 bytes spill stores, 0 bytes spill loads
+ptxas info    : Used 89 registers, used 1 barriers, 18968 bytes smem
+ptxas info    : Compile time = 168.577 ms
+ptxas info    : Compiling entry function '_ZN5nvfp44dual16amax_tile_kernelIfLi4ELb0EEEvPKT_NS0_6ParamsENS0_7ProArgsIS2_EEPj' for 'sm_120a'
+ptxas info    : Function properties for _ZN5nvfp44dual16amax_tile_kernelIfLi4ELb0EEEvPKT_NS0_6ParamsENS0_7ProArgsIS2_EEPj
+    0 bytes stack frame, 0 bytes spill stores, 0 bytes spill loads
+ptxas info    : Used 48 registers, used 1 barriers, 16680 bytes smem
+ptxas info    : Compile time = 46.997 ms
+ptxas info    : Compiling entry function '_ZN5nvfp44dual16amax_tile_kernelIfLi4ELb1EEEvPKT_NS0_6ParamsENS0_7ProArgsIS2_EEPj' for 'sm_120a'
+ptxas info    : Function properties for _ZN5nvfp44dual16amax_tile_kernelIfLi4ELb1EEEvPKT_NS0_6ParamsENS0_7ProArgsIS2_EEPj
+    0 bytes stack frame, 0 bytes spill stores, 0 bytes spill loads
+ptxas info    : Used 80 registers, used 1 barriers, 16688 bytes smem
+ptxas info    : Compile time = 85.470 ms
+ptxas info    : Compiling entry function '_ZN5nvfp44dual20dual_quantize_kernelI13__nv_bfloat16Li4ELb0EEEvPKT_NS0_6ParamsENS0_7ProArgsIS3_EEPKjSA_NS0_7OutputsE' for 'sm_120a'
+ptxas info    : Function properties for _ZN5nvfp44dual20dual_quantize_kernelI13__nv_bfloat16Li4ELb0EEEvPKT_NS0_6ParamsENS0_7ProArgsIS3_EEPKjSA_NS0_7OutputsE
+    0 bytes stack frame, 0 bytes spill stores, 0 bytes spill loads
+ptxas info    : Used 54 registers, used 1 barriers, 18968 bytes smem
+ptxas info    : Compile time = 158.444 ms
+ptxas info    : Compiling entry function '_ZN5nvfp44dual20dual_quantize_kernelI13__nv_bfloat16Li4ELb1EEEvPKT_NS0_6ParamsENS0_7ProArgsIS3_EEPKjSA_NS0_7OutputsE' for 'sm_120a'
+ptxas info    : Function properties for _ZN5nvfp44dual20dual_quantize_kernelI13__nv_bfloat16Li4ELb1EEEvPKT_NS0_6ParamsENS0_7ProArgsIS3_EEPKjSA_NS0_7OutputsE
+    0 bytes stack frame, 0 bytes spill stores, 0 bytes spill loads
+ptxas info    : Used 89 registers, used 1 barriers, 18968 bytes smem
+ptxas info    : Compile time = 170.504 ms
+ptxas info    : Compiling entry function '_ZN5nvfp44dual16amax_tile_kernelI13__nv_bfloat16Li4ELb0EEEvPKT_NS0_6ParamsENS0_7ProArgsIS3_EEPj' for 'sm_120a'
+ptxas info    : Function properties for _ZN5nvfp44dual16amax_tile_kernelI13__nv_bfloat16Li4ELb0EEEvPKT_NS0_6ParamsENS0_7ProArgsIS3_EEPj
+    0 bytes stack frame, 0 bytes spill stores, 0 bytes spill loads
+ptxas info    : Used 48 registers, used 1 barriers, 16680 bytes smem
+ptxas info    : Compile time = 45.290 ms
+ptxas info    : Compiling entry function '_ZN5nvfp44dual16amax_tile_kernelI13__nv_bfloat16Li4ELb1EEEvPKT_NS0_6ParamsENS0_7ProArgsIS3_EEPj' for 'sm_120a'
+ptxas info    : Function properties for _ZN5nvfp44dual16amax_tile_kernelI13__nv_bfloat16Li4ELb1EEEvPKT_NS0_6ParamsENS0_7ProArgsIS3_EEPj
+    0 bytes stack frame, 0 bytes spill stores, 0 bytes spill loads
+ptxas info    : Used 80 registers, used 1 barriers, 16688 bytes smem
+ptxas info    : Compile time = 78.200 ms
+ptxas info    : Compiling entry function '_ZN5nvfp44dual20dual_quantize_kernelI13__nv_bfloat16Li3ELb0EEEvPKT_NS0_6ParamsENS0_7ProArgsIS3_EEPKjSA_NS0_7OutputsE' for 'sm_120a'
+ptxas info    : Function properties for _ZN5nvfp44dual20dual_quantize_kernelI13__nv_bfloat16Li3ELb0EEEvPKT_NS0_6ParamsENS0_7ProArgsIS3_EEPKjSA_NS0_7OutputsE
+    0 bytes stack frame, 0 bytes spill stores, 0 bytes spill loads
+ptxas info    : Used 62 registers, used 1 barriers, 18968 bytes smem
+ptxas info    : Compile time = 174.186 ms
+ptxas info    : Compiling entry function '_ZN5nvfp44dual20dual_quantize_kernelI13__nv_bfloat16Li3ELb1EEEvPKT_NS0_6ParamsENS0_7ProArgsIS3_EEPKjSA_NS0_7OutputsE' for 'sm_120a'
+ptxas info    : Function properties for _ZN5nvfp44dual20dual_quantize_kernelI13__nv_bfloat16Li3ELb1EEEvPKT_NS0_6ParamsENS0_7ProArgsIS3_EEPKjSA_NS0_7OutputsE
+    0 bytes stack frame, 0 bytes spill stores, 0 bytes spill loads
+ptxas info    : Used 89 registers, used 1 barriers, 18968 bytes smem
+ptxas info    : Compile time = 192.959 ms
+ptxas info    : Compiling entry function '_ZN5nvfp44dual16amax_tile_kernelI13__nv_bfloat16Li3ELb0EEEvPKT_NS0_6ParamsENS0_7ProArgsIS3_EEPj' for 'sm_120a'
+ptxas info    : Function properties for _ZN5nvfp44dual16amax_tile_kernelI13__nv_bfloat16Li3ELb0EEEvPKT_NS0_6ParamsENS0_7ProArgsIS3_EEPj
+    0 bytes stack frame, 0 bytes spill stores, 0 bytes spill loads
+ptxas info    : Used 54 registers, used 1 barriers, 16680 bytes smem
+ptxas info    : Compile time = 60.824 ms
+ptxas info    : Compiling entry function '_ZN5nvfp44dual16amax_tile_kernelI13__nv_bfloat16Li3ELb1EEEvPKT_NS0_6ParamsENS0_7ProArgsIS3_EEPj' for 'sm_120a'
+ptxas info    : Function properties for _ZN5nvfp44dual16amax_tile_kernelI13__nv_bfloat16Li3ELb1EEEvPKT_NS0_6ParamsENS0_7ProArgsIS3_EEPj
+    0 bytes stack frame, 0 bytes spill stores, 0 bytes spill loads
+ptxas info    : Used 80 registers, used 1 barriers, 16688 bytes smem
+ptxas info    : Compile time = 99.604 ms
+ptxas info    : Compiling entry function '_ZN5nvfp44dual20dual_quantize_kernelI13__nv_bfloat16Li2ELb0EEEvPKT_NS0_6ParamsENS0_7ProArgsIS3_EEPKjSA_NS0_7OutputsE' for 'sm_120a'
+ptxas info    : Function properties for _ZN5nvfp44dual20dual_quantize_kernelI13__nv_bfloat16Li2ELb0EEEvPKT_NS0_6ParamsENS0_7ProArgsIS3_EEPKjSA_NS0_7OutputsE
+    0 bytes stack frame, 0 bytes spill stores, 0 bytes spill loads
+ptxas info    : Used 54 registers, used 1 barriers, 18968 bytes smem
+ptxas info    : Compile time = 172.133 ms
+ptxas info    : Compiling entry function '_ZN5nvfp44dual20dual_quantize_kernelI13__nv_bfloat16Li2ELb1EEEvPKT_NS0_6ParamsENS0_7ProArgsIS3_EEPKjSA_NS0_7OutputsE' for 'sm_120a'
+ptxas info    : Function properties for _ZN5nvfp44dual20dual_quantize_kernelI13__nv_bfloat16Li2ELb1EEEvPKT_NS0_6ParamsENS0_7ProArgsIS3_EEPKjSA_NS0_7OutputsE
+    0 bytes stack frame, 0 bytes spill stores, 0 bytes spill loads
+ptxas info    : Used 89 registers, used 1 barriers, 18968 bytes smem
+ptxas info    : Compile time = 188.809 ms
+ptxas info    : Compiling entry function '_ZN5nvfp44dual16amax_tile_kernelI13__nv_bfloat16Li2ELb0EEEvPKT_NS0_6ParamsENS0_7ProArgsIS3_EEPj' for 'sm_120a'
+ptxas info    : Function properties for _ZN5nvfp44dual16amax_tile_kernelI13__nv_bfloat16Li2ELb0EEEvPKT_NS0_6ParamsENS0_7ProArgsIS3_EEPj
+    0 bytes stack frame, 0 bytes spill stores, 0 bytes spill loads
+ptxas info    : Used 55 registers, used 1 barriers, 16680 bytes smem
+ptxas info    : Compile time = 56.280 ms
+ptxas info    : Compiling entry function '_ZN5nvfp44dual16amax_tile_kernelI13__nv_bfloat16Li2ELb1EEEvPKT_NS0_6ParamsENS0_7ProArgsIS3_EEPj' for 'sm_120a'
+ptxas info    : Function properties for _ZN5nvfp44dual16amax_tile_kernelI13__nv_bfloat16Li2ELb1EEEvPKT_NS0_6ParamsENS0_7ProArgsIS3_EEPj
+    0 bytes stack frame, 0 bytes spill stores, 0 bytes spill loads
+ptxas info    : Used 80 registers, used 1 barriers, 16688 bytes smem
+ptxas info    : Compile time = 92.309 ms
+ptxas info    : Compiling entry function '_ZN5nvfp44dual20dual_quantize_kernelIfLi1ELb0EEEvPKT_NS0_6ParamsENS0_7ProArgsIS2_EEPKjS9_NS0_7OutputsE' for 'sm_120a'
+ptxas info    : Function properties for _ZN5nvfp44dual20dual_quantize_kernelIfLi1ELb0EEEvPKT_NS0_6ParamsENS0_7ProArgsIS2_EEPKjS9_NS0_7OutputsE
+    0 bytes stack frame, 0 bytes spill stores, 0 bytes spill loads
+ptxas info    : Used 56 registers, used 1 barriers, 18968 bytes smem
+ptxas info    : Compile time = 159.434 ms
+ptxas info    : Compiling entry function '_ZN5nvfp44dual20dual_quantize_kernelIfLi1ELb1EEEvPKT_NS0_6ParamsENS0_7ProArgsIS2_EEPKjS9_NS0_7OutputsE' for 'sm_120a'
+ptxas info    : Function properties for _ZN5nvfp44dual20dual_quantize_kernelIfLi1ELb1EEEvPKT_NS0_6ParamsENS0_7ProArgsIS2_EEPKjS9_NS0_7OutputsE
+    0 bytes stack frame, 0 bytes spill stores, 0 bytes spill loads
+ptxas info    : Used 89 registers, used 1 barriers, 18968 bytes smem
+ptxas info    : Compile time = 173.389 ms
+ptxas info    : Compiling entry function '_ZN5nvfp44dual16amax_tile_kernelIfLi1ELb0EEEvPKT_NS0_6ParamsENS0_7ProArgsIS2_EEPj' for 'sm_120a'
+ptxas info    : Function properties for _ZN5nvfp44dual16amax_tile_kernelIfLi1ELb0EEEvPKT_NS0_6ParamsENS0_7ProArgsIS2_EEPj
+    0 bytes stack frame, 0 bytes spill stores, 0 bytes spill loads
+ptxas info    : Used 48 registers, used 1 barriers, 16680 bytes smem
+ptxas info    : Compile time = 51.610 ms
+ptxas info    : Compiling entry function '_ZN5nvfp44dual16amax_tile_kernelIfLi1ELb1EEEvPKT_NS0_6ParamsENS0_7ProArgsIS2_EEPj' for 'sm_120a'
+ptxas info    : Function properties for _ZN5nvfp44dual16amax_tile_kernelIfLi1ELb1EEEvPKT_NS0_6ParamsENS0_7ProArgsIS2_EEPj
+    8 bytes stack frame, 4 bytes spill stores, 4 bytes spill loads
+ptxas info    : Used 80 registers, used 1 barriers, 8 bytes cumulative stack size, 16688 bytes smem
+ptxas info    : Compile time = 88.156 ms
+ptxas info    : Compiling entry function '_ZN5nvfp44dual20dual_quantize_kernelI13__nv_bfloat16Li1ELb0EEEvPKT_NS0_6ParamsENS0_7ProArgsIS3_EEPKjSA_NS0_7OutputsE' for 'sm_120a'
+ptxas info    : Function properties for _ZN5nvfp44dual20dual_quantize_kernelI13__nv_bfloat16Li1ELb0EEEvPKT_NS0_6ParamsENS0_7ProArgsIS3_EEPKjSA_NS0_7OutputsE
+    0 bytes stack frame, 0 bytes spill stores, 0 bytes spill loads
+ptxas info    : Used 54 registers, used 1 barriers, 18968 bytes smem
+ptxas info    : Compile time = 166.415 ms
+ptxas info    : Compiling entry function '_ZN5nvfp44dual20dual_quantize_kernelI13__nv_bfloat16Li1ELb1EEEvPKT_NS0_6ParamsENS0_7ProArgsIS3_EEPKjSA_NS0_7OutputsE' for 'sm_120a'
+ptxas info    : Function properties for _ZN5nvfp44dual20dual_quantize_kernelI13__nv_bfloat16Li1ELb1EEEvPKT_NS0_6ParamsENS0_7ProArgsIS3_EEPKjSA_NS0_7OutputsE
+    0 bytes stack frame, 0 bytes spill stores, 0 bytes spill loads
+ptxas info    : Used 89 registers, used 1 barriers, 18968 bytes smem
+ptxas info    : Compile time = 181.611 ms
+ptxas info    : Compiling entry function '_ZN5nvfp44dual16amax_tile_kernelI13__nv_bfloat16Li1ELb0EEEvPKT_NS0_6ParamsENS0_7ProArgsIS3_EEPj' for 'sm_120a'
+ptxas info    : Function properties for _ZN5nvfp44dual16amax_tile_kernelI13__nv_bfloat16Li1ELb0EEEvPKT_NS0_6ParamsENS0_7ProArgsIS3_EEPj
+    0 bytes stack frame, 0 bytes spill stores, 0 bytes spill loads
+ptxas info    : Used 48 registers, used 1 barriers, 16680 bytes smem
+ptxas info    : Compile time = 47.899 ms
+ptxas info    : Compiling entry function '_ZN5nvfp44dual16amax_tile_kernelI13__nv_bfloat16Li1ELb1EEEvPKT_NS0_6ParamsENS0_7ProArgsIS3_EEPj' for 'sm_120a'
+ptxas info    : Function properties for _ZN5nvfp44dual16amax_tile_kernelI13__nv_bfloat16Li1ELb1EEEvPKT_NS0_6ParamsENS0_7ProArgsIS3_EEPj
+    0 bytes stack frame, 0 bytes spill stores, 0 bytes spill loads
+ptxas info    : Used 80 registers, used 1 barriers, 16688 bytes smem
+ptxas info    : Compile time = 84.603 ms
+ptxas info    : Compiling entry function '_ZN5nvfp44dual20dual_quantize_kernelIfLi10ELb0EEEvPKT_NS0_6ParamsENS0_7ProArgsIS2_EEPKjS9_NS0_7OutputsE' for 'sm_120a'
+ptxas info    : Function properties for _ZN5nvfp44dual20dual_quantize_kernelIfLi10ELb0EEEvPKT_NS0_6ParamsENS0_7ProArgsIS2_EEPKjS9_NS0_7OutputsE
+    0 bytes stack frame, 0 bytes spill stores, 0 bytes spill loads
+ptxas info    : Used 56 registers, used 1 barriers, 18968 bytes smem
+ptxas info    : Compile time = 164.390 ms
+ptxas info    : Compiling entry function '_ZN5nvfp44dual20dual_quantize_kernelIfLi10ELb1EEEvPKT_NS0_6ParamsENS0_7ProArgsIS2_EEPKjS9_NS0_7OutputsE' for 'sm_120a'
+ptxas info    : Function properties for _ZN5nvfp44dual20dual_quantize_kernelIfLi10ELb1EEEvPKT_NS0_6ParamsENS0_7ProArgsIS2_EEPKjS9_NS0_7OutputsE
+    8 bytes stack frame, 8 bytes spill stores, 12 bytes spill loads
+ptxas info    : Used 80 registers, used 1 barriers, 8 bytes cumulative stack size, 18968 bytes smem
+ptxas info    : Compile time = 174.870 ms
+ptxas info    : Compiling entry function '_ZN5nvfp44dual16amax_tile_kernelIfLi10ELb0EEEvPKT_NS0_6ParamsENS0_7ProArgsIS2_EEPj' for 'sm_120a'
+ptxas info    : Function properties for _ZN5nvfp44dual16amax_tile_kernelIfLi10ELb0EEEvPKT_NS0_6ParamsENS0_7ProArgsIS2_EEPj
+    0 bytes stack frame, 0 bytes spill stores, 0 bytes spill loads
+ptxas info    : Used 48 registers, used 1 barriers, 16680 bytes smem
+ptxas info    : Compile time = 49.351 ms
+ptxas info    : Compiling entry function '_ZN5nvfp44dual16amax_tile_kernelIfLi10ELb1EEEvPKT_NS0_6ParamsENS0_7ProArgsIS2_EEPj' for 'sm_120a'
+ptxas info    : Function properties for _ZN5nvfp44dual16amax_tile_kernelIfLi10ELb1EEEvPKT_NS0_6ParamsENS0_7ProArgsIS2_EEPj
+    0 bytes stack frame, 0 bytes spill stores, 0 bytes spill loads
+ptxas info    : Used 80 registers, used 1 barriers, 16688 bytes smem
+ptxas info    : Compile time = 88.111 ms
+ptxas info    : Compiling entry function '_ZN5nvfp44dual20dual_quantize_kernelI13__nv_bfloat16Li10ELb0EEEvPKT_NS0_6ParamsENS0_7ProArgsIS3_EEPKjSA_NS0_7OutputsE' for 'sm_120a'
+ptxas info    : Function properties for _ZN5nvfp44dual20dual_quantize_kernelI13__nv_bfloat16Li10ELb0EEEvPKT_NS0_6ParamsENS0_7ProArgsIS3_EEPKjSA_NS0_7OutputsE
+    0 bytes stack frame, 0 bytes spill stores, 0 bytes spill loads
+ptxas info    : Used 51 registers, used 1 barriers, 18968 bytes smem
+ptxas info    : Compile time = 164.023 ms
+ptxas info    : Compiling entry function '_ZN5nvfp44dual20dual_quantize_kernelI13__nv_bfloat16Li10ELb1EEEvPKT_NS0_6ParamsENS0_7ProArgsIS3_EEPKjSA_NS0_7OutputsE' for 'sm_120a'
+ptxas info    : Function properties for _ZN5nvfp44dual20dual_quantize_kernelI13__nv_bfloat16Li10ELb1EEEvPKT_NS0_6ParamsENS0_7ProArgsIS3_EEPKjSA_NS0_7OutputsE
+    16 bytes stack frame, 12 bytes spill stores, 20 bytes spill loads
+ptxas info    : Used 80 registers, used 1 barriers, 16 bytes cumulative stack size, 18968 bytes smem
+ptxas info    : Compile time = 170.655 ms
+ptxas info    : Compiling entry function '_ZN5nvfp44dual16amax_tile_kernelI13__nv_bfloat16Li10ELb0EEEvPKT_NS0_6ParamsENS0_7ProArgsIS3_EEPj' for 'sm_120a'
+ptxas info    : Function properties for _ZN5nvfp44dual16amax_tile_kernelI13__nv_bfloat16Li10ELb0EEEvPKT_NS0_6ParamsENS0_7ProArgsIS3_EEPj
+    0 bytes stack frame, 0 bytes spill stores, 0 bytes spill loads
+ptxas info    : Used 48 registers, used 1 barriers, 16680 bytes smem
+ptxas info    : Compile time = 46.987 ms
+ptxas info    : Compiling entry function '_ZN5nvfp44dual16amax_tile_kernelI13__nv_bfloat16Li10ELb1EEEvPKT_NS0_6ParamsENS0_7ProArgsIS3_EEPj' for 'sm_120a'
+ptxas info    : Function properties for _ZN5nvfp44dual16amax_tile_kernelI13__nv_bfloat16Li10ELb1EEEvPKT_NS0_6ParamsENS0_7ProArgsIS3_EEPj
+    0 bytes stack frame, 0 bytes spill stores, 0 bytes spill loads
+ptxas info    : Used 80 registers, used 1 barriers, 16688 bytes smem
+ptxas info    : Compile time = 81.188 ms
+ptxas info    : Compiling entry function '_ZN5nvfp44dual20dual_quantize_kernelIfLi0ELb0EEEvPKT_NS0_6ParamsENS0_7ProArgsIS2_EEPKjS9_NS0_7OutputsE' for 'sm_120a'
+ptxas info    : Function properties for _ZN5nvfp44dual20dual_quantize_kernelIfLi0ELb0EEEvPKT_NS0_6ParamsENS0_7ProArgsIS2_EEPKjS9_NS0_7OutputsE
+    0 bytes stack frame, 0 bytes spill stores, 0 bytes spill loads
+ptxas info    : Used 56 registers, used 1 barriers, 18968 bytes smem
+ptxas info    : Compile time = 151.381 ms
+ptxas info    : Compiling entry function '_ZN5nvfp44dual20dual_quantize_kernelIfLi0ELb1EEEvPKT_NS0_6ParamsENS0_7ProArgsIS2_EEPKjS9_NS0_7OutputsE' for 'sm_120a'
+ptxas info    : Function properties for _ZN5nvfp44dual20dual_quantize_kernelIfLi0ELb1EEEvPKT_NS0_6ParamsENS0_7ProArgsIS2_EEPKjS9_NS0_7OutputsE
+    0 bytes stack frame, 0 bytes spill stores, 0 bytes spill loads
+ptxas info    : Used 89 registers, used 1 barriers, 18968 bytes smem
+ptxas info    : Compile time = 163.204 ms
+ptxas info    : Compiling entry function '_ZN5nvfp44dual16amax_flat_kernelIfEEvPKT_lPj' for 'sm_120a'
+ptxas info    : Function properties for _ZN5nvfp44dual16amax_flat_kernelIfEEvPKT_lPj
+    0 bytes stack frame, 0 bytes spill stores, 0 bytes spill loads
+ptxas info    : Used 38 registers, used 1 barriers, 32 bytes smem
+ptxas info    : Compile time = 11.186 ms
+ptxas info    : Compiling entry function '_ZN5nvfp44dual16amax_tile_kernelIfLi0ELb0EEEvPKT_NS0_6ParamsENS0_7ProArgsIS2_EEPj' for 'sm_120a'
+ptxas info    : Function properties for _ZN5nvfp44dual16amax_tile_kernelIfLi0ELb0EEEvPKT_NS0_6ParamsENS0_7ProArgsIS2_EEPj
+    0 bytes stack frame, 0 bytes spill stores, 0 bytes spill loads
+ptxas info    : Used 48 registers, used 1 barriers, 16680 bytes smem
+ptxas info    : Compile time = 43.789 ms
+ptxas info    : Compiling entry function '_ZN5nvfp44dual16amax_tile_kernelIfLi0ELb1EEEvPKT_NS0_6ParamsENS0_7ProArgsIS2_EEPj' for 'sm_120a'
+ptxas info    : Function properties for _ZN5nvfp44dual16amax_tile_kernelIfLi0ELb1EEEvPKT_NS0_6ParamsENS0_7ProArgsIS2_EEPj
+    0 bytes stack frame, 0 bytes spill stores, 0 bytes spill loads
+ptxas info    : Used 80 registers, used 1 barriers, 16688 bytes smem
+ptxas info    : Compile time = 80.933 ms
+ptxas info    : Compiling entry function '_ZN5nvfp44dual20dual_quantize_kernelI13__nv_bfloat16Li0ELb0EEEvPKT_NS0_6ParamsENS0_7ProArgsIS3_EEPKjSA_NS0_7OutputsE' for 'sm_120a'
+ptxas info    : Function properties for _ZN5nvfp44dual20dual_quantize_kernelI13__nv_bfloat16Li0ELb0EEEvPKT_NS0_6ParamsENS0_7ProArgsIS3_EEPKjSA_NS0_7OutputsE
+    0 bytes stack frame, 0 bytes spill stores, 0 bytes spill loads
+ptxas info    : Used 54 registers, used 1 barriers, 18968 bytes smem
+ptxas info    : Compile time = 151.799 ms
+ptxas info    : Compiling entry function '_ZN5nvfp44dual20dual_quantize_kernelI13__nv_bfloat16Li0ELb1EEEvPKT_NS0_6ParamsENS0_7ProArgsIS3_EEPKjSA_NS0_7OutputsE' for 'sm_120a'
+ptxas info    : Function properties for _ZN5nvfp44dual20dual_quantize_kernelI13__nv_bfloat16Li0ELb1EEEvPKT_NS0_6ParamsENS0_7ProArgsIS3_EEPKjSA_NS0_7OutputsE
+    0 bytes stack frame, 0 bytes spill stores, 0 bytes spill loads
+ptxas info    : Used 89 registers, used 1 barriers, 18968 bytes smem
+ptxas info    : Compile time = 168.094 ms
+ptxas info    : Compiling entry function '_ZN5nvfp44dual16amax_flat_kernelI13__nv_bfloat16EEvPKT_lPj' for 'sm_120a'
+ptxas info    : Function properties for _ZN5nvfp44dual16amax_flat_kernelI13__nv_bfloat16EEvPKT_lPj
+    0 bytes stack frame, 0 bytes spill stores, 0 bytes spill loads
+ptxas info    : Used 30 registers, used 1 barriers, 32 bytes smem
+ptxas info    : Compile time = 11.548 ms
+ptxas info    : Compiling entry function '_ZN5nvfp44dual16amax_tile_kernelI13__nv_bfloat16Li0ELb0EEEvPKT_NS0_6ParamsENS0_7ProArgsIS3_EEPj' for 'sm_120a'
+ptxas info    : Function properties for _ZN5nvfp44dual16amax_tile_kernelI13__nv_bfloat16Li0ELb0EEEvPKT_NS0_6ParamsENS0_7ProArgsIS3_EEPj
+    0 bytes stack frame, 0 bytes spill stores, 0 bytes spill loads
+ptxas info    : Used 48 registers, used 1 barriers, 16680 bytes smem
+ptxas info    : Compile time = 43.385 ms
+ptxas info    : Compiling entry function '_ZN5nvfp44dual16amax_tile_kernelI13__nv_bfloat16Li0ELb1EEEvPKT_NS0_6ParamsENS0_7ProArgsIS3_EEPj' for 'sm_120a'
+ptxas info    : Function properties for _ZN5nvfp44dual16amax_tile_kernelI13__nv_bfloat16Li0ELb1EEEvPKT_NS0_6ParamsENS0_7ProArgsIS3_EEPj
+    0 bytes stack frame, 0 bytes spill stores, 0 bytes spill loads
+ptxas info    : Used 80 registers, used 1 barriers, 16688 bytes smem
+ptxas info    : Compile time = 78.827 ms
+creating build/lib.linux-x86_64-3.10
+creating build/lib.linux-x86_64-3.10/nvfp4
+x86_64-linux-gnu-g++ -shared -Wl,-O1 -Wl,-Bsymbolic-functions -Wl,-Bsymbolic-functions -g -fwrapv -O2 -Wl,-Bsymbolic-functions -g -fwrapv -O2 -g -fstack-protector-strong -Wformat -Werror=format-security -Wdate-time -D_FORTIFY_SOURCE=2 /workspace/nvfp4-train-sm120/build/temp.linux-x86_64-3.10/csrc/attention.o /workspace/nvfp4-train-sm120/build/temp.linux-x86_64-3.10/csrc/bindings.o /workspace/nvfp4-train-sm120/build/temp.linux-x86_64-3.10/csrc/gemm.o /workspace/nvfp4-train-sm120/build/temp.linux-x86_64-3.10/csrc/gemm_tma.o /workspace/nvfp4-train-sm120/build/temp.linux-x86_64-3.10/csrc/norm.o /workspace/nvfp4-train-sm120/build/temp.linux-x86_64-3.10/csrc/quantize.o /workspace/nvfp4-train-sm120/build/temp.linux-x86_64-3.10/csrc/quantize_dual.o -L/workspace/venv/lib/python3.10/site-packages/torch/lib -L/usr/local/cuda/lib64 -lc10 -ltorch -ltorch_cpu -ltorch_python -lcudart -lc10_cuda -ltorch_cuda -o build/lib.linux-x86_64-3.10/nvfp4/_C.cpython-310-x86_64-linux-gnu.so
+copying build/lib.linux-x86_64-3.10/nvfp4/_C.cpython-310-x86_64-linux-gnu.so -> nvfp4
+[guard] elapsed 78s | peak GPU temp 30C, power 36W, GPU mem 4MB | min host mem avail 225564MB | cooldown 0s

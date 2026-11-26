@@ -10,6 +10,9 @@ std::vector<torch::Tensor> nvfp4_quantize_dual(torch::Tensor x, bool do_row, boo
                                                const OptTensor& row_seed_t, const OptTensor& col_seed_t, const OptTensor& rht_seed_t,
                                                const OptTensor& amax_floor);
 torch::Tensor nvfp4_dequantize(torch::Tensor data, torch::Tensor scales, torch::Tensor gdec, at::ScalarType out_dtype);
+torch::Tensor nvfp4_combine_fwd(torch::Tensor rows, torch::Tensor pos, c10::optional<torch::Tensor> w);
+torch::Tensor nvfp4_combine_bwd_rows(torch::Tensor g, torch::Tensor inv, c10::optional<torch::Tensor> w, int64_t k);
+torch::Tensor nvfp4_combine_bwd_w(torch::Tensor g, torch::Tensor rows, torch::Tensor pos);
 std::vector<torch::Tensor> nvfp4_quantize_dual_parts(std::vector<torch::Tensor> parts, bool do_row, bool do_col,
                                                      bool row_sr, int64_t row_seed, bool col_sr, int64_t col_seed,
                                                      bool col_rht, int64_t rht_seed, int64_t col_pad,
@@ -94,6 +97,12 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
         py::arg("row_sr") = false, py::arg("row_seed") = 0, py::arg("col_sr") = false, py::arg("col_seed") = 0,
         py::arg("col_rht") = false, py::arg("rht_seed") = 0, py::arg("col_pad") = 16, py::arg("row_seed_t") = py::none(), py::arg("col_seed_t") = py::none(),
         py::arg("rht_seed_t") = py::none(), py::arg("amax_floor") = py::none());
+  m.def("combine_fwd", &nvfp4_combine_fwd, "out[r] = sum_j w[r, j] rows[pos[r, j]] (MoE combine)", py::arg("rows"),
+        py::arg("pos"), py::arg("w") = py::none());
+  m.def("combine_bwd_rows", &nvfp4_combine_bwd_rows, "MoE combine backward: the rows' gradient by gather", py::arg("g"),
+        py::arg("inv"), py::arg("w") = py::none(), py::arg("k") = 1);
+  m.def("combine_bwd_w", &nvfp4_combine_bwd_w, "MoE combine backward: the weights' gradient", py::arg("g"),
+        py::arg("rows"), py::arg("pos"));
   m.def("dequantize", &nvfp4_dequantize, "NVFP4 rows -> bf16 / fp32 (reference.dequantize)", py::arg("data"),
         py::arg("scales"), py::arg("gdec"), py::arg("out_dtype"));
   m.def("quantize_dual_parts", &nvfp4_quantize_dual_parts,
