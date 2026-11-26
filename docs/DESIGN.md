@@ -515,6 +515,33 @@ double-buffered; what cuBLASLt gains at locked clocks comes from instruction sch
 larger tile. At real clocks the gap does not exist: the kernel is ahead of cuBLASLt on every
 benchmarked shape on the desktop RTX 5090 (RESULTS.md §6).
 
+**Dynamic tile claiming (v0.18, `ops.set_dynamic_tiles`, `MoE.ep_dynamic_tiles`).** With the fixed
+assignment (CTA c runs units c, c + grid, …) a persistent GEMM launched while another kernel holds k SMs
+(NCCL's all-to-all CTAs during overlapped expert parallelism) leaves k of its CTAs waiting until some CTA
+has finished its *whole* share: their units run as a second wave and the GEMM takes ~1.75× as long, for
+any k from 2 to 16 of 82 SMs (`bench/bench_residency.py` on an RTX PRO 4500: a spin kernel of k CTAs with
+64 KB of shared memory each, so no GEMM CTA fits beside one). That is the 1.7× seen beside NCCL in v0.17,
+and why an SM margin smaller than NCCL's grid did not help. With claiming, CTA c starts on unit c and then
+takes the next unit from a global counter as it needs one: CTAs that start late find the work taken, and
+the GEMM takes SMs / (SMs − k) as long (0.99–1.11×). The claims go through a shared-memory ring of 32
+{sequence, unit} slots per CTA: the first warp whose cursor needs the CTA's n-th unit claims it (a
+shared-memory CAS elects it, then one global atomic) and publishes it; the other warps' cursor copies and
+the consumers read it there, so the per-warp cursors of §4.2 still agree without sharing state. Units
+without k-tiles (unused tiles of grouped GEMMs) are never claimed; each CTA stores its share of those zero
+tiles after its claimed units, which bounds the cursors' lead over the consumers (at most
+STAGES + 2 · QUAD k-tiles) and so the ring. One {claims, exits} pair per stream (launches on a stream run in
+order; the last CTA to exit resets it); launches being captured into CUDA graphs keep the fixed assignment.
+Results are bit-identical either way. Alone it costs 0–4% on dense GEMMs and ~6% on grouped ones (the
+global atomic's round trip stalls the claiming warp once per unit; claiming one unit ahead from thread 0
+was slower, 7–14%, as the pending value lives in the cursor structure, which the compiler keeps in local
+memory, and a non-inlined claim spilled the accumulators, 8–16%), so it is off by default and the MoE layer
+turns it on only around forwards and backwards whose GEMMs overlap exchanges (`ep_dynamic_tiles="auto"`:
+chunks, or the shared expert during the exchange): identity autograd nodes on the layer's output and input
+switch it on and back when the layer's backward starts and ends. compute-sanitizer's racecheck cannot run
+it (its serialized execution of a block makes the threads waiting for a claim spin almost indefinitely);
+memcheck, synccheck and initcheck pass. On WSL2 the laptop showed no residency effect to fix: any kernel on
+a second stream, a memory copy included, slowed by ~3× (WDDM time-slices the streams).
+
 ### 4.3 Split-K for small output grids
 
 A wgrad GEMM with a small M×N, such as the 768×768 attention projection at d=768 (36 CTA tiles on 82

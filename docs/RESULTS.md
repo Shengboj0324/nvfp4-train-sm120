@@ -752,6 +752,25 @@ not be re-quantized away as for the dispatched activations), and a 1.94× smalle
 bytes per 256 values) is what the return direction needs, not 3.5×. One process adds the encode / decode
 without the transfer they save: 929 vs 886 s for 3000 steps.
 
+### 8.6 The GEMMs beside NCCL: SM residency (v0.18, `experiments/results/v0.18_residency_pro4500/`)
+
+v0.17 found the expert GEMMs ~1.7× slower while all-to-alls ran beside them. `bench/bench_residency.py`
+reproduces that without NCCL: the persistent NVFP4 GEMM (16384 × 2816 × 2048) on one RTX PRO 4500 while a
+spin kernel holds k SMs (one 64 KB-shared-memory CTA each, so no GEMM CTA fits beside it), milliseconds per
+GEMM and the slowdown against the GEMM alone:
+
+| tiles | alone | k = 2 | k = 4 | k = 8 | k = 16 |
+|---|---|---|---|---|---|
+| fixed assignment (v0.17) | 0.428 | 0.751 (1.76×) | 0.751 (1.76×) | 0.745 (1.74×) | 0.734 (1.72×) |
+| dynamic claiming (`ops.set_dynamic_tiles`) | 0.444 | 0.438 (0.99×) | 0.445 (1.00×) | 0.461 (1.04×) | 0.494 (1.11×) |
+
+The slowdown does not grow with k: the k CTAs that cannot start run their whole share of the tiles after
+the others finish (a second wave), whatever k is, so an SM margin only helps once it is at least NCCL's
+grid. With claiming the resident CTAs take that work and the GEMM runs at SMs / (SMs − k). Alone,
+claiming costs 3.7% here (0–4% dense and ~6% grouped on the laptop), so the MoE layer enables it only around
+the GEMMs that overlap exchanges (`ep_dynamic_tiles="auto"`). (The k = 1 runs are left out: the spin kernel
+had not loaded before the first one; the benchmark now warms it up.)
+
 ## 9. RTX PRO 4500 Blackwell (v0.17, `experiments/results/v0.17_ep_4xpro4500/nvfp4_results2/`)
 
 The first sm_120 part besides the RTX 5090s: 82 SMs (the 5090 Laptop also has 82, at a 175 W limit), 200 W,
