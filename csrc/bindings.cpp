@@ -13,6 +13,8 @@ torch::Tensor nvfp4_dequantize(torch::Tensor data, torch::Tensor scales, torch::
 torch::Tensor nvfp4_combine_fwd(torch::Tensor rows, torch::Tensor pos, c10::optional<torch::Tensor> w);
 torch::Tensor nvfp4_combine_bwd_rows(torch::Tensor g, torch::Tensor inv, c10::optional<torch::Tensor> w, int64_t k);
 torch::Tensor nvfp4_combine_bwd_w(torch::Tensor g, torch::Tensor rows, torch::Tensor pos);
+torch::Tensor nvfp4_mxfp8_encode(torch::Tensor x, c10::optional<torch::Tensor> seed);
+torch::Tensor nvfp4_mxfp8_decode(torch::Tensor buf, int64_t d, at::ScalarType out_dtype);
 std::vector<torch::Tensor> nvfp4_quantize_dual_parts(std::vector<torch::Tensor> parts, bool do_row, bool do_col,
                                                      bool row_sr, int64_t row_seed, bool col_sr, int64_t col_seed,
                                                      bool col_rht, int64_t rht_seed, int64_t col_pad,
@@ -103,6 +105,10 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
         py::arg("inv"), py::arg("w") = py::none(), py::arg("k") = 1);
   m.def("combine_bwd_w", &nvfp4_combine_bwd_w, "MoE combine backward: the weights' gradient", py::arg("g"),
         py::arg("rows"), py::arg("pos"));
+  m.def("mxfp8_encode", &nvfp4_mxfp8_encode, "rows -> MXFP8 message rows (e4m3 + exponent per 32)", py::arg("x"),
+        py::arg("seed") = py::none());
+  m.def("mxfp8_decode", &nvfp4_mxfp8_decode, "MXFP8 message rows -> [R, d]", py::arg("buf"), py::arg("d"),
+        py::arg("out_dtype"));
   m.def("dequantize", &nvfp4_dequantize, "NVFP4 rows -> bf16 / fp32 (reference.dequantize)", py::arg("data"),
         py::arg("scales"), py::arg("gdec"), py::arg("out_dtype"));
   m.def("quantize_dual_parts", &nvfp4_quantize_dual_parts,

@@ -99,14 +99,23 @@ def main():
                              ("ep wire nvfp4+grad chunks 2", {}, {"ep_wire": "nvfp4", "ep_wire_grad": "nvfp4",
                                                                   "ep_chunks": 2}),
                              ("ep wire nvfp4 chunks 2 margin 8", {}, {"ep_wire": "nvfp4", "ep_chunks": 2, **m8}),
-                             ("ep wire nvfp4 chunks 4 margin 8", {}, {"ep_wire": "nvfp4", "ep_chunks": 4, **m8})]
+                             ("ep wire nvfp4 chunks 4 margin 8", {}, {"ep_wire": "nvfp4", "ep_chunks": 4, **m8}),
+                             ("ep wire nvfp4 + fp8 return", {}, {"ep_wire": "nvfp4", "ep_wire_return": "fp8"}),
+                             ("ep wire nvfp4 + fp8 return chunks 2", {}, {"ep_wire": "nvfp4", "ep_wire_return": "fp8",
+                                                                         "ep_chunks": 2})]
+            else:
+                variants.append(("ep fp8 return", {}, {"ep_wire_return": "fp8"}))
             if a.node_size > 1:
                 L = a.node_size
                 variants += [(f"ep nodes {L}", {"ep_node_size": L}, {}),
-                             (f"ep nodes {L} chunks 2 margin 8", {"ep_node_size": L}, {"ep_chunks": 2, **m8})]
+                             (f"ep nodes {L} chunks 2", {"ep_node_size": L}, {"ep_chunks": 2, "ep_serial": False}),
+                             (f"ep nodes {L} chunks 2 serial", {"ep_node_size": L}, {"ep_chunks": 2, "ep_serial": True}),
+                             (f"ep nodes {L} chunks 4 serial", {"ep_node_size": L}, {"ep_chunks": 4, "ep_serial": True}),
+                             (f"ep nodes {L} fp8 return", {"ep_node_size": L}, {"ep_wire_return": "fp8"})]
                 if prec == "nvfp4":
-                    variants.append((f"ep nodes {L} wire nvfp4 chunks 2 margin 8", {"ep_node_size": L},
-                                     {"ep_wire": "nvfp4", "ep_chunks": 2, **m8}))
+                    variants += [(f"ep nodes {L} wire nvfp4", {"ep_node_size": L}, {"ep_wire": "nvfp4"}),
+                                 (f"ep nodes {L} wire nvfp4 + fp8 return chunks 2 serial", {"ep_node_size": L},
+                                  {"ep_wire": "nvfp4", "ep_wire_return": "fp8", "ep_chunks": 2, "ep_serial": True})]
             for name, ctor, attrs in variants:
                 m = make(ep_group=dist.group.WORLD, **ctor)
                 attrs = dict(attrs)

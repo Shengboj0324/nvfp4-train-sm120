@@ -14,9 +14,12 @@
 #include <c10/cuda/CUDAGuard.h>
 #include <cuda_bf16.h>
 #include <cuda_fp16.h>
+#include <cuda_fp8.h>
 #include <torch/extension.h>
 
 #include <type_traits>
+
+#include "nvfp4_common.cuh"
 
 namespace nvfp4 {
 namespace combine {
@@ -147,6 +150,69 @@ const float* w_ptr(const c10::optional<torch::Tensor>& w, int64_t R, int64_t k, 
   return w->data_ptr<float>();
 }
 
+
+// --- MXFP8 message rows (expert-parallel return direction) ------------------------------------------------------
+// [R, d] -> uint8 [R, d + d / 32]: e4m3 codes, then per 32 values a biased exponent e + 127 of the scale 2^e,
+// the smallest power of two with amax / 2^e <= 448. Round to nearest, or (seed) stochastically: the scaled
+// value's fp32 bits get 20 random bits added below e4m3's 3 mantissa bits and are truncated (values under the
+// smallest normal, 2^-6, are lifted by 2^-6 first, where the spacing equals the subnormal one).
+template <typename T>
+__global__ void __launch_bounds__(256) mxfp8_encode_kernel(const T* __restrict__ x, int64_t ld_x,
+                                                           uint8_t* __restrict__ out, int64_t ld_out, int64_t R,
+                                                           int64_t d, const int64_t* __restrict__ seed) {
+  const int64_t nb = d / 32;
+  const int64_t i = static_cast<int64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+  if (i >= R * nb) return;
+  const int64_t r = i / nb, b = i - r * nb;
+  const T* src = x + r * ld_x + b * 32;
+  float v[32];
+  float amax = 0.0f;
+#pragma unroll
+  for (int j = 0; j < 32; ++j) {
+    v[j] = to_f(src[j]);
+    amax = fmaxf(amax, fabsf(v[j]));
+  }
+  int e = -127;
+  if (amax > 0.0f) {
+    int ea;
+    const float m = frexpf(amax, &ea);  // amax = m 2^ea, m in [0.5, 1); 448 = 0.875 2^9
+    e = m <= 0.875f ? ea - 9 : ea - 8;
+    e = e < -127 ? -127 : (e > 127 ? 127 : e);
+  }
+  const float inv = ldexpf(1.0f, -e);
+  uint32_t key = 0;
+  if (seed) key = nvfp4::sr_key(static_cast<uint64_t>(*seed));
+  uint8_t* dst = out + r * ld_out + b * 32;
+#pragma unroll
+  for (int j = 0; j < 32; ++j) {
+    float y = v[j] * inv;
+    if (seed) {
+      const float a = fabsf(y);
+      const float off = a < 0x1p-6f ? 0x1p-6f : 0.0f;
+      const uint32_t rnd = nvfp4::hash_u32(static_cast<uint32_t>(r * d + b * 32 + j) + key) & 0xFFFFFu;
+      const uint32_t bits = (__float_as_uint(__fadd_rn(a, off)) + rnd) & ~0xFFFFFu;
+      const float q = __fsub_rn(__uint_as_float(bits), off);
+      y = __uint_as_float(__float_as_uint(q) | (__float_as_uint(y) & 0x80000000u));
+    }
+    dst[j] = static_cast<uint8_t>(__nv_cvt_float_to_fp8(y, __NV_SATFINITE, __NV_E4M3));
+  }
+  out[r * ld_out + d + b] = static_cast<uint8_t>(e + 127);
+}
+
+template <typename OutT>
+__global__ void __launch_bounds__(256) mxfp8_decode_kernel(const uint8_t* __restrict__ buf, int64_t ld,
+                                                           OutT* __restrict__ out, int64_t R, int64_t d) {
+  const int64_t nb = d / 32;
+  const int64_t i = static_cast<int64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+  if (i >= R * nb) return;
+  const int64_t r = i / nb, b = i - r * nb;
+  const float s = ldexpf(1.0f, static_cast<int>(buf[r * ld + d + b]) - 127);
+  const uint8_t* src = buf + r * ld + b * 32;
+  OutT* dst = out + r * d + b * 32;
+#pragma unroll
+  for (int j = 0; j < 32; ++j) dst[j] = from_f<OutT>(__fmul_rn(nvfp4::e4m3_to_float(src[j]), s));
+}
+
 #define NVFP4_COMBINE_DISPATCH(ST, ...)                                         \
   switch (ST) {                                                                \
     case at::kBFloat16: { using T = __nv_bfloat16; __VA_ARGS__; break; }       \
@@ -241,4 +307,49 @@ torch::Tensor nvfp4_combine_bwd_w(torch::Tensor g, torch::Tensor rows, torch::Te
   });
   C10_CUDA_KERNEL_LAUNCH_CHECK();
   return dw;
+}
+
+
+torch::Tensor nvfp4_mxfp8_encode(torch::Tensor x, OptT seed) {
+  using namespace nvfp4::combine;
+  check_2d(x, "x");
+  const int64_t R = x.size(0), d = x.size(1);
+  TORCH_CHECK(d % 32 == 0, "MXFP8 rows need a multiple of 32 columns");
+  const int64_t* sp = nullptr;
+  if (seed.has_value() && seed->defined()) {
+    TORCH_CHECK(seed->is_cuda() && seed->scalar_type() == at::kLong && seed->numel() == 1, "seed: one int64 on the GPU");
+    sp = seed->data_ptr<int64_t>();
+  }
+  const c10::cuda::CUDAGuard guard(x.device());
+  auto out = torch::empty({R, d + d / 32}, x.options().dtype(at::kByte));
+  if (R == 0 || d == 0) return out;
+  const int64_t n = R * (d / 32);
+  const int grid = static_cast<int>((n + 255) / 256);
+  auto stream = at::cuda::getCurrentCUDAStream();
+  NVFP4_COMBINE_DISPATCH(x.scalar_type(), {
+    mxfp8_encode_kernel<T><<<grid, 256, 0, stream>>>(reinterpret_cast<const T*>(x.data_ptr()), x.stride(0),
+                                                    out.data_ptr<uint8_t>(), out.stride(0), R, d, sp);
+  });
+  C10_CUDA_KERNEL_LAUNCH_CHECK();
+  return out;
+}
+
+torch::Tensor nvfp4_mxfp8_decode(torch::Tensor buf, int64_t d, at::ScalarType out_dtype) {
+  using namespace nvfp4::combine;
+  TORCH_CHECK(buf.is_cuda() && buf.dim() == 2 && buf.scalar_type() == at::kByte && buf.stride(1) == 1 &&
+                  buf.size(1) >= d + d / 32 && d % 32 == 0, "buf must hold uint8 [R, >= d + d / 32] MXFP8 rows");
+  TORCH_CHECK(out_dtype == at::kBFloat16 || out_dtype == at::kFloat || out_dtype == at::kHalf, "bad out_dtype");
+  const c10::cuda::CUDAGuard guard(buf.device());
+  const int64_t R = buf.size(0);
+  auto out = torch::empty({R, d}, buf.options().dtype(out_dtype));
+  if (R == 0 || d == 0) return out;
+  const int64_t n = R * (d / 32);
+  const int grid = static_cast<int>((n + 255) / 256);
+  auto stream = at::cuda::getCurrentCUDAStream();
+  NVFP4_COMBINE_DISPATCH(out_dtype, {
+    mxfp8_decode_kernel<T><<<grid, 256, 0, stream>>>(buf.data_ptr<uint8_t>(), buf.stride(0),
+                                                    reinterpret_cast<T*>(out.data_ptr()), R, d);
+  });
+  C10_CUDA_KERNEL_LAUNCH_CHECK();
+  return out;
 }

@@ -13,7 +13,8 @@
 #   gpt     GPT-124M, 3000 steps: BF16 and NVFP4 on one GPU, NVFP4 with DDP over all GPUs (NCCL)
 #   ep      MoE expert parallelism over all GPUs (NCCL): the MoE tests, bench/bench_moe_ep.py (two GPUs; with
 #           four, also all four with two-stage exchanges over pairs of GPUs), bench_moe.py
-#   eprof   bench/profile_moe_ep.py on two GPUs (and four): where an expert-parallel step's time goes
+#   eprof   bench/profile_moe_ep.py on two GPUs (and four, with nodes of two): where an expert-parallel step's time goes
+#   overlap bench/bench_overlap.py: a GEMM beside an all-to-all (SM margins; NCCL_MAX_NCHANNELS unset / 4 / 8)
 #   moegpt  MoE GPT (8 experts, top-2) over all GPUs: experts replicated (DDP) vs expert parallelism (plain;
 #           chunked with NVFP4 messages; with four GPUs, nodes of two), tokens/s and loss
 # Everything ends up in $OUT (default /workspace/nvfp4_results) and $OUT.tar.gz.
@@ -208,9 +209,27 @@ do_eprof() {
   CUDA_VISIBLE_DEVICES=0,1 python tools/guard.py --log "$OUT/eprof2.csv" -- torchrun --standalone --nproc_per_node 2     bench/profile_moe_ep.py --out "$OUT/profile_ep2" > "$OUT/eprof2.log" 2>&1 || st=1
   grep -v "guard] sample" "$OUT/eprof2.log" | tail -12
   if [ "$ngpu" -ge 4 ]; then
-    CUDA_VISIBLE_DEVICES=0,1,2,3 python tools/guard.py --log "$OUT/eprof4.csv" -- torchrun --standalone       --nproc_per_node 4 bench/profile_moe_ep.py --out "$OUT/profile_ep4" > "$OUT/eprof4.log" 2>&1 || st=1
+    CUDA_VISIBLE_DEVICES=0,1,2,3 python tools/guard.py --log "$OUT/eprof4.csv" -- torchrun --standalone       --nproc_per_node 4 bench/profile_moe_ep.py --node-size 2 --out "$OUT/profile_ep4" > "$OUT/eprof4.log" 2>&1 || st=1
     grep -v "guard] sample" "$OUT/eprof4.log" | tail -12
   fi
+  return $st
+}
+
+do_overlap() {
+  cd "$REPO" || return 1
+  export PYTHONPATH=$REPO
+  local st=0 ngpu w ch
+  ngpu=$(nvidia-smi -L | wc -l)
+  for w in 2 4; do
+    [ "$ngpu" -ge "$w" ] || continue
+    for ch in "" 4 8; do
+      local tag="w${w}_ch${ch:-default}"
+      env ${ch:+NCCL_MAX_NCHANNELS=$ch} CUDA_VISIBLE_DEVICES=$(seq -s, 0 $((w - 1))) python tools/guard.py \
+        --log "$OUT/overlap_$tag.csv" -- torchrun --standalone --nproc_per_node "$w" bench/bench_overlap.py \
+        --out "$OUT/overlap_$tag.json" > "$OUT/overlap_$tag.log" 2>&1 || st=1
+      echo "$tag: $(grep 'nvfp4 GEMM' "$OUT/overlap_$tag.log")"
+    done
+  done
   return $st
 }
 
@@ -253,6 +272,7 @@ for p in $PHASES; do
     gpt) phase gpt do_gpt ;;
     ep) phase ep do_ep ;;
     eprof) phase eprof do_eprof ;;
+    overlap) phase overlap do_overlap ;;
     moegpt) phase moegpt do_moegpt ;;
   esac
 done
