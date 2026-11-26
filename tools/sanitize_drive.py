@@ -161,5 +161,21 @@ for act, bias, fp4, cf, sh in (("swiglu", False, True, None, 0), ("gelu_tanh", F
     with torch.autocast("cuda", dtype=torch.bfloat16):
         ym = moe(xm)
     (ym.float().square().mean() + moe.aux_loss).backward()
+# v0.17: the tensor-amax floor (plain and multi-part paths), dequantization of strided message rows with per-row
+# tensor scales, persistent GEMMs with an SM margin
+for R in (0, 1, 37, 130):
+    xb = torch.randn(R, 256, device=d, dtype=torch.bfloat16)
+    fl = torch.full((1,), 7.0, device=d)
+    q, _ = ops.quantize_dual(xb, col=False, row_sr_seed=1, amax_floor=fl)
+    ops.quantize_dual(xb, rht_seed=3, col_pad=128, amax_floor=fl)
+    ops.quantize_dual(xb, bias_grad=True, row_sr_seed=1, col_sr_seed=2, rht_seed=3, col_pad=128, amax_floor=fl)
+    msg = torch.cat([q.data, q.scales, q.gdec.view(1, 1).expand(R, 1).contiguous().view(torch.uint8)], 1)
+    for dt in (torch.bfloat16, torch.float32):
+        ops.dequantize(msg[:, :128], msg[:, 128:144], msg[:, 144:148].view(torch.float32)[:, 0], dt)
+        ops.dequantize(q.data, q.scales, q.gdec, dt)
+ops.set_sm_margin(40)
+qa, _ = ops.quantize_dual(torch.randn(384, 512, device=d), col=False)
+ops.gemm(qa, qa, impl="tma")
+ops.set_sm_margin(0)
 torch.cuda.synchronize()
 print("DRIVE_OK")
