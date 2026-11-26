@@ -156,22 +156,45 @@ const float* w_ptr(const c10::optional<torch::Tensor>& w, int64_t R, int64_t k, 
 // the smallest power of two with amax / 2^e <= 448. Round to nearest, or (seed) stochastically: the scaled
 // value's fp32 bits get 20 random bits added below e4m3's 3 mantissa bits and are truncated (values under the
 // smallest normal, 2^-6, are lifted by 2^-6 first, where the spacing equals the subnormal one).
-template <typename T>
+// Four threads per 32-value block, eight contiguous values each (one or two 16-byte loads when aligned, VEC),
+// the block's amax combined with two shuffles: consecutive threads touch consecutive bytes (one thread per
+// block with 64-byte strides ran at ~1/10 of the bandwidth). Results are those of the per-block definition.
+template <typename T, bool VEC>
 __global__ void __launch_bounds__(256) mxfp8_encode_kernel(const T* __restrict__ x, int64_t ld_x,
                                                            uint8_t* __restrict__ out, int64_t ld_out, int64_t R,
                                                            int64_t d, const int64_t* __restrict__ seed) {
   const int64_t nb = d / 32;
-  const int64_t i = static_cast<int64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
-  if (i >= R * nb) return;
-  const int64_t r = i / nb, b = i - r * nb;
-  const T* src = x + r * ld_x + b * 32;
-  float v[32];
+  const int64_t t = static_cast<int64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+  const int64_t i = t >> 2;  // the 32-value block
+  const int q = static_cast<int>(t & 3);
+  const bool ok = i < R * nb;
+  const int64_t r = ok ? i / nb : 0, b = ok ? i - r * nb : 0;
+  float v[8];
+  const T* src = x + r * ld_x + b * 32 + q * 8;
+  if (ok) {
+    if constexpr (VEC) {
+      constexpr int PER = 16 / sizeof(T);  // values per 16-byte load
+#pragma unroll
+      for (int h = 0; h < 8 / PER; ++h) {
+        const uint4 u = *reinterpret_cast<const uint4*>(src + h * PER);
+        const T* e = reinterpret_cast<const T*>(&u);
+#pragma unroll
+        for (int j = 0; j < PER; ++j) v[h * PER + j] = to_f(e[j]);
+      }
+    } else {
+#pragma unroll
+      for (int j = 0; j < 8; ++j) v[j] = to_f(src[j]);
+    }
+  } else {
+#pragma unroll
+    for (int j = 0; j < 8; ++j) v[j] = 0.0f;
+  }
   float amax = 0.0f;
 #pragma unroll
-  for (int j = 0; j < 32; ++j) {
-    v[j] = to_f(src[j]);
-    amax = fmaxf(amax, fabsf(v[j]));
-  }
+  for (int j = 0; j < 8; ++j) amax = fmaxf(amax, fabsf(v[j]));
+  amax = fmaxf(amax, __shfl_xor_sync(0xffffffffu, amax, 1));
+  amax = fmaxf(amax, __shfl_xor_sync(0xffffffffu, amax, 2));
+  if (!ok) return;
   int e = -127;
   if (amax > 0.0f) {
     int ea;
@@ -182,35 +205,63 @@ __global__ void __launch_bounds__(256) mxfp8_encode_kernel(const T* __restrict__
   const float inv = ldexpf(1.0f, -e);
   uint32_t key = 0;
   if (seed) key = nvfp4::sr_key(static_cast<uint64_t>(*seed));
-  uint8_t* dst = out + r * ld_out + b * 32;
+  uint32_t w[2] = {0u, 0u};
 #pragma unroll
-  for (int j = 0; j < 32; ++j) {
+  for (int j = 0; j < 8; ++j) {
     float y = v[j] * inv;
     if (seed) {
       const float a = fabsf(y);
       const float off = a < 0x1p-6f ? 0x1p-6f : 0.0f;
-      const uint32_t rnd = nvfp4::hash_u32(static_cast<uint32_t>(r * d + b * 32 + j) + key) & 0xFFFFFu;
+      const uint32_t rnd = nvfp4::hash_u32(static_cast<uint32_t>(r * d + b * 32 + q * 8 + j) + key) & 0xFFFFFu;
       const uint32_t bits = (__float_as_uint(__fadd_rn(a, off)) + rnd) & ~0xFFFFFu;
-      const float q = __fsub_rn(__uint_as_float(bits), off);
-      y = __uint_as_float(__float_as_uint(q) | (__float_as_uint(y) & 0x80000000u));
+      const float qv = __fsub_rn(__uint_as_float(bits), off);
+      y = __uint_as_float(__float_as_uint(qv) | (__float_as_uint(y) & 0x80000000u));
     }
-    dst[j] = static_cast<uint8_t>(__nv_cvt_float_to_fp8(y, __NV_SATFINITE, __NV_E4M3));
+    w[j >> 2] |= static_cast<uint32_t>(__nv_cvt_float_to_fp8(y, __NV_SATFINITE, __NV_E4M3)) << (8 * (j & 3));
   }
-  out[r * ld_out + d + b] = static_cast<uint8_t>(e + 127);
+  uint8_t* dst = out + r * ld_out + b * 32 + q * 8;
+  if constexpr (VEC) {
+    *reinterpret_cast<uint2*>(dst) = make_uint2(w[0], w[1]);
+  } else {
+#pragma unroll
+    for (int j = 0; j < 8; ++j) dst[j] = static_cast<uint8_t>(w[j >> 2] >> (8 * (j & 3)));
+  }
+  if (q == 0) out[r * ld_out + d + b] = static_cast<uint8_t>(e + 127);
 }
 
-template <typename OutT>
+template <typename OutT, bool VEC>
 __global__ void __launch_bounds__(256) mxfp8_decode_kernel(const uint8_t* __restrict__ buf, int64_t ld,
                                                            OutT* __restrict__ out, int64_t R, int64_t d) {
   const int64_t nb = d / 32;
-  const int64_t i = static_cast<int64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+  const int64_t t = static_cast<int64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+  const int64_t i = t >> 2;
+  const int q = static_cast<int>(t & 3);
   if (i >= R * nb) return;
   const int64_t r = i / nb, b = i - r * nb;
   const float s = ldexpf(1.0f, static_cast<int>(buf[r * ld + d + b]) - 127);
-  const uint8_t* src = buf + r * ld + b * 32;
-  OutT* dst = out + r * d + b * 32;
+  const uint8_t* src = buf + r * ld + b * 32 + q * 8;
+  uint32_t w[2];
+  if constexpr (VEC) {
+    const uint2 u = *reinterpret_cast<const uint2*>(src);
+    w[0] = u.x, w[1] = u.y;
+  } else {
+    w[0] = w[1] = 0u;
 #pragma unroll
-  for (int j = 0; j < 32; ++j) dst[j] = from_f<OutT>(__fmul_rn(nvfp4::e4m3_to_float(src[j]), s));
+    for (int j = 0; j < 8; ++j) w[j >> 2] |= static_cast<uint32_t>(src[j]) << (8 * (j & 3));
+  }
+  alignas(16) OutT y[8];
+#pragma unroll
+  for (int j = 0; j < 8; ++j)
+    y[j] = from_f<OutT>(__fmul_rn(nvfp4::e4m3_to_float(static_cast<uint8_t>(w[j >> 2] >> (8 * (j & 3)))), s));
+  OutT* dst = out + r * d + b * 32 + q * 8;
+  if constexpr (VEC) {
+    constexpr int PER = 16 / sizeof(OutT);
+#pragma unroll
+    for (int h = 0; h < 8 / PER; ++h) *reinterpret_cast<uint4*>(dst + h * PER) = *reinterpret_cast<const uint4*>(y + h * PER);
+  } else {
+#pragma unroll
+    for (int j = 0; j < 8; ++j) dst[j] = y[j];
+  }
 }
 
 #define NVFP4_COMBINE_DISPATCH(ST, ...)                                         \
@@ -323,12 +374,20 @@ torch::Tensor nvfp4_mxfp8_encode(torch::Tensor x, OptT seed) {
   const c10::cuda::CUDAGuard guard(x.device());
   auto out = torch::empty({R, d + d / 32}, x.options().dtype(at::kByte));
   if (R == 0 || d == 0) return out;
-  const int64_t n = R * (d / 32);
+  const int64_t n = R * (d / 32) * 4;  // four threads per block
   const int grid = static_cast<int>((n + 255) / 256);
   auto stream = at::cuda::getCurrentCUDAStream();
   NVFP4_COMBINE_DISPATCH(x.scalar_type(), {
-    mxfp8_encode_kernel<T><<<grid, 256, 0, stream>>>(reinterpret_cast<const T*>(x.data_ptr()), x.stride(0),
-                                                    out.data_ptr<uint8_t>(), out.stride(0), R, d, sp);
+    const T* xp = reinterpret_cast<const T*>(x.data_ptr());
+    // 16-byte input loads and 8-byte code stores: aligned base pointers and row strides
+    const bool vec = (reinterpret_cast<uintptr_t>(xp) % 16 == 0) && (x.stride(0) * sizeof(T)) % 16 == 0 &&
+                     (reinterpret_cast<uintptr_t>(out.data_ptr()) % 8 == 0) && out.stride(0) % 8 == 0;
+    if (vec)
+      mxfp8_encode_kernel<T, true><<<grid, 256, 0, stream>>>(xp, x.stride(0), out.data_ptr<uint8_t>(), out.stride(0), R,
+                                                            d, sp);
+    else
+      mxfp8_encode_kernel<T, false><<<grid, 256, 0, stream>>>(xp, x.stride(0), out.data_ptr<uint8_t>(), out.stride(0),
+                                                             R, d, sp);
   });
   C10_CUDA_KERNEL_LAUNCH_CHECK();
   return out;
@@ -343,12 +402,18 @@ torch::Tensor nvfp4_mxfp8_decode(torch::Tensor buf, int64_t d, at::ScalarType ou
   const int64_t R = buf.size(0);
   auto out = torch::empty({R, d}, buf.options().dtype(out_dtype));
   if (R == 0 || d == 0) return out;
-  const int64_t n = R * (d / 32);
+  const int64_t n = R * (d / 32) * 4;  // four threads per block
   const int grid = static_cast<int>((n + 255) / 256);
   auto stream = at::cuda::getCurrentCUDAStream();
+  // 8-byte code loads (the output is a fresh contiguous tensor: 16-byte stores need only d % 32 == 0)
+  const bool vec = reinterpret_cast<uintptr_t>(buf.data_ptr()) % 8 == 0 && buf.stride(0) % 8 == 0;
   NVFP4_COMBINE_DISPATCH(out_dtype, {
-    mxfp8_decode_kernel<T><<<grid, 256, 0, stream>>>(buf.data_ptr<uint8_t>(), buf.stride(0),
-                                                    reinterpret_cast<T*>(out.data_ptr()), R, d);
+    if (vec)
+      mxfp8_decode_kernel<T, true><<<grid, 256, 0, stream>>>(buf.data_ptr<uint8_t>(), buf.stride(0),
+                                                            reinterpret_cast<T*>(out.data_ptr()), R, d);
+    else
+      mxfp8_decode_kernel<T, false><<<grid, 256, 0, stream>>>(buf.data_ptr<uint8_t>(), buf.stride(0),
+                                                             reinterpret_cast<T*>(out.data_ptr()), R, d);
   });
   C10_CUDA_KERNEL_LAUNCH_CHECK();
   return out;
