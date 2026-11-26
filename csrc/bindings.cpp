@@ -13,6 +13,8 @@ torch::Tensor nvfp4_dequantize(torch::Tensor data, torch::Tensor scales, torch::
 torch::Tensor nvfp4_combine_fwd(torch::Tensor rows, torch::Tensor pos, c10::optional<torch::Tensor> w);
 torch::Tensor nvfp4_combine_bwd_rows(torch::Tensor g, torch::Tensor inv, c10::optional<torch::Tensor> w, int64_t k);
 torch::Tensor nvfp4_combine_bwd_w(torch::Tensor g, torch::Tensor rows, torch::Tensor pos);
+torch::Tensor nvfp4_mxfp8_encode(torch::Tensor x, c10::optional<torch::Tensor> seed);
+torch::Tensor nvfp4_mxfp8_decode(torch::Tensor buf, int64_t d, at::ScalarType out_dtype);
 std::vector<torch::Tensor> nvfp4_quantize_dual_parts(std::vector<torch::Tensor> parts, bool do_row, bool do_col,
                                                      bool row_sr, int64_t row_seed, bool col_sr, int64_t col_seed,
                                                      bool col_rht, int64_t rht_seed, int64_t col_pad,
@@ -67,7 +69,8 @@ torch::Tensor nvfp4_gemm(torch::Tensor a, torch::Tensor sfa, torch::Tensor gdec_
                          c10::optional<torch::Tensor> residual, bool bias_round);
 
 void nvfp4_set_four_six(bool on);
-namespace nvfp4 { namespace gemm { void set_sm_margin(int64_t n); int64_t sm_margin(); } }
+namespace nvfp4 { namespace gemm { void set_sm_margin(int64_t n); int64_t sm_margin(); void set_dynamic_tiles(bool on);
+bool dynamic_tiles(); } }
 bool nvfp4_four_six();
 void nvfp4_set_ms_eden(bool on);
 bool nvfp4_ms_eden();
@@ -103,6 +106,10 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
         py::arg("inv"), py::arg("w") = py::none(), py::arg("k") = 1);
   m.def("combine_bwd_w", &nvfp4_combine_bwd_w, "MoE combine backward: the weights' gradient", py::arg("g"),
         py::arg("rows"), py::arg("pos"));
+  m.def("mxfp8_encode", &nvfp4_mxfp8_encode, "rows -> MXFP8 message rows (e4m3 + exponent per 32)", py::arg("x"),
+        py::arg("seed") = py::none());
+  m.def("mxfp8_decode", &nvfp4_mxfp8_decode, "MXFP8 message rows -> [R, d]", py::arg("buf"), py::arg("d"),
+        py::arg("out_dtype"));
   m.def("dequantize", &nvfp4_dequantize, "NVFP4 rows -> bf16 / fp32 (reference.dequantize)", py::arg("data"),
         py::arg("scales"), py::arg("gdec"), py::arg("out_dtype"));
   m.def("quantize_dual_parts", &nvfp4_quantize_dual_parts,
@@ -168,6 +175,9 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
   m.def("four_six", &nvfp4_four_six, "Whether Four Over Six block scales are enabled");
   m.def("set_sm_margin", &nvfp4::gemm::set_sm_margin, "SMs the persistent GEMMs leave free", py::arg("n"));
   m.def("sm_margin", &nvfp4::gemm::sm_margin, "SMs the persistent GEMMs leave free");
+  m.def("set_dynamic_tiles", &nvfp4::gemm::set_dynamic_tiles, "persistent GEMMs claim tiles at run time",
+        py::arg("on"));
+  m.def("dynamic_tiles", &nvfp4::gemm::dynamic_tiles, "persistent GEMMs claim tiles at run time");
   m.def("set_ms_eden", &nvfp4_set_ms_eden,
         "Enable / disable MS-EDEN (64-point RHT, EDEN-corrected scales instead of element SR) on wgrad operands",
         py::arg("on"));

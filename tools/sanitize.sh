@@ -19,7 +19,7 @@ for tool in ${@:-memcheck racecheck synccheck initcheck}; do
   # layers' backward) reports a shared-memory hazard warning that is not ours to fix.
   extra=()
   [ "$tool" = racecheck ] && extra=(--kernel-name-exclude kns=native)
-  "$PY" tools/guard.py --log "logs/sanitize_$tool.csv" -- \
+  NVFP4_SANITIZE_TOOL=$tool "$PY" tools/guard.py --log "logs/sanitize_$tool.csv" -- \
     "$CS" --tool "$tool" "${extra[@]}" --print-limit 10 --error-exitcode 7 "$PY" tools/sanitize_drive.py 2>&1 \
     | grep -v "^\[guard\] sample" | grep -E "SUMMARY|DRIVE_OK|rror|hazard|Uninitialized|Invalid|Device Frame|guard\]"
   rc=${PIPESTATUS[0]}

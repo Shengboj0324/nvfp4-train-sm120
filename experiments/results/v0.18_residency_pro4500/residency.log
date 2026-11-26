@@ -1,0 +1,4 @@
+{"sms": 82, "shape": [16384, 2816, 2048], "device": "NVIDIA RTX PRO 4500 Blackwell", "static_alone_ms": 0.428, "static_held1_ms": 0.427, "static_held2_ms": 0.751, "static_held4_ms": 0.751, "static_held8_ms": 0.745, "static_held16_ms": 0.734, "dynamic_alone_ms": 0.444, "dynamic_held1_ms": 0.431, "dynamic_held2_ms": 0.438, "dynamic_held4_ms": 0.445, "dynamic_held8_ms": 0.461, "dynamic_held16_ms": 0.494}
+static   alone 0.428 ms; with k SMs held: k=1 1.00x, k=2 1.76x, k=4 1.76x, k=8 1.74x, k=16 1.72x
+dynamic  alone 0.444 ms; with k SMs held: k=1 0.97x, k=2 0.99x, k=4 1.00x, k=8 1.04x, k=16 1.11x
+[guard] elapsed 50s | peak GPU temp 37C, power 29W, GPU mem 2190MB | min host mem avail 159660MB | cooldown 0s

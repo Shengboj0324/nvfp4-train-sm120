@@ -1,0 +1,79 @@
+== session start 2026-11-26T12:29:12Z
+
+==================== env ====================
+Thu Nov 26 12:29:12 2026       
++-----------------------------------------------------------------------------------------+
+| NVIDIA-SMI 595.112.07             Driver Version: 595.112.07     CUDA Version: 13.2     |
++-----------------------------------------+------------------------+----------------------+
+| GPU  Name                 Persistence-M | Bus-Id          Disp.A | Volatile Uncorr. ECC |
+| Fan  Temp   Perf          Pwr:Usage/Cap |           Memory-Usage | GPU-Util  Compute M. |
+|                                         |                        |               MIG M. |
+|=========================================+========================+======================|
+|   0  NVIDIA RTX PRO 4500 Blac...    On  |   00000000:C1:00.0 Off |                  Off |
+| 30%   29C    P8             14W /  200W |       2MiB /  32623MiB |      0%      Default |
+|                                         |                        |                  N/A |
++-----------------------------------------+------------------------+----------------------+
+
++-----------------------------------------------------------------------------------------+
+| Processes:                                                                              |
+|  GPU   GI   CI              PID   Type   Process name                        GPU Memory |
+|        ID   ID                                                               Usage      |
+|=========================================================================================|
+|  No running processes found                                                             |
++-----------------------------------------------------------------------------------------+
+index, name, compute_cap, memory.total [MiB], power.limit [W], clocks.max.sm [MHz], pcie.link.gen.max, pcie.link.width.max
+0, NVIDIA RTX PRO 4500 Blackwell, 12.0, 32623 MiB, 200.00 W, 3090 MHz, 4, 16
+	[4mGPU0	CPU Affinity	NUMA Affinity	GPU NUMA ID[0m
+GPU0	 X 	0-111	0		N/A
+
+Legend:
+
+  X    = Self
+  SYS  = Connection traversing PCIe as well as the SMP interconnect between NUMA nodes (e.g., QPI/UPI)
+  NODE = Connection traversing PCIe as well as the interconnect between PCIe Host Bridges within a NUMA node
+  PHB  = Connection traversing PCIe as well as a PCIe Host Bridge (typically the CPU)
+  PXB  = Connection traversing multiple PCIe bridges (without traversing the PCIe Host Bridge)
+  PIX  = Connection traversing at most a single PCIe bridge
+  NV#  = Connection traversing a bonded set of # NVLinks
+driver supports CUDA 13.2
+nvcc 12.8 at /usr/local/cuda
+ERROR: Could not find a version that satisfies the requirement torch==2.14.1 (from versions: 2.7.0+cu128, 2.7.1+cu128, 2.8.0+cu128, 2.9.0+cu128, 2.9.1+cu128, 2.10.0+cu128, 2.11.0+cu128)
+ERROR: No matching distribution found for torch==2.14.1
+torch 2.11.0+cu128 cuda 12.8 ['NVIDIA RTX PRO 4500 Blackwell']
+ce6a603 sanitize: dynamic tile claiming under memcheck/synccheck/initcheck (racecheck serializes the claim spin)
+== env: ok (127 s)
+
+==================== build ====================
+ptxas info    : Used 56 registers, used 1 barriers, 18968 bytes smem
+    8 bytes stack frame, 8 bytes spill stores, 12 bytes spill loads
+ptxas info    : Used 80 registers, used 1 barriers, 8 bytes cumulative stack size, 18968 bytes smem
+ptxas info    : Used 48 registers, used 1 barriers, 16680 bytes smem
+ptxas info    : Used 80 registers, used 1 barriers, 16688 bytes smem
+ptxas info    : Used 51 registers, used 1 barriers, 18968 bytes smem
+ptxas info    : Used 80 registers, used 1 barriers, 16 bytes cumulative stack size, 18968 bytes smem
+ptxas info    : Used 48 registers, used 1 barriers, 16680 bytes smem
+ptxas info    : Used 80 registers, used 1 barriers, 16688 bytes smem
+ptxas info    : Used 56 registers, used 1 barriers, 18968 bytes smem
+ptxas info    : Used 89 registers, used 1 barriers, 18968 bytes smem
+ptxas info    : Used 38 registers, used 1 barriers, 32 bytes smem
+ptxas info    : Used 48 registers, used 1 barriers, 16680 bytes smem
+ptxas info    : Used 80 registers, used 1 barriers, 16688 bytes smem
+ptxas info    : Used 54 registers, used 1 barriers, 18968 bytes smem
+ptxas info    : Used 89 registers, used 1 barriers, 18968 bytes smem
+ptxas info    : Used 30 registers, used 1 barriers, 32 bytes smem
+ptxas info    : Used 48 registers, used 1 barriers, 16680 bytes smem
+ptxas info    : Used 80 registers, used 1 barriers, 16688 bytes smem
+x86_64-linux-gnu-g++ -shared -Wl,-O1 -Wl,-Bsymbolic-functions -Wl,-Bsymbolic-functions -g -fwrapv -O2 -Wl,-Bsymbolic-functions -g -fwrapv -O2 -g -fstack-protector-strong -Wformat -Werror=format-security -Wdate-time -D_FORTIFY_SOURCE=2 /workspace/nvfp4-train-sm120/build/temp.linux-x86_64-3.10/csrc/attention.o /workspace/nvfp4-train-sm120/build/temp.linux-x86_64-3.10/csrc/bindings.o /workspace/nvfp4-train-sm120/build/temp.linux-x86_64-3.10/csrc/gemm.o /workspace/nvfp4-train-sm120/build/temp.linux-x86_64-3.10/csrc/gemm_tma.o /workspace/nvfp4-train-sm120/build/temp.linux-x86_64-3.10/csrc/moe_combine.o /workspace/nvfp4-train-sm120/build/temp.linux-x86_64-3.10/csrc/norm.o /workspace/nvfp4-train-sm120/build/temp.linux-x86_64-3.10/csrc/quantize.o /workspace/nvfp4-train-sm120/build/temp.linux-x86_64-3.10/csrc/quantize_dual.o -L/workspace/venv/lib/python3.10/site-packages/torch/lib -L/usr/local/cuda/lib64 -lc10 -ltorch -ltorch_cpu -ltorch_python -lcudart -lc10_cuda -ltorch_cuda -o build/lib.linux-x86_64-3.10/nvfp4/_C.cpython-310-x86_64-linux-gnu.so
+== build: ok (88 s)
+
+==================== overlap ====================
+static   alone 0.428 ms; with k SMs held: k=1 1.00x, k=2 1.76x, k=4 1.76x, k=8 1.74x, k=16 1.72x
+dynamic  alone 0.444 ms; with k SMs held: k=1 0.97x, k=2 0.99x, k=4 1.00x, k=8 1.04x, k=16 1.11x
+== overlap: ok (50 s)
+
+== summary
+  env: ok
+  build: ok
+  overlap: ok
+results: /workspace/nvfp4_results.tar.gz
+== session end 2026-11-26T12:33:37Z

@@ -142,10 +142,11 @@ def _data(r):
     return torch.randn(150, 256, device=DEV, generator=g), torch.randn(150, 256, device=DEV, generator=g)
 
 
-def _check_fp32(rank, world, group, cf, node, chunks):
-    """fp32 experts: outputs and every gradient equal the single-process layer's (up to summation order)."""
+def _check_fp32(rank, world, group, cf, node, chunks, serial="auto"):
+    """fp32 experts: outputs and every gradient equal the single-process layer's (up to summation order); also
+    with the exchanges issued from one serialized stream (``serial``; "auto": with nodes and chunks)."""
     ref, ep = _pair(world, rank, group, False, cf, node)
-    ep.ep_dispatch, ep.ep_chunks = "variable", chunks
+    ep.ep_dispatch, ep.ep_chunks, ep.ep_serial = "variable", chunks, serial
     El = E // world
     ref_grads = {n: torch.zeros_like(p) for n, p in ref.named_parameters()}
     for r in range(world):
@@ -212,6 +213,71 @@ def _check_nvfp4(rank, world, group, node):
                 assert _cos(gr, base[2][n]) > 0.95, (n, chunks, wire_grad, _cos(gr, base[2][n]))
 
 
+def _check_return(rank, world, group, node):
+    """MXFP8 return messages (expert outputs; input gradients stochastically rounded) against bf16 ones: the
+    same layer to within e4m3's precision (fp32 experts: the messages are the only difference)."""
+    _, ep = _pair(world, rank, group, False, None, node)
+    ep.ep_dispatch, ep.ep_chunks = "variable", 2
+    x, g = _data(rank)
+    res = {}
+    for ret in ("bf16", "fp8"):
+        ep.ep_wire_return = ret
+        xe = x.clone().requires_grad_()
+        ep.zero_grad(set_to_none=True)
+        y = ep(xe)
+        y.backward(g)
+        res[ret] = [y.detach(), xe.grad] + [p.grad.clone() for p in ep.parameters()]
+    cy = _cos(res["fp8"][0], res["bf16"][0])
+    assert cy > 0.999, cy
+    for a, b in zip(res["fp8"][1:], res["bf16"][1:]):
+        assert _cos(a, b) > 0.995, _cos(a, b)
+
+
+def _check_dynamic(rank, world, group, node):
+    """ep_dynamic_tiles: the layer's GEMMs (forward and backward) claim tiles at run time, with the same bits
+    as the fixed assignment; the global setting is on only inside the layer's forward and backward. (A margin
+    leaves 2 CTAs, so that these small GEMMs have more tiles than CTAs and claiming engages.)"""
+    _, ep = _pair(world, rank, group, True, None, node)
+    ep.ep_dispatch, ep.ep_chunks = "variable", 2
+    x, g = _data(rank)
+    seen = []
+    ops.set_sm_margin(torch.cuda.get_device_properties(0).multi_processor_count - 2)
+    try:
+        ep.ep_dynamic_tiles = False
+        want = _run_nvfp4(ep, x, g)
+        ep.ep_dynamic_tiles = "auto"  # chunks 2: on
+
+        def spy(t):
+            seen.append(("bwd", ops.dynamic_tiles()))
+            return t
+        torch.manual_seed(11)
+        xe = x.clone().requires_grad_()
+        ep.zero_grad(set_to_none=True)
+        with torch.autocast("cuda", dtype=torch.bfloat16):
+            y = ep(xe)
+        assert not ops.dynamic_tiles()  # restored after the forward
+        y.register_hook(spy)  # runs before the layer's backward: still off
+        calls, real = [], ops.set_dynamic_tiles
+        ops.set_dynamic_tiles = lambda on: (calls.append(on), real(on))[1]
+        try:
+            y.backward(g.bfloat16())
+        finally:
+            ops.set_dynamic_tiles = real
+        assert calls == [True, False], calls  # on at the layer's output, restored at its input
+        assert not ops.dynamic_tiles()  # restored after the backward
+        got = (y.detach(), xe.grad, {n: p.grad.clone() for n, p in ep.named_parameters()})
+    finally:
+        ops.set_sm_margin(0)
+        ops.set_dynamic_tiles(False)
+    assert seen == [("bwd", False)]
+    assert torch.equal(got[0], want[0]) and torch.equal(got[1], want[1])
+    for n in want[2]:
+        assert torch.equal(got[2][n], want[2][n]), n
+    ep.ep_dynamic_tiles = "bad"
+    with pytest.raises(ValueError):
+        ep(x)
+
+
 def _worker(rank, world, port, configs, backend="gloo"):
     import datetime
 
@@ -225,6 +291,10 @@ def _worker(rank, world, port, configs, backend="gloo"):
         for kind, *args in configs:
             if kind == "fp32":
                 _check_fp32(rank, world, dist.group.WORLD, *args)
+            elif kind == "ret":
+                _check_return(rank, world, dist.group.WORLD, *args)
+            elif kind == "dyn":
+                _check_dynamic(rank, world, dist.group.WORLD, *args)
             else:
                 _check_nvfp4(rank, world, dist.group.WORLD, *args)
             dist.barrier()
@@ -239,16 +309,24 @@ def _spawn(world, configs, backend="gloo"):
     if not dist.is_available() or not (dist.is_gloo_available() if backend == "gloo" else dist.is_nccl_available()):
         pytest.skip(f"{backend} not available")
     os.environ.setdefault("OMP_NUM_THREADS", "2")
-    mp.spawn(_worker, args=(world, _free_port(), configs, backend), nprocs=world, join=True)
+    for attempt in range(3):  # the free port can be taken before rank 0 listens on it
+        try:
+            mp.spawn(_worker, args=(world, _free_port(), configs, backend), nprocs=world, join=True)
+            return
+        except mp.ProcessRaisedException as e:
+            if "EADDRINUSE" not in str(e) or attempt == 2:
+                raise
 
 
 def test_variable_ep_two_ranks():
     _spawn(2, [("fp32", None, 1, 1), ("fp32", 0.75, 1, 3), ("fp32", None, 2, 2), ("fp32", None, 1, 7),
-               ("nvfp4", 1), ("nvfp4", 2)])
+               ("fp32", None, 1, 3, True), ("nvfp4", 1), ("nvfp4", 2), ("ret", 1), ("ret", 2),
+               ("dyn", 1), ("dyn", 2)])
 
 
 def test_variable_ep_two_nodes_of_two():
-    _spawn(4, [("fp32", None, 2, 1), ("fp32", 0.75, 2, 2), ("fp32", None, 1, 2), ("nvfp4", 2)])
+    _spawn(4, [("fp32", None, 2, 1), ("fp32", 0.75, 2, 2), ("fp32", None, 2, 3, False), ("fp32", None, 1, 2),
+               ("nvfp4", 2), ("ret", 2)])
 
 
 def test_multi_gpu_nccl_variable_ep():
@@ -257,8 +335,8 @@ def test_multi_gpu_nccl_variable_ep():
     if n < 2 or not all(ops.available(i) for i in range(n)):
         pytest.skip("needs two sm_120 GPUs")
     if n >= 4:
-        _spawn(4, [("fp32", None, 2, 1), ("fp32", None, 1, 3), ("fp32", 0.75, 2, 2), ("nvfp4", 2), ("nvfp4", 1)],
-               "nccl")
+        _spawn(4, [("fp32", None, 2, 1), ("fp32", None, 1, 3), ("fp32", 0.75, 2, 2), ("fp32", None, 2, 2, False),
+                   ("nvfp4", 2), ("nvfp4", 1), ("ret", 2), ("dyn", 2)], "nccl")
     else:
         _spawn(2, [("fp32", None, 1, 1), ("fp32", 0.75, 1, 3), ("fp32", None, 2, 2), ("nvfp4", 1), ("nvfp4", 2)],
                "nccl")
@@ -416,3 +494,54 @@ def test_moe_combine_matches_bmm_path(monkeypatch):
     plain = run()
     for a, b in zip(fused, plain):
         torch.testing.assert_close(a, b, rtol=1e-5, atol=1e-5)
+
+
+# --- MXFP8 message rows (v0.18) -------------------------------------------------------------------------------
+
+def _mxfp8_ref(x):
+    """reference: per 32 values the smallest power-of-two scale with amax / scale <= 448, e4m3 round to
+    nearest (saturating), decoded."""
+    R, d = x.shape
+    xb = x.float().view(R, d // 32, 32)
+    amax = xb.abs().amax(-1)
+    m, ea = torch.frexp(amax)
+    e = torch.where(m <= 0.875, ea - 9, ea - 8)
+    e = torch.where(amax > 0, e, torch.full_like(e, -127)).clamp(-127, 127)
+    y = torch.ldexp(xb, -e.unsqueeze(-1)).clamp(-448, 448).to(torch.float8_e4m3fn)
+    return torch.ldexp(y.float(), e.unsqueeze(-1)).view(R, d), (e + 127).to(torch.uint8)
+
+
+@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float32])
+def test_mxfp8_messages_round_to_nearest(dtype):
+    from nvfp4 import _library as lib
+    g = torch.Generator(device=DEV).manual_seed(1)
+    x = (torch.randn(77, 256, device=DEV, generator=g) * torch.logspace(-20, 6, 77, base=2, device=DEV)[:, None])
+    x[3, :32] = 0
+    x = x.to(dtype)
+    msg = lib.mxfp8_encode(x, None)
+    assert msg.shape == (77, 256 + 8)
+    want, exps = _mxfp8_ref(x)
+    assert torch.equal(msg[:, 256:], exps)
+    out = lib.mxfp8_decode(msg, 256, torch.float32)
+    assert torch.equal(out, want)
+    # inside a wider message, decoded to bf16
+    wide = torch.zeros(77, 300, device=DEV, dtype=torch.uint8)
+    wide[:, :264] = msg
+    assert torch.equal(lib.mxfp8_decode(wide, 256, torch.bfloat16), want.bfloat16())
+    rel = ((out - x.float()).norm() / x.float().norm()).item()
+    assert rel < 0.05, rel
+
+
+def test_mxfp8_messages_stochastic_rounding_is_unbiased():
+    from nvfp4 import _library as lib
+    x = torch.randn(4, 256, device=DEV) * 3
+    x[0, 5] = 1e-6  # in e4m3's subnormal range after scaling
+    acc = torch.zeros_like(x)
+    n = 2000
+    for i in range(n):
+        out = lib.mxfp8_decode(lib.mxfp8_encode(x, torch.tensor([i], device=DEV)), 256, torch.float32)
+        assert ((out - x).abs() <= (out.abs() + x.abs()) * 2 ** -3 + 1e-4).all()  # a grid neighbour
+        acc += out
+    err = (acc / n - x).abs()
+    scale = x.abs() * 2 ** -3 + 1e-30  # the e4m3 grid step is at most 2^-3 of the value
+    assert (err <= 4 * scale / n ** 0.5 + 1e-9).float().mean() > 0.99

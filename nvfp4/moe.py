@@ -103,6 +103,23 @@ def _fused(t: torch.Tensor) -> bool:
     return bool(ok)
 
 
+class _TileScope(torch.autograd.Function):
+    """Identity whose backward sets ``ops.set_dynamic_tiles(on)``: placed on an expert-parallel layer's output
+    (on) and input (the previous setting), it brackets the layer's backward, whose GEMMs then claim their
+    tiles at run time while the gradient exchanges' NCCL kernels hold SMs (autograd runs a layer's nodes
+    between its output's and its input's)."""
+
+    @staticmethod
+    def forward(ctx, x, on: bool):
+        ctx.on = on
+        return x.view_as(x)
+
+    @staticmethod
+    def backward(ctx, g):
+        ops.set_dynamic_tiles(ctx.on)
+        return g, None
+
+
 class _GatherCombine(torch.autograd.Function):
     """out[r] = sum_j w[r, j] rows[pos[r, j]] (w None: weight 1; pos outside [0, len(rows)): nothing), in fp32
     with one rounding to rows' dtype, by one kernel that reads each row once (csrc/moe_combine.cu). Backward by
@@ -374,12 +391,39 @@ class _Pending:
     __slots__ = ("work", "bwork", "bout", "bin")
 
 
-def _a2a(x: torch.Tensor, send, recv, group, async_op: bool):
+_SERIAL_STREAMS: dict = {}
+
+
+def _serial_stream(dev: torch.device) -> torch.cuda.Stream:
+    """The stream every serialized exchange on ``dev`` is issued from (one per device)."""
+    idx = dev.index if dev.index is not None else torch.cuda.current_device()
+    if idx not in _SERIAL_STREAMS:
+        _SERIAL_STREAMS[idx] = torch.cuda.Stream(device=idx)
+    return _SERIAL_STREAMS[idx]
+
+
+def _a2a(x: torch.Tensor, send, recv, group, async_op: bool, serial: bool = False):
     """(output, work) of all_to_all_single over x's rows: equal splits (send / recv None) or the given row
-    counts per rank."""
+    counts per rank. ``serial`` (CUDA): issued from one stream that waits for each collective's end, so
+    collectives of different process groups never run at the same time (each still overlaps the compute
+    stream, which waits only through the returned work)."""
     rows = x.shape[0] if recv is None else sum(recv)
     out = x.new_empty((rows,) + tuple(x.shape[1:]))
-    work = dist.all_to_all_single(out, x.contiguous(), recv, send, group=group, async_op=async_op)
+    x = x.contiguous()
+    if not (serial and x.is_cuda):
+        return out, dist.all_to_all_single(out, x, recv, send, group=group, async_op=async_op)
+    s = _serial_stream(x.device)
+    s.wait_stream(torch.cuda.current_stream(x.device))  # the payload is ready
+    with torch.cuda.stream(s):
+        work = dist.all_to_all_single(out, x, recv, send, group=group, async_op=True)
+        work.wait()  # the next serialized collective starts after this one ends
+    # That wait drops the process group's own references to the buffers, and only s waits for the transfer:
+    # without these, a buffer freed on the compute stream could be reused there while NCCL still reads
+    # (or writes) it (a corrupted payload: out-of-range ids in the first measurement).
+    x.record_stream(s)
+    out.record_stream(s)
+    if not async_op:
+        work.wait()
     return out, work
 
 
@@ -454,6 +498,8 @@ def _encode(x: torch.Tensor, wire: str, amax=None, sr_seed=None) -> torch.Tensor
     """x's rows as bytes: raw, or ``wire="nvfp4"``: NVFP4 codes and block scales with the tensor scale of
     ``amax`` (round-to-nearest, or stochastic with ``sr_seed``), then the tensor decode scale and the amax as
     fp32 in every row (9 d / 16 + 8 bytes for d values, 3.6x fewer than bf16 at d = 1024)."""
+    if wire == "fp8":
+        return _lib.mxfp8_encode(x, sr_seed)
     if wire != "nvfp4":
         return _bytes(x)
     with _plain_rows():
@@ -465,6 +511,8 @@ def _encode(x: torch.Tensor, wire: str, amax=None, sr_seed=None) -> torch.Tensor
 def _decode(buf: torch.Tensor, o: int, d: int, dtype, wire: str):
     """(rows [R, d] in ``dtype`` from the bytes buf[:, o:], their tensor amax (NVFP4 rows: one fp32 element,
     None without rows; raw rows: None), the offset after them)."""
+    if wire == "fp8":
+        return _lib.mxfp8_decode(buf[:, o:], d, dtype), None, o + d + d // 32
     if wire != "nvfp4":
         n = d * dtype.itemsize
         return buf[:, o:o + n].view(dtype), None, o + n
@@ -474,12 +522,11 @@ def _decode(buf: torch.Tensor, o: int, d: int, dtype, wire: str):
     return x, (tail[:1, 1].contiguous() if buf.shape[0] else None), t + 8
 
 
-def _global_max(t: torch.Tensor, group) -> torch.Tensor:
+def _global_max(t: torch.Tensor, group, serial: bool = False) -> torch.Tensor:
     """The max over ``group``'s ranks of a one-element tensor (by all-to-all: gloo on PyTorch 2.11 Windows
     crashes reducing CUDA tensors)."""
     W = dist.get_world_size(group)
-    out = torch.empty(W, device=t.device, dtype=torch.float32)
-    dist.all_to_all_single(out, t.reshape(1).float().expand(W).contiguous(), group=group)
+    out, _ = _a2a(t.reshape(1).float().expand(W), None, None, group, False, serial)
     return out.max().reshape(1)
 
 
@@ -503,8 +550,10 @@ class _Xchg:
     in the backward runs between the reverse transfer's start (finish's backward) and its end."""
 
     def __init__(self, group, send, recv, d: int, dtype, k: int = 0, w: bool = False, ids: bool = False,
-                 wire: str = "bf16", amax=None, wire_grad: str = "bf16", grad_amax=None, box: _Box | None = None):
+                 wire: str = "bf16", amax=None, wire_grad: str = "bf16", grad_amax=None, box: _Box | None = None,
+                 serial: bool = False):
         self.group, self.send, self.recv, self.d, self.dtype, self.k = group, send, recv, d, dtype, k
+        self.serial = serial
         self.w, self.ids, self.wire, self.amax = w, ids, wire, amax
         self.wire_grad, self.grad_amax, self.box = wire_grad, grad_amax, box
         self.work = self.out = self.bwork = self.bout = None
@@ -530,7 +579,7 @@ class _XStart(torch.autograd.Function):
         if xc.ids:
             parts.append(_bytes(ids.to(torch.int32)))
         buf = torch.cat(parts, 1) if len(parts) > 1 else parts[0]
-        xc.out, xc.work = _a2a(buf, xc.send, xc.recv, xc.group, True)
+        xc.out, xc.work = _a2a(buf, xc.send, xc.recv, xc.group, True, xc.serial)
         return x.new_zeros(())  # a handle: carries the autograd link to _XWait
 
     @staticmethod
@@ -567,19 +616,21 @@ class _XWait(torch.autograd.Function):
         xc, R, dev = ctx.xc, ctx.rows, ctx.dev
         gx = torch.zeros(R, xc.d, device=dev, dtype=xc.dtype) if gx is None else gx.to(xc.dtype)
         amax = seed = None
-        if xc.wire_grad == "nvfp4":
+        if xc.wire_grad == "fp8":
+            seed = draw_seeds(1, dev)[0]  # stochastic rounding: unbiased gradients
+        elif xc.wire_grad == "nvfp4":
             local = gx.abs().amax().float().reshape(1) if R else torch.zeros(1, device=dev)
             if isinstance(xc.grad_amax, _Box):
                 amax = xc.grad_amax.amax if xc.grad_amax.amax is not None else local
             else:
-                amax = _global_max(local, xc.grad_amax)
+                amax = _global_max(local, xc.grad_amax, xc.serial)
             seed = draw_seeds(1, dev)[0]
         parts = [_encode(gx, xc.wire_grad, amax, seed)]
         if xc.w:
             gw = rest[0] if rest and rest[0] is not None else torch.zeros(R, xc.k, device=dev)
             parts.append(_bytes(gw.float()))
         buf = torch.cat(parts, 1) if len(parts) > 1 else parts[0]
-        xc.bout, xc.bwork = _a2a(buf, xc.recv, xc.send, xc.group, True)
+        xc.bout, xc.bwork = _a2a(buf, xc.recv, xc.send, xc.group, True, xc.serial)
         return torch.zeros((), device=dev), None
 
 
@@ -698,7 +749,14 @@ class MoE(nn.Module):
         unchanged, only the weight gradient's token-wise quantization sees the dequantized rows) and
         ``ep_wire_grad = "nvfp4"`` the gradients sent to the experts (stochastically rounded, unbiased).
         ``last_ep_rows``: rows this rank sent to other ranks in the last forward (across nodes, within its node).
+        ``ep_wire_return = "fp8"``: the return direction (expert outputs, and the input gradients going back)
+        as MXFP8 (e4m3 with a power-of-two scale per 32 values; gradients stochastically rounded), 1.94x fewer
+        bytes than bf16 (CUDA and d % 128 == 0; else bf16). ``ep_serial`` ("auto": with chunks and nodes): every exchange
+        issued from one side stream, one at a time, so rail and node collectives never run concurrently.
     The shared expert runs while the expert outputs travel back (``ep_overlap = False``: after them).
+    ``ep_dynamic_tiles`` ("auto": with chunks or an overlapped shared expert): the layer's GEMMs, forward and
+    backward, claim their tiles at run time (``ops.set_dynamic_tiles``) so that SMs held by NCCL do not
+    delay them.
 
     After forward, ``aux_loss`` holds the Switch Transformer load-balancing loss E * sum_e f_e P_e (f_e:
     fraction of routed slots, P_e: mean router probability of expert e; before dropping; this rank's tokens),
@@ -756,6 +814,9 @@ class MoE(nn.Module):
         self.ep_chunks = 1
         self.ep_wire = "bf16"
         self.ep_wire_grad = "bf16"
+        self.ep_wire_return = "bf16"
+        self.ep_serial = "auto"
+        self.ep_dynamic_tiles = "auto"
         self.wgrad_rht = True
         self.fuse_wgrad_accumulation = False
         self.cache_weight_quantization = False
@@ -934,6 +995,34 @@ class MoE(nn.Module):
         return ys.index_select(0, pos.view(-1))
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
+        dyn = self._dynamic_tiles()
+        if not dyn:
+            return self._forward(x)
+        prev = ops.dynamic_tiles()
+        ops.set_dynamic_tiles(True)
+        # the backward is bracketed only when the input takes a gradient: its node restores the setting last
+        scoped = x.requires_grad and torch.is_grad_enabled()
+        try:
+            y = self._forward(_TileScope.apply(x, prev) if scoped else x)
+        finally:
+            ops.set_dynamic_tiles(prev)
+        return _TileScope.apply(y, True) if scoped else y
+
+    def _dynamic_tiles(self) -> bool:
+        """Whether this forward (and its backward) runs its GEMMs with dynamic tile claiming
+        (``ops.set_dynamic_tiles``): ``ep_dynamic_tiles`` "auto" turns it on while expert-parallel exchanges
+        overlap GEMMs (``ep_chunks`` > 1, or the shared expert during the exchanges), where NCCL's kernels hold
+        SMs that the fixed tile assignment would wait for (the GEMMs ran 1.7x slower; RESULTS.md §8.6)."""
+        v = self.ep_dynamic_tiles
+        if v not in ("auto", True, False):
+            raise ValueError(f"ep_dynamic_tiles must be 'auto', True or False, got {v!r}")
+        if self.ep_group is None or not torch.cuda.is_available() or not ops.available():
+            return False
+        if v != "auto":
+            return bool(v)
+        return self.ep_chunks > 1 or bool(self.shared_d_ff and self.ep_overlap)
+
+    def _forward(self, x: torch.Tensor) -> torch.Tensor:
         lead = x.shape[:-1]
         x2d = x.reshape(-1, self.d)
         T, k, E = x2d.shape[0], self.top_k, self.n_experts
@@ -980,9 +1069,13 @@ class MoE(nn.Module):
         for name in ("ep_wire", "ep_wire_grad"):
             if getattr(self, name) not in ("bf16", "nvfp4"):
                 raise ValueError(f"{name} must be 'bf16' or 'nvfp4', got {getattr(self, name)!r}")
+        if self.ep_wire_return not in ("bf16", "fp8"):
+            raise ValueError(f"ep_wire_return must be 'bf16' or 'fp8', got {self.ep_wire_return!r}")
+        if self.ep_serial not in ("auto", True, False):
+            raise ValueError(f"ep_serial must be 'auto', True or False, got {self.ep_serial!r}")
         if not (isinstance(self.ep_chunks, int) and self.ep_chunks >= 1):
             raise ValueError(f"ep_chunks must be a positive int, got {self.ep_chunks!r}")
-        extra = self.ep_chunks > 1 or self.ep_node_size > 1 or self.ep_wire != "bf16" or self.ep_wire_grad != "bf16"
+        extra = self.ep_chunks > 1 or self.ep_node_size > 1 or self.ep_wire != "bf16" or             self.ep_wire_grad != "bf16" or self.ep_wire_return != "bf16"
         if self.ep_dispatch == "variable" or (self.ep_dispatch == "auto" and (C is None or extra)):
             return "variable"
         if C is None:
@@ -1009,6 +1102,7 @@ class MoE(nn.Module):
         nvfp4 = self.nvfp4 and not ops.high_precision() and x2d.is_cuda
         wire = self.ep_wire if nvfp4 else "bf16"
         wire_grad = self.ep_wire_grad if nvfp4 else "bf16"
+        wret = self.ep_wire_return if x2d.is_cuda and self.d % 128 == 0 else "bf16"  # outputs, input gradients
         if nvfp4:
             xin = x2d.to(BF16)  # NVFP4 experts read bf16
         elif torch.is_autocast_enabled("cuda") and x2d.is_cuda:
@@ -1016,6 +1110,7 @@ class MoE(nn.Module):
         else:
             xin = x2d
         n = max(1, min(self.ep_chunks, T))
+        ser = (L > 1 and n > 1) if self.ep_serial == "auto" else bool(self.ep_serial)
         starts = [(c * T + n - 1) // n for c in range(n + 1)]
         sizes = [starts[c + 1] - starts[c] for c in range(n)]
         # --- what every rank sends where, per chunk: one all-to-all, one host read --------------------------
@@ -1062,7 +1157,7 @@ class MoE(nn.Module):
             p = plans[c]
             r1 = _route(ids_c[c], N, El * L, sum(p["send1"]))
             d1 = _Xchg(self._rail_group, p["send1"], p["recv1"], d, xin.dtype, k, w=True, ids=True, wire=wire,
-                       amax=x_amax)
+                       amax=x_amax, wire_grad=wret, serial=ser)
             h = d1.start(_Dispatch.apply(xs_c[c], r1.src, r1.pos)[:r1.rows.shape[0]],
                          w_c[c].index_select(0, r1.rows) * r1.mask, r1.ids)
             yield
@@ -1071,7 +1166,7 @@ class MoE(nn.Module):
             if L > 1:  # forward within the node
                 r2 = _route(ie, L, El, sum(p["send2"]))
                 d2 = _Xchg(self._node_group, p["send2"], p["recv2"], d, xin.dtype, k, w=True, ids=True, wire=wire,
-                           amax=x_amax)
+                           amax=x_amax, wire_grad=wret, serial=ser)
                 h = d2.start(_Dispatch.apply(xe, r2.src, r2.pos)[:r2.rows.shape[0]],
                              we.index_select(0, r2.rows) * r2.mask, r2.ids)
                 yield
@@ -1081,13 +1176,13 @@ class MoE(nn.Module):
                                 p["slots"], True, ws, bs, self._caches, x_amax)
             part = _combine(ys, pos, we)  # this rank's experts' weighted sum for every row
             if L > 1:
-                back = _Xchg(self._node_group, p["recv2"], p["send2"], d, part.dtype, wire_grad=wire_grad,
-                             grad_amax=box)
+                back = _Xchg(self._node_group, p["recv2"], p["send2"], d, part.dtype, wire=wret,
+                             wire_grad=wire_grad, grad_amax=box, serial=ser)
                 h = back.start(part)
                 yield
                 part = _gather_sum(back.finish(h)[0], r2.pos)  # the node's sum for every row
-            back = _Xchg(self._rail_group, p["recv1"], p["send1"], d, part.dtype, wire_grad=wire_grad,
-                         grad_amax=group, box=box)
+            back = _Xchg(self._rail_group, p["recv1"], p["send1"], d, part.dtype, wire=wret,
+                         wire_grad=wire_grad, grad_amax=group, box=box, serial=ser)
             h = back.start(part)
             yield
             return _gather_sum(back.finish(h)[0], r1.pos)

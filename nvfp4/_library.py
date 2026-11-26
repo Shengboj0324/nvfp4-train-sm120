@@ -96,6 +96,16 @@ def _combine_bwd_w_impl(g: Tensor, rows: Tensor, pos: Tensor) -> Tensor:
     return _C.combine_bwd_w(g, rows, pos)
 
 
+def _mxfp8_encode_impl(x: Tensor, seed: Optional[Tensor]) -> Tensor:
+    require(x)
+    return _C.mxfp8_encode(x, seed)
+
+
+def _mxfp8_decode_impl(buf: Tensor, d: int, out_dtype: torch.dtype) -> Tensor:
+    require(buf)
+    return _C.mxfp8_decode(buf, d, out_dtype)
+
+
 def _dequantize_impl(data: Tensor, scales: Tensor, gdec: Tensor, out_dtype: torch.dtype) -> Tensor:
     require(data)
     return _C.dequantize(data, scales, gdec, out_dtype)
@@ -235,6 +245,8 @@ def _attn_bwd_impl(q: Tensor, qs: Tensor, qt: Tensor, qts: Tensor, k: Tensor, ks
 
 _quantize_dual_op = torch.library.custom_op("nvfp4::quantize_dual", _quantize_dual_impl, mutates_args=())
 _dequantize_op = torch.library.custom_op("nvfp4::dequantize", _dequantize_impl, mutates_args=())
+_mxfp8_encode_op = torch.library.custom_op("nvfp4::mxfp8_encode", _mxfp8_encode_impl, mutates_args=())
+_mxfp8_decode_op = torch.library.custom_op("nvfp4::mxfp8_decode", _mxfp8_decode_impl, mutates_args=())
 _combine_fwd_op = torch.library.custom_op("nvfp4::combine_fwd", _combine_fwd_impl, mutates_args=())
 _combine_bwd_rows_op = torch.library.custom_op("nvfp4::combine_bwd_rows", _combine_bwd_rows_impl, mutates_args=())
 _combine_bwd_w_op = torch.library.custom_op("nvfp4::combine_bwd_w", _combine_bwd_w_impl, mutates_args=())
@@ -275,6 +287,16 @@ def _dual_fake(x: Tensor, do_row: bool, do_col: bool, col_pad: int) -> _DUAL:
 @_quantize_dual_op.register_fake
 def _(x, do_row, do_col, block_2d, row_sr, row_seed, col_sr, col_seed, col_rht, rht_seed, col_pad, *seed_tensors):
     return _dual_fake(x, do_row, do_col, col_pad)
+
+
+@_mxfp8_encode_op.register_fake
+def _(x, seed):
+    return x.new_empty((x.shape[0], x.shape[1] + x.shape[1] // 32), dtype=torch.uint8)
+
+
+@_mxfp8_decode_op.register_fake
+def _(buf, d, out_dtype):
+    return buf.new_empty((buf.shape[0], d), dtype=out_dtype)
 
 
 @_combine_fwd_op.register_fake
@@ -448,6 +470,8 @@ quantize_dual = _pick(_quantize_dual_impl, _quantize_dual_op)
 quantize_dual_parts = _pick(_quantize_dual_parts_impl, _quantize_dual_parts_op)
 dequantize = _pick(_dequantize_impl, _dequantize_op)
 combine_fwd = _pick(_combine_fwd_impl, _combine_fwd_op)
+mxfp8_encode = _pick(_mxfp8_encode_impl, _mxfp8_encode_op)
+mxfp8_decode = _pick(_mxfp8_decode_impl, _mxfp8_decode_op)
 combine_bwd_rows = _pick(_combine_bwd_rows_impl, _combine_bwd_rows_op)
 combine_bwd_w = _pick(_combine_bwd_w_impl, _combine_bwd_w_op)
 norm_backward = _pick(_norm_backward_impl, _norm_backward_op)

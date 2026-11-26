@@ -204,6 +204,8 @@ def main():
                     help="expert-parallel message formats (activations; +grad: gradients too). Without --moe-ep: "
                          "the exchanges run over a one-process group (the wire formats' accuracy on one GPU)")
     ap.add_argument("--moe-ep-chunks", type=int, default=1, help="expert-parallel exchanges in this many chunks")
+    ap.add_argument("--moe-ep-wire-return", choices=["bf16", "fp8"], default="bf16",
+                    help="expert-parallel return messages (expert outputs, input gradients)")
     ap.add_argument("--moe-ep-node-size", type=int, default=1, help="two-stage exchanges over nodes of this size")
     ap.add_argument("--sm-margin", type=int, default=0, help="SMs the persistent NVFP4 GEMMs leave free")
     ap.add_argument("--bf16-tail", type=float, default=0.0,
@@ -231,7 +233,7 @@ def main():
     train = np.memmap(os.path.join(a.data, "train.bin"), dtype=np.uint16, mode="r")
     val = np.memmap(os.path.join(a.data, "val.bin"), dtype=np.uint16, mode="r")
     moe = None
-    ep = a.moe_ep or bool(a.moe_ep_wire)
+    ep = a.moe_ep or bool(a.moe_ep_wire) or a.moe_ep_wire_return != "bf16"
     if ep:
         import torch.distributed as dist
         if not ddp:  # one process: the expert-parallel path over a one-process group (a numerics study)
@@ -270,6 +272,7 @@ def main():
             blk.moe.ep_dispatch, blk.moe.ep_chunks = "variable", a.moe_ep_chunks
             blk.moe.ep_wire = "nvfp4" if a.moe_ep_wire.startswith("nvfp4") else "bf16"
             blk.moe.ep_wire_grad = "nvfp4" if a.moe_ep_wire == "nvfp4+grad" else "bf16"
+            blk.moe.ep_wire_return = a.moe_ep_wire_return
     n_params = sum(p.numel() for p in model.parameters())
     opt = torch.optim.AdamW(model.parameters(), lr=a.lr, betas=(0.9, 0.95), weight_decay=0.1, fused=True)
     fwd = model

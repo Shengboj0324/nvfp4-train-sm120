@@ -1,0 +1,11 @@
+W1126 19:59:58.537000 6801 torch/distributed/run.py:851] 
+W1126 19:59:58.537000 6801 torch/distributed/run.py:851] *****************************************
+W1126 19:59:58.537000 6801 torch/distributed/run.py:851] Setting OMP_NUM_THREADS environment variable for each process to be 1 in default, to avoid your system being overloaded, please further tune the variable for optimal performance in your application as needed. 
+W1126 19:59:58.537000 6801 torch/distributed/run.py:851] *****************************************
+/workspace/venv/lib/python3.10/site-packages/torch/profiler/profiler.py:224: UserWarning: Warning: Profiler clears events at the end of each cycle.Only events from the current cycle will be reported.To keep events across cycles, set acc_events=True.
+  _warn_once(
+/workspace/venv/lib/python3.10/site-packages/torch/profiler/profiler.py:224: UserWarning: Warning: Profiler clears events at the end of each cycle.Only events from the current cycle will be reported.To keep events across cycles, set acc_events=True.
+  _warn_once(
+{"a2a_ms": 46.009, "a2a_GiB_s_per_gpu": 0.679, "nvfp4_alone_ms": 0.44, "bf16_alone_ms": 1.128, "bf16_beside_ms": 1.128, "nvfp4_alone_margin0_ms": 0.432, "nvfp4_beside_margin0_ms": 0.489, "nvfp4_alone_margin8_ms": 0.46, "nvfp4_beside_margin8_ms": 0.468, "nvfp4_alone_margin16_ms": 0.494, "nvfp4_beside_margin16_ms": 0.504, "nvfp4_alone_margin24_ms": 0.543, "nvfp4_beside_margin24_ms": 0.585, "nvfp4_alone_margin32_ms": 0.624, "nvfp4_beside_margin32_ms": 0.65, "nvfp4_alone_margin48_ms": 0.867, "nvfp4_beside_margin48_ms": 0.884, "nvfp4_dyn_alone_margin0_ms": 0.458, "nvfp4_dyn_beside_margin0_ms": 0.465, "nvfp4_dyn_alone_margin8_ms": 0.484, "nvfp4_dyn_beside_margin8_ms": 0.49, "nccl_grid": [[2, 1, 1]], "sms": 82, "env": {"NCCL_VERSION": "2.25.1-1", "NCCL_MAX_NCHANNELS": "4"}}
+nvfp4 GEMM 16384x2816x2048: alone 0.440 ms; beside the all-to-all margin 0: 1.11x, margin 8: 1.06x, margin 16: 1.15x, margin 24: 1.33x, margin 32: 1.48x, margin 48: 2.01x; dynamic tiles margin 0: 1.06x, margin 8: 1.11x; bf16 cuBLAS 1.00x; NCCL grid [[2, 1, 1]]
+[guard] elapsed 10s | peak GPU temp 43C, power 87W, GPU mem 2520MB | min host mem avail 105206MB | cooldown 0s

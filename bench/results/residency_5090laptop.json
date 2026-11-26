@@ -1,0 +1,21 @@
+{
+ "sms": 82,
+ "shape": [
+  16384,
+  2816,
+  2048
+ ],
+ "device": "NVIDIA GeForce RTX 5090 Laptop GPU",
+ "static_alone_ms": 0.4914207935333252,
+ "static_held1_ms": 0.49439201354980467,
+ "static_held2_ms": 1.172539234161377,
+ "static_held4_ms": 1.2202143669128418,
+ "static_held8_ms": 1.1562159538269043,
+ "static_held16_ms": 1.147771167755127,
+ "dynamic_alone_ms": 0.5087007999420166,
+ "dynamic_held1_ms": 1.3560015678405761,
+ "dynamic_held2_ms": 1.2406415939331055,
+ "dynamic_held4_ms": 1.2244336128234863,
+ "dynamic_held8_ms": 1.2109647750854493,
+ "dynamic_held16_ms": 1.1955007553100585
+}

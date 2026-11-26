@@ -22,13 +22,31 @@ from torch.profiler import ProfilerActivity, profile
 from nvfp4 import convert_linears, ops
 from nvfp4.moe import MoE
 
-VARIANTS = {  # name: (constructor kwargs, attributes, SM margin)
+VARIANTS = {  # name: (constructor kwargs, attributes, SM margin); attributes "_fused": the fused combine on / off,
+    # (MoE.ep_dynamic_tiles defaults to "auto": on with chunks; the "_static" variants turn it off)
     "dropless": ({}, {}, 0),
     "chunks2": ({}, {"ep_chunks": 2}, 0),
+    "chunks2_serial": ({}, {"ep_chunks": 2, "ep_serial": True}, 0),
     "chunks2_margin8": ({}, {"ep_chunks": 2}, 8),
+    "chunks2_static": ({}, {"ep_chunks": 2, "ep_dynamic_tiles": False}, 0),
     "wire_nvfp4": ({}, {"ep_wire": "nvfp4"}, 0),
+    "wire_fp8_return": ({}, {"ep_wire": "nvfp4", "ep_wire_return": "fp8"}, 0),
     "cap1.25": ({"capacity_factor": 1.25}, {}, 0),
 }
+
+
+def node_variants(L):
+    n = {"ep_node_size": L}
+    return {
+        "nodes": (n, {}, 0),
+        "nodes_chunks2": (n, {"ep_chunks": 2, "ep_serial": False}, 0),
+        "nodes_chunks2_margin8": (n, {"ep_chunks": 2, "ep_serial": False}, 8),
+        "nodes_chunks2_unfused": (n, {"ep_chunks": 2, "ep_serial": False, "_fused": False}, 0),
+        "nodes_chunks2_serial": (n, {"ep_chunks": 2, "ep_serial": True}, 0),
+        "nodes_chunks2_serial_static": (n, {"ep_chunks": 2, "ep_serial": True, "ep_dynamic_tiles": False}, 0),
+        "nodes_chunks4_serial": (n, {"ep_chunks": 4, "ep_serial": True}, 0),
+        "nodes_fp8_return": (n, {"ep_wire": "nvfp4", "ep_wire_return": "fp8"}, 0),
+    }
 
 
 def union_ms(intervals):
@@ -51,6 +69,8 @@ def main():
     ap.add_argument("--tokens", type=int, default=16384)
     ap.add_argument("--shared", type=int, default=2816)
     ap.add_argument("--steps", type=int, default=4)
+    ap.add_argument("--node-size", type=int, default=1)
+    ap.add_argument("--only", default="", help="comma-separated variant names")
     a = ap.parse_args()
     rank, W = int(os.environ["RANK"]), int(os.environ["WORLD_SIZE"])
     torch.cuda.set_device(int(os.environ.get("LOCAL_RANK", rank)))
@@ -60,10 +80,18 @@ def main():
     x = torch.randn(a.tokens, a.d, device="cuda", requires_grad=True)
     g = torch.randn(a.tokens, a.d, device="cuda", dtype=torch.bfloat16)
     summary = {}
-    for name, (ctor, attrs, margin) in VARIANTS.items():
+    variants = dict(VARIANTS)
+    if a.node_size > 1:
+        variants.update(node_variants(a.node_size))
+    if a.only:
+        variants = {k: v for k, v in variants.items() if k in a.only.split(",")}
+    from nvfp4 import moe as moe_mod
+    for name, (ctor, attrs, margin) in variants.items():
         torch.manual_seed(0)
         m = MoE(a.d, a.d_ff, a.experts, top_k=a.top_k, shared_d_ff=a.shared, ep_group=dist.group.WORLD, **ctor).cuda()
         convert_linears(m)
+        attrs = dict(attrs)
+        moe_mod._FUSED_COMBINE = attrs.pop("_fused", True)
         for k, v in attrs.items():
             setattr(m, k, v)
         ops.set_sm_margin(margin)
@@ -84,6 +112,7 @@ def main():
             torch.cuda.synchronize()
             wall = (time.perf_counter() - t0) * 1e3 / a.steps
         ops.set_sm_margin(0)
+        moe_mod._FUSED_COMBINE = True
         if rank == 0:
             prof.export_chrome_trace(os.path.join(a.out, f"trace_{name}_rank0.json"))
         evs = [e for e in prof.events() if e.device_type == torch.autograd.DeviceType.CUDA]

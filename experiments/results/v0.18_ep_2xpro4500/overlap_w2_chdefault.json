@@ -1,0 +1,34 @@
+{
+ "a2a_ms": 6.634226989746094,
+ "a2a_GiB_s_per_gpu": 4.710420678746779,
+ "nvfp4_alone_ms": 0.4214000225067139,
+ "bf16_alone_ms": 1.0971615791320801,
+ "bf16_beside_ms": 1.1031023979187011,
+ "nvfp4_alone_margin0_ms": 0.41971678733825685,
+ "nvfp4_beside_margin0_ms": 0.5410079956054688,
+ "nvfp4_alone_margin8_ms": 0.4482416152954102,
+ "nvfp4_beside_margin8_ms": 0.46548800468444823,
+ "nvfp4_alone_margin16_ms": 0.47974720001220705,
+ "nvfp4_beside_margin16_ms": 0.5065616130828857,
+ "nvfp4_alone_margin24_ms": 0.524726390838623,
+ "nvfp4_beside_margin24_ms": 0.5735392093658447,
+ "nvfp4_alone_margin32_ms": 0.6108848094940186,
+ "nvfp4_beside_margin32_ms": 0.651307201385498,
+ "nvfp4_alone_margin48_ms": 0.8598912239074707,
+ "nvfp4_beside_margin48_ms": 0.9095088005065918,
+ "nvfp4_dyn_alone_margin0_ms": 0.4493231773376465,
+ "nvfp4_dyn_beside_margin0_ms": 0.46004481315612794,
+ "nvfp4_dyn_alone_margin8_ms": 0.47448000907897947,
+ "nvfp4_dyn_beside_margin8_ms": 0.4821216106414795,
+ "nccl_grid": [
+  [
+   2,
+   1,
+   1
+  ]
+ ],
+ "sms": 82,
+ "env": {
+  "NCCL_VERSION": "2.25.1-1"
+ }
+}

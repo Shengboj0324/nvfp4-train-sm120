@@ -184,9 +184,39 @@ for dt in (torch.bfloat16, torch.float32, torch.float16):
         inv = torch.randint(-1, 111, (130,), device=d)
         _lib.combine_bwd_rows(gc, inv, wc, 3)
         _lib.combine_bwd_w(gc, rows.contiguous(), posc)
+# v0.18: MXFP8 return messages (round-to-nearest and stochastic rounding; strided wide messages; zero rows)
+for R in (0, 1, 37, 130):
+    for dt in (torch.bfloat16, torch.float32):
+        xm8 = (torch.randn(R, 256 + 64, device=d, dtype=dt) * 100)[:, :256]
+        for seed in (None, torch.tensor([5], device=d, dtype=torch.int64)):
+            m8 = _lib.mxfp8_encode(xm8, seed)
+            _lib.mxfp8_decode(m8, 256, dt)
+            wide = torch.zeros(R, 300, device=d, dtype=torch.uint8)
+            wide[:, :264] = m8
+            _lib.mxfp8_decode(wide[:, :264], 256, torch.bfloat16)
 ops.set_sm_margin(40)
 qa, _ = ops.quantize_dual(torch.randn(384, 512, device=d), col=False)
 ops.gemm(qa, qa, impl="tma")
+ops.set_sm_margin(0)
+# dynamic tile claiming: dense (and split-K), grouped with runs of unused tiles, ragged K with an empty group
+# (claiming engages only with more units than CTAs: a margin leaves 3 CTAs). Not under racecheck: its
+# serialized execution of a block makes the threads that wait for a claim spin almost forever (and a
+# flag-synchronized ring is outside what it models); memcheck, synccheck and initcheck cover it.
+import os  # noqa: E402
+ops.set_dynamic_tiles(os.environ.get("NVFP4_SANITIZE_TOOL") != "racecheck")
+ops.set_sm_margin(torch.cuda.get_device_properties(0).multi_processor_count - 3)
+qd, _ = ops.quantize_dual(torch.randn(1024, 512, device=d), col=False)
+ops.gemm(qd, qa, impl="tma")
+ops.gemm(qa, qa, torch.float32, impl="tma", splits=2)
+tg = torch.tensor([-1, 0, 0, -1, -1, -1, 1, -1], device=d, dtype=torch.int32)
+am_, _ = ops.quantize_dual(torch.randn(8 * 128, 512, device=d), col=False)
+bm_, _ = ops.quantize_dual(torch.randn(2 * 256, 512, device=d), col=False)
+ops.gemm_grouped(am_, bm_, "m", tg, group_rows=256)
+sg = torch.tensor([[0, 256, 0], [256, 0, 128], [256, 256, 256]], device=d, dtype=torch.int32)
+ak_, _ = ops.quantize_dual(torch.randn(128, 512, device=d), col=False)
+bk_, _ = ops.quantize_dual(torch.randn(256, 512, device=d), col=False)
+ops.gemm_grouped(ak_, bk_, "k", sg, out=torch.zeros(384, 256, device=d), out_dtype=torch.float32)
+ops.set_dynamic_tiles(False)
 ops.set_sm_margin(0)
 torch.cuda.synchronize()
 print("DRIVE_OK")

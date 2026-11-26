@@ -510,7 +510,7 @@ on the activations of a model trained at 4096 tokens (`bench/attention_real_erro
 [0.7–2.3%], dQ 0.4–2.0% [0.3–0.6%; v0.9.0: 0.4–24%], dK 1.2–6.9% [2.8–7.1%], dV 0.2–2.1% [2.5–3.1%].
 GPT-124M (attention a small share of the step) trains at the same speed with either.
 
-## 8. Mixture of experts (v0.11–v0.17, `bench/results/moe.json`, `experiments/results/v0.12_moe/`, `…/v0.13_moe/`, `…/v0.14_moe/`, `…/v0.16_ep_2x5090/`, `…/v0.17_*/`)
+## 8. Mixture of experts (v0.11–v0.18, `bench/results/moe.json`, `experiments/results/v0.12_moe/`, `…/v0.13_moe/`, `…/v0.14_moe/`, `…/v0.16_ep_2x5090/`, `…/v0.17_*/`, `…/v0.18_*/`)
 
 `nvfp4.moe.MoE` layer, one training step (forward + backward, autocast BF16, 16,384 tokens), BF16 experts
 vs the same experts converted to NVFP4 (`bench/bench_moe.py`). v0.11 ran each expert's fused MLP in turn;
@@ -681,9 +681,10 @@ expert 2816. BF16 experts: layer B on four GPUs 491.9 (capacity) → 207.9 (once
   does not (one pair; 4 chunks cost more). A profile (`bench/profile_moe_ep.py`, `profile_ep4/`) shows why
   not more: on four GPUs the flat step idles its compute stream 158 of 200 ms waiting for NCCL; with 2
   chunks the idle time drops to 109 ms, but the expert GEMMs run ~1.3–1.7× slower beside the NCCL
-  copies (memory and SM contention), and an SM margin (`ops.set_sm_margin(8)`) changes that by under
-  1%. With nodes, chunks were slower in the final run (233 vs 96 ms; an earlier run with the old combine:
-  114 vs 123), so keep `ep_chunks = 1` there. Running both stages over the whole group's communicator
+  copies, and an SM margin (`ops.set_sm_margin(8)`) changes that by under 1%. (v0.18: SM residency of
+  the persistent GEMM, fixed by dynamic tile claiming, §8.6.) With nodes, chunks were slower in the final
+  run (233 vs 96 ms; an earlier run with the old combine: 114 vs 123), so v0.17 advised `ep_chunks = 1`
+  there. (v0.18: concurrent rail and node collectives; serialized, chunks are 14–16% faster, §8.8.) Running both stages over the whole group's communicator
   (zero-size splits to the other ranks) instead of rail and node sub-groups was 3× slower (284 ms,
   `final_onecomm/`) and was reverted.
 - **NVFP4 messages** cut the activation messages 3.6× and the gradient messages likewise: 7–13% faster
@@ -732,6 +733,126 @@ NVFP4 is now 1.61–2.70× the grouped BF16 experts on the laptop (was 1.47–2.
 ~2 GB at d 2048. On expert parallelism the fused combine took the two-GPU layer-B step from 71.1 to
 49.2 ms in the profile (compute stream busy 62.5 → 40.0 ms), since it also replaces the partial sums and
 the dispatch's backward. On the RTX PRO 4500 the layer is 1.45–2.02× grouped BF16.
+
+### 8.5 MXFP8 return messages: the loss (v0.18, `experiments/results/v0.18_ep_return/`)
+
+The same MoE GPT and protocol as §8.3 (`experiments/run_ep_return.sh`), with the return direction (expert
+outputs going back, and the input gradients of the dispatch's backward) in bf16 or in MXFP8
+(`ep_wire_return="fp8"`: e4m3 codes with one power-of-two scale per 32 values, round-to-nearest for the
+outputs and stochastic rounding for the gradients):
+
+| return messages | seed 0 | seed 1 | mean | vs bf16 |
+|---|---|---|---|---|
+| bf16 | 1.4940 | 1.5023 | 1.4982 | – |
+| MXFP8 (`ep_wire_return="fp8"`) | 1.5022 | 1.5020 | 1.5021 | +0.26% |
+
+The difference is below the seed spread of the bf16 runs (0.55%) and of single MoE GPT runs (±0.33%), like
+the NVFP4 gradient messages of §8.3. MXFP8 keeps 3 mantissa bits per value against NVFP4's 1, so it was
+chosen over NVFP4 for these messages: the experts' outputs are summed after the trip (NVFP4's error would
+not be re-quantized away as for the dispatched activations), and a 1.94× smaller message than bf16 (264
+bytes per 256 values) is what the return direction needs, not 3.5×. One process adds the encode / decode
+without the transfer they save: 929 vs 886 s for 3000 steps (with the first, slow kernels; §8.7).
+
+### 8.6 The GEMMs beside NCCL: SM residency (v0.18, `experiments/results/v0.18_residency_pro4500/`)
+
+v0.17 found the expert GEMMs ~1.7× slower while all-to-alls ran beside them. `bench/bench_residency.py`
+reproduces that without NCCL: the persistent NVFP4 GEMM (16384 × 2816 × 2048) on one RTX PRO 4500 while a
+spin kernel holds k SMs (one 64 KB-shared-memory CTA each, so no GEMM CTA fits beside it), milliseconds per
+GEMM and the slowdown against the GEMM alone:
+
+| tiles | alone | k = 2 | k = 4 | k = 8 | k = 16 |
+|---|---|---|---|---|---|
+| fixed assignment (v0.17) | 0.428 | 0.751 (1.76×) | 0.751 (1.76×) | 0.745 (1.74×) | 0.734 (1.72×) |
+| dynamic claiming (`ops.set_dynamic_tiles`) | 0.444 | 0.438 (0.99×) | 0.445 (1.00×) | 0.461 (1.04×) | 0.494 (1.11×) |
+
+The slowdown does not grow with k: the k CTAs that cannot start run their whole share of the tiles after
+the others finish (a second wave), whatever k is, so an SM margin only helps once it is at least NCCL's
+grid. With claiming the resident CTAs take that work and the GEMM runs at SMs / (SMs − k). Alone,
+claiming costs 3.7% here (0–4% dense and ~6% grouped on the laptop), so the MoE layer enables it only around
+the GEMMs that overlap exchanges (`ep_dynamic_tiles="auto"`). (The k = 1 runs are left out: the spin kernel
+had not loaded before the first one; the benchmark now warms it up.)
+
+### 8.7 Beside a real all-to-all, and the v0.18 options, on two RTX PRO 4500 (`experiments/results/v0.18_ep_2xpro4500/`)
+
+Two RTX PRO 4500 Blackwell under one PCIe host bridge (19 GiB/s all-to-all). `bench/bench_overlap.py`: the
+same GEMM timed while all-to-alls of 64 MiB per rank run on NCCL's stream (NCCL's kernel: 2 CTAs), against
+the GEMM alone with all 82 SMs:
+
+| NCCL channels | fixed tiles, margin 0 | margin 8 | margin 16 | margin 32 | dynamic tiles, margin 0 | cuBLAS BF16 |
+|---|---|---|---|---|---|---|
+| default | 1.28× | 1.10× | 1.20× | 1.55× | 1.09× | 1.01× |
+| `NCCL_MAX_NCHANNELS=4` | 1.19× | 1.08× | 1.17× | 1.53× | 1.08× | 1.01× |
+| `NCCL_MAX_NCHANNELS=8` | 1.28× | 1.14× | 1.26× | 1.55× | 1.09× | 1.00× |
+
+cuBLAS's non-persistent GEMM is not slowed at all, and memory traffic is not what slows the persistent one: a
+margin of at least NCCL's grid removes the second wave (what is left, 1.10×, is the 8 SMs given up; larger
+margins only give up more), and dynamic claiming does the same without knowing the grid (1.09×, of which
+~6% is the claims themselves here, `nvfp4_dyn_alone`). Fewer channels change little. The residency
+benchmark of §8.6 gave the same split on this pod (fixed 1.72–1.77×, dynamic 0.98–1.10×).
+
+`bench/profile_moe_ep.py`, layer B (d 2048, 32 experts, top-4, shared expert 2816, 16,384 tokens per rank),
+milliseconds per training step on the two GPUs (`r3/`):
+
+| variant | wall | compute kernels | NCCL kernels |
+|---|---|---|---|
+| once per rank (`ep_chunks=1`) | 48.46 | 38.28 | 31.92 |
+| chunks 2 (dynamic tiles, the default) | 50.92 | 45.21 | 43.03 |
+| chunks 2, fixed tiles (`ep_dynamic_tiles=False`) | 52.19 | 46.96 | 41.89 |
+| chunks 2, serialized exchanges (`ep_serial=True`) | 50.88 | 45.28 | 41.58 |
+| NVFP4 dispatch (`ep_wire="nvfp4"`) | 47.19 | 39.63 | 28.06 |
+| NVFP4 dispatch + MXFP8 return (`ep_wire_return="fp8"`) | **45.71** | 40.48 | 20.83 |
+
+Within one host bridge the exchange is short enough that chunks do not pay (as in §8.1); where they run,
+dynamic tiles take 2.5% off the step. The MXFP8 return is now the fastest configuration here (−3% on the
+NVFP4 dispatch, −6% on bf16 messages): its encode and decode run at 750–800 GB/s (`csrc/moe_combine.cu`;
+the first version, one thread per 32 values, took 5 ms per step and made it slower, `r2/`). This session
+also found a use-after-free in `ep_serial`: the side stream's wait released the process group's references
+to the message buffers while only that stream waited for the transfer, so the compute stream could reuse a
+buffer NCCL was still reading (out-of-range ids, a device-side assert, `eprof2.log` of the first run); the
+buffers are now recorded on the side stream. 100 MoE tests passed over NCCL on the two GPUs.
+
+### 8.8 Chunks with nodes, and the v0.18 options, on four RTX PRO 4500 (`experiments/results/v0.18_ep_4xpro4500/`)
+
+The host of §8.2 again (two PCIe host bridges, two GPUs each; 3.1 GiB/s all-to-all across them, 19.5
+within), nodes of two. `bench/bench_moe_ep.py`, NVFP4 experts, milliseconds per training step (forward +
+backward) of one layer on each GPU, 16,384 tokens per GPU; data parallelism = the local layer + the
+all-reduce of its expert gradients:
+
+| path | layer A (d 1024, 8 experts, top-2) | layer B (d 2048, 32 experts, top-4, shared 2816) |
+|---|---|---|
+| data parallelism | 12.8 + 38.8 = 51.6 | 38.4 + 156.7 = 195.1 |
+| once per rank | 86.0 | 195.6 |
+| … chunks 2 (dynamic tiles) | 66.2 | 163.6 |
+| … NVFP4 dispatch + MXFP8 return, chunks 2 | 46.4 | 110.1 |
+| nodes (v0.17's best: 96.1 on B) | 38.5 | 95.4 |
+| nodes, chunks 2, concurrent exchanges (`ep_serial=False`, v0.17) | 100.5 | 230.3 |
+| **nodes, chunks 2, serialized** (`ep_serial`, the default now) | 40.0 | 80.4 |
+| nodes, chunks 2, serialized, fixed tiles | 41.5 | 84.4 |
+| nodes, MXFP8 return | 33.4 | 82.9 |
+| nodes, NVFP4 dispatch | 36.0 | 88.7 |
+| **nodes, NVFP4 dispatch + MXFP8 return, chunks 2, serialized** | 44.1 | **67.2** |
+
+**The chunks-with-nodes regression was concurrent collectives on two communicators.** With chunks, chunk
+c's node exchange and chunk c + 1's rail exchange were in flight together on the rail and node
+sub-groups; NCCL's kernels then took 875 ms of kernel time per step instead of 131 (`eprof4.log`,
+summed over kernels), and the step 2.7× as long as without chunks (266.7 vs 97.2 ms in the profile).
+Issuing every exchange from one stream, each after the previous one ends (`ep_serial`, "auto" with nodes
+and chunks), makes chunks 2 14–16% *faster* than none (83.2 / 80.4 vs 97.2 / 95.4 ms). The other suspects
+are cleared by the same profile: the v0.16 bmm combine (`nodes_chunks2_unfused`, 302.9) and an SM margin
+(255.6) do not help, and four chunks are slower than two (107.9). v0.17's 113.9 ms with the older combine
+had the collectives' timing line up by chance. On layer A, whose exchange is small, chunks no longer cost
+but do not gain either.
+
+**Messages.** With nodes the MXFP8 return pays the most (layer B 95.4 → 82.9 alone; 67.2 with the NVFP4
+dispatch and chunks, −30% on v0.17's best and 2.9× data parallelism). Without nodes the same combination
+takes layer B from 195.6 to 110.1.
+
+**The GEMMs beside the cross-bridge all-to-all** (`bench/bench_overlap.py`, four GPUs): the fixed
+assignment ran 2.07–2.22× slower than alone (margin 8: 1.32–1.36×; NCCL's grid: 2 CTAs), dynamic claiming
+1.04–1.08×, with any `NCCL_MAX_NCHANNELS`. In the layer the fixed tiles cost 3–5% of the step
+(`… fixed tiles` rows; the profile's compute kernels: 54.4 vs 48.9 ms). The two-GPU runs of that benchmark
+deadlocked on this pod: each rank chose its own number of queued all-to-alls from its timings; rank 0's
+count is now broadcast. Tests: 100 MoE tests over NCCL on the four GPUs passed.
 
 ## 9. RTX PRO 4500 Blackwell (v0.17, `experiments/results/v0.17_ep_4xpro4500/nvfp4_results2/`)
 
