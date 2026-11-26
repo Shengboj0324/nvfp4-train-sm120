@@ -1,0 +1,117 @@
+{
+ "dropless": {
+  "wall_ms": 49.1931960277725,
+  "compute_kernels_ms": 40.030717499999874,
+  "nccl_kernels_ms": 31.515754500000003,
+  "compute_busy_ms": 40.030717499999874,
+  "compute_idle_ms": 9.162478527772628,
+  "host_sync_ms": 0.0,
+  "kernels_per_step": 464.0,
+  "top_kernels_ms": {
+   "void nvfp4::gemm::tma::nvfp4_gemm_tma_kernel<__nv_bfloat16, false, tru": 7.0560572499999985,
+   "void nvfp4::gemm::tma::nvfp4_gemm_tma_kernel<float, true, true>(nvfp4:": 6.806246249999981,
+   "void at::native::vectorized_elementwise_kernel<4, at::native::bfloat16": 2.0700727499999916,
+   "void at::native::vectorized_elementwise_kernel<4, at::native::CUDAFunc": 1.8311810000000084,
+   "void nvfp4::gemm::tma::nvfp4_gemm_tma_kernel<float, false, true>(nvfp4": 1.7940362499999956,
+   "void nvfp4::combine::combine_fwd_kernel<__nv_bfloat16, 8>(__nv_bfloat1": 1.6523145000000041,
+   "void at::native::vectorized_gather_kernel<16, long>(char*, char*, long": 1.3816394999999912,
+   "void nvfp4::dual::dual_quantize_kernel<__nv_bfloat16, 0, false>(__nv_b": 1.3642079999999912,
+   "void nvfp4::dual::dual_quantize_kernel<__nv_bfloat16, 6, false>(__nv_b": 1.2357662500000033,
+   "void nvfp4::dual::amax_tile_kernel<__nv_bfloat16, 6, false>(__nv_bfloa": 1.1951017499999934,
+   "void at::native::(anonymous namespace)::CatArrayBatchedCopy_vectorized": 1.0699807499999903,
+   "void nvfp4::combine::combine_bwd_rows_kernel<__nv_bfloat16, 8>(__nv_bf": 1.0122432499999996
+  }
+ },
+ "chunks2": {
+  "wall_ms": 52.26397473597899,
+  "compute_kernels_ms": 47.085935750000075,
+  "nccl_kernels_ms": 40.407062500000016,
+  "compute_busy_ms": 47.08551975000008,
+  "compute_idle_ms": 5.1784549859789095,
+  "host_sync_ms": 0.0,
+  "kernels_per_step": 708.0,
+  "top_kernels_ms": {
+   "void nvfp4::gemm::tma::nvfp4_gemm_tma_kernel<float, true, true>(nvfp4:": 8.184951999999988,
+   "void nvfp4::gemm::tma::nvfp4_gemm_tma_kernel<__nv_bfloat16, false, tru": 6.948609000000004,
+   "void at::native::vectorized_elementwise_kernel<4, at::native::CUDAFunc": 4.008461999999984,
+   "void at::native::vectorized_elementwise_kernel<4, at::native::bfloat16": 2.107000749999987,
+   "void nvfp4::gemm::tma::nvfp4_gemm_tma_kernel<float, false, true>(nvfp4": 1.867901249999998,
+   "void nvfp4::dual::dual_quantize_kernel<float, 0, false>(float const*, ": 1.809188250000014,
+   "void at::native::vectorized_elementwise_kernel<4, at::native::FillFunc": 1.57843750000002,
+   "void nvfp4::combine::combine_fwd_kernel<__nv_bfloat16, 8>(__nv_bfloat1": 1.57583450000001,
+   "void nvfp4::dual::amax_flat_kernel<float>(float const*, long, unsigned": 1.528018000000004,
+   "void nvfp4::dual::dual_quantize_kernel<__nv_bfloat16, 0, false>(__nv_b": 1.3916160000000015,
+   "void at::native::elementwise_kernel<128, 4, at::native::gpu_kernel_imp": 1.3367520000000064,
+   "void at::native::(anonymous namespace)::CatArrayBatchedCopy_vectorized": 1.3219907500000223
+  }
+ },
+ "chunks2_margin8": {
+  "wall_ms": 50.80566325341351,
+  "compute_kernels_ms": 46.03320425000013,
+  "nccl_kernels_ms": 42.0222755,
+  "compute_busy_ms": 46.032564250000135,
+  "compute_idle_ms": 4.773099003413378,
+  "host_sync_ms": 0.0,
+  "kernels_per_step": 708.0,
+  "top_kernels_ms": {
+   "void nvfp4::gemm::tma::nvfp4_gemm_tma_kernel<float, true, true>(nvfp4:": 7.6319529999999975,
+   "void nvfp4::gemm::tma::nvfp4_gemm_tma_kernel<__nv_bfloat16, false, tru": 6.36068099999999,
+   "void at::native::vectorized_elementwise_kernel<4, at::native::CUDAFunc": 4.011102750000015,
+   "void at::native::vectorized_elementwise_kernel<4, at::native::bfloat16": 2.0974472500000125,
+   "void nvfp4::dual::dual_quantize_kernel<float, 0, false>(float const*, ": 1.8153025000000005,
+   "void nvfp4::gemm::tma::nvfp4_gemm_tma_kernel<float, false, true>(nvfp4": 1.7913167500000027,
+   "void at::native::vectorized_elementwise_kernel<4, at::native::FillFunc": 1.581602000000024,
+   "void nvfp4::combine::combine_fwd_kernel<__nv_bfloat16, 8>(__nv_bfloat1": 1.5803230000000126,
+   "void nvfp4::dual::amax_flat_kernel<float>(float const*, long, unsigned": 1.52616999999998,
+   "void nvfp4::dual::dual_quantize_kernel<__nv_bfloat16, 0, false>(__nv_b": 1.3996569999999882,
+   "void at::native::elementwise_kernel<128, 4, at::native::gpu_kernel_imp": 1.3500142499999646,
+   "void at::native::(anonymous namespace)::CatArrayBatchedCopy_vectorized": 1.3222384999999948
+  }
+ },
+ "wire_nvfp4": {
+  "wall_ms": 48.04054574924521,
+  "compute_kernels_ms": 41.41061825000007,
+  "nccl_kernels_ms": 26.527490000000004,
+  "compute_busy_ms": 41.41001825000007,
+  "compute_idle_ms": 6.63052749924514,
+  "host_sync_ms": 0.0,
+  "kernels_per_step": 473.0,
+  "top_kernels_ms": {
+   "void nvfp4::gemm::tma::nvfp4_gemm_tma_kernel<__nv_bfloat16, false, tru": 7.056688500000004,
+   "void nvfp4::gemm::tma::nvfp4_gemm_tma_kernel<float, true, true>(nvfp4:": 6.7803095000000075,
+   "void at::native::vectorized_elementwise_kernel<4, at::native::bfloat16": 2.070856000000007,
+   "void at::native::vectorized_elementwise_kernel<4, at::native::CUDAFunc": 1.8266850000000077,
+   "void nvfp4::gemm::tma::nvfp4_gemm_tma_kernel<float, false, true>(nvfp4": 1.8215485000000053,
+   "void nvfp4::combine::combine_fwd_kernel<__nv_bfloat16, 8>(__nv_bfloat1": 1.6560034999999982,
+   "void nvfp4::dual::dual_quantize_kernel<__nv_bfloat16, 0, false>(__nv_b": 1.5456575000000052,
+   "void at::native::vectorized_gather_kernel<16, long>(char*, char*, long": 1.399344000000008,
+   "void nvfp4::dual::dual_quantize_kernel<__nv_bfloat16, 6, false>(__nv_b": 1.2449902499999936,
+   "void nvfp4::dual::amax_tile_kernel<__nv_bfloat16, 6, false>(__nv_bfloa": 1.1788772499999913,
+   "void nvfp4::dequantize_kernel<__nv_bfloat16>(unsigned char const*, lon": 1.1301010000000011,
+   "void at::native::(anonymous namespace)::CatArrayBatchedCopy_vectorized": 1.04424425
+  }
+ },
+ "cap1.25": {
+  "wall_ms": 73.35227573639713,
+  "compute_kernels_ms": 47.492082000000046,
+  "nccl_kernels_ms": 74.68221150000004,
+  "compute_busy_ms": 47.491809750000044,
+  "compute_idle_ms": 25.860465986397088,
+  "host_sync_ms": 0.0,
+  "kernels_per_step": 380.0,
+  "top_kernels_ms": {
+   "void nvfp4::gemm::tma::nvfp4_gemm_tma_kernel<float, true, true>(nvfp4:": 7.783953499999996,
+   "void nvfp4::gemm::tma::nvfp4_gemm_tma_kernel<__nv_bfloat16, false, tru": 7.323037750000001,
+   "void at::native::vectorized_gather_kernel<16, long>(char*, char*, long": 2.6925834999999863,
+   "void at::native::indexFuncLargeIndex<c10::BFloat16, long, unsigned int": 2.448836999999998,
+   "void at::native::vectorized_elementwise_kernel<4, at::native::bfloat16": 2.336235500000005,
+   "void at::native::(anonymous namespace)::CatArrayBatchedCopy_vectorized": 2.1471605000000062,
+   "void nvfp4::gemm::tma::nvfp4_gemm_tma_kernel<float, false, true>(nvfp4": 2.120712250000006,
+   "void nvfp4::combine::combine_fwd_kernel<__nv_bfloat16, 8>(__nv_bfloat1": 1.8396065000000048,
+   "void at::native::vectorized_elementwise_kernel<4, at::native::CUDAFunc": 1.8226775000000166,
+   "void nvfp4::dual::dual_quantize_kernel<__nv_bfloat16, 0, false>(__nv_b": 1.6472992500000065,
+   "void at::native::vectorized_elementwise_kernel<4, at::native::FillFunc": 1.511441750000008,
+   "void nvfp4::dual::dual_quantize_kernel<__nv_bfloat16, 6, false>(__nv_b": 1.489560749999995
+  }
+ }
+}

@@ -173,6 +173,17 @@ for R in (0, 1, 37, 130):
     for dt in (torch.bfloat16, torch.float32):
         ops.dequantize(msg[:, :128], msg[:, 128:144], msg[:, 144:148].view(torch.float32)[:, 0], dt)
         ops.dequantize(q.data, q.scales, q.gdec, dt)
+from nvfp4 import _library as _lib  # noqa: E402
+for dt in (torch.bfloat16, torch.float32, torch.float16):
+    for dd in (256, 200):  # 16-byte vectors / scalar path
+        rows = torch.randn(130, dd + 8, device=d, dtype=dt)[:, :dd]  # strided rows
+        posc = torch.randint(-1, 140, (37, 3), device=d)
+        wc = torch.rand(37, 3, device=d)
+        gc = _lib.combine_fwd(rows, posc, wc)
+        _lib.combine_fwd(rows.contiguous(), posc, None)
+        inv = torch.randint(-1, 111, (130,), device=d)
+        _lib.combine_bwd_rows(gc, inv, wc, 3)
+        _lib.combine_bwd_w(gc, rows.contiguous(), posc)
 ops.set_sm_margin(40)
 qa, _ = ops.quantize_dual(torch.randn(384, 512, device=d), col=False)
 ops.gemm(qa, qa, impl="tma")

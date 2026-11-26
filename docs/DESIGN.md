@@ -674,9 +674,91 @@ The MoE layer around it (`nvfp4/moe.py`):
     function's backward waits for it; autograd runs ready nodes with the highest sequence number first,
     so the nodes created between the two in the forward run, in reverse, while the gradients travel.
     The layer puts the shared expert there, during the return of the expert outputs (a test checks the
-    call order). Without a shared expert there is nothing independent to overlap at this level; splitting
-    the tokens into chunks to pipeline the exchange against the experts is not done.
-  - Not done: hierarchical (intra- / inter-node) all-to-alls; they need a multi-node machine.
+    call order).
+  - **Variable-size exchanges (v0.17)** replace v0.16's dropless path (and serve a capacity too, with
+    `ep_dispatch="variable"`). Three changes, each aimed at the exchange that v0.16 measured as the
+    whole cost of expert parallelism on PCIe machines (RESULTS.md §8.1):
+    - *Once per rank.* v0.16 sent every slot, so a token whose k experts sit on one rank crossed the
+      link k times, and its k outputs came back separately. Now a token travels once to each rank that
+      holds one of its experts, with those experts' ids and routing weights (fp32) in the same message,
+      and the rank returns one row: the weighted sum of its experts' outputs (the layout of DeepSeek's
+      DeepEP). With top-4 of 32 experts on two ranks a token reaches 1.9 ranks on average instead of
+      sending 4 rows. A router (`_route`) computes, on the GPU, one sent row per (token, member) pair
+      grouped by member, the member-local ids, and for the backward the row each (token, choice) maps
+      to (its member's first choice; the others point at a zero row, so each token's gradient is a
+      gather-sum over distinct rows: deterministic). The weights' gradients come back through the same
+      reverse message; at most one sent row carries a nonzero weight per choice, so their gather-sums
+      add exact zeros.
+    - *Counts once.* The receivers' sizes depend on routing, so they are read on the host, but once per
+      forward: one integer all-to-all carries, per chunk and destination, the slots per expert there,
+      the rows to it, to its node and to each rank of its node, and the input's amax (for the NVFP4
+      wire). Every message of every chunk and stage is then sized from that one read.
+    - *Byte messages.* A payload (rows, weights, ids) is packed into one uint8 row per token, so each
+      exchange is one all-to-all; a start function (async) and a wait function as in v0.16, now carrying
+      a scalar handle through autograd because the bytes are not differentiable.
+  - **Nodes (v0.17, `ep_node_size` L).** With W = N L ranks in nodes of L consecutive ranks, a token
+    crosses to another node once per node it needs (DeepEP's node-limited layout), to the rank with the
+    sender's position in that node: the "rails" (one per position, N ranks each) carry only inter-node
+    traffic, which on rail-optimized clusters is one NIC per position. The receiving rank routes the
+    token again, once per rank of its node holding one of its experts, and on the way back sums its
+    node's rows, so the return crosses nodes once per (token, node) too. Both stages are all-to-alls over
+    the whole group's communicator with zero-size splits to every rank outside the rail or node: a first
+    version used rail and node sub-groups, and with chunks their collectives were in flight at once next to
+    the persistent GEMMs and stalled each other (2.4x slower than unchunked); one communicator serializes
+    them in one order. Tested with four
+    processes as two nodes of two on one GPU (gloo) and over NCCL on four GPUs against the single-process
+    layer. No multi-node machine was available; it was timed on one host whose GPUs sit in pairs behind
+    separate PCIe host bridges, the pairs as nodes (RESULTS.md §8.2).
+  - **Chunks (v0.17, `ep_chunks` n).** The routed experts used to wait for all their rows. Now the tokens
+    go in n contiguous chunks, each a generator that yields after starting each exchange, run in a
+    wavefront: at each step the later chunks start their next exchange before the earlier ones compute,
+    so chunk c + 1's rows travel while chunk c's experts run, and chunk c's outputs return while chunk
+    c + 1's run. In the backward the same structure falls out of autograd's order: the waits' backward
+    nodes (which start the reverse exchanges) have the highest sequence numbers and all become ready at
+    once, so every chunk's output gradients leave first, and each chunk's input gradients leave as soon
+    as its experts' backward is done. Each chunk's experts form their own buffer (their hidden
+    activation's tensor scale is per chunk, the weight gradients accumulate over chunks).
+  - **SM margin (v0.17, `ops.set_sm_margin`).** The persistent GEMMs launch one CTA per SM with ~99 KB of
+    shared memory each, so an NCCL kernel issued during a GEMM finds no SM: it waits, or, if it started
+    first, the GEMM CTAs that could not become resident run their statically assigned tiles only after
+    the transfer ends. A margin leaves k SMs to concurrent kernels; GEMM results are bit-identical with
+    any margin (tested).
+  - **NVFP4 messages (v0.17, `ep_wire`, `ep_wire_grad`; NVFP4 experts).** An NVFP4 row is 9 d / 16 bytes
+    of codes and block scales plus 8 bytes (the tensor decode scale and amax), 3.6× fewer than bf16 at
+    d = 1024. The receiver dequantizes (a new kernel, bit-identical to `reference.dequantize`, reading
+    strided message rows with per-row tensor scales) and the experts quantize again. That is lossless
+    for the forward because of two things. `quantize_dual(amax_floor=)` lets a tensor's scale come from
+    max(amax, floor), and the expert-parallel layer passes the group's input amax (from the counts
+    message) both to the sender and to the experts' quantizer, so the tensor scale is the same everywhere.
+    And re-quantizing a dequantized NVFP4 row with the same tensor scale reproduces its codes and
+    block scales: each block's largest element maps back to 6 (or 4 under Four Over Six) times the same
+    e4m3 scale, and bf16 rounding of the dequantized values (2^-9 relative) is far from any rounding
+    boundary of the 1-mantissa-bit codes. So the experts' forward and input gradient are bit-identical to
+    bf16 messages (tested, also through the node stage, where the rail rank re-encodes). Only the weight
+    gradients see a difference: their token-wise operand is quantized from the dequantized rows, a
+    second rounding. Gradient messages (`ep_wire_grad`) are stochastically rounded with a tensor scale
+    agreed over the group (a one-element all-to-all in the backward) and carried along for re-encoding
+    at a rail rank. The experts' input gradients are then rounded twice, both times unbiased: the
+    receiver multiplies the rows by the routing weights before its own quantization, so the codes are
+    not reproduced. The combine direction (expert outputs, input gradients) stays bf16, as in DeepSeek-V3:
+    those tensors are otherwise unquantized.
+  - **Fused gather / combine (v0.17, `csrc/moe_combine.cu`).** The combine y[t] = Σ_j w[t, j] ys[pos[t, j]]
+  was an index_select into a [T, k, d] buffer and a batched GEMM of T 1 × k by k × d products, whose
+  backward is a scatter-add (atomics). Profiled on expert-parallel steps (RESULTS.md §8.2) those kernels
+  and their copies took 15–20 ms of a 70 ms step. Now one kernel reads each of a token's k rows once and
+  accumulates in fp32 in choice order (one rounding; indices outside the rows read nothing, so no zero row
+  is concatenated). The backward is two gathers: each row's gradient comes from the one choice that reads
+  it (the layer's layouts guarantee that, or the choice has weight zero; the reader is found with an
+  integer scatter-max, deterministic), and the weights' gradients are per-choice dot products, a warp per
+  choice. The same kernel is the token dispatch's backward (a gather-sum with unit weights) and the
+  expert-parallel partial sums. The weights are rounded to the rows' dtype first, as the batched GEMM took
+  them, so compiled and eager steps stay bit-identical. `NVFP4_MOE_FUSED_COMBINE=0` restores the old
+  path. The single-GPU MoE layer gets 8–15% faster in NVFP4 (3–7% in BF16) and uses ~2 GB less at 16k
+  tokens (RESULTS.md §8).
+- **With data parallelism.** The experts' gradients already sum every rank's tokens, so data
+    parallelism over the same ranks must skip them (`ignore_expert_parameters_in_ddp`) and scale them by
+    1 / W to match DDP's average (`scale_expert_grads`); a two-rank DDP test checks every gradient
+    against one process training on both batches, and `train_gpt.py --moe-ep` trains that way.
 
 ## 5. Verification
 
@@ -696,6 +778,7 @@ The MoE layer around it (`nvfp4/moe.py`):
 | Integration | `tests/test_integration_cuda.py` | GPU seed tensors == integer seeds bit for bit (all four quantizers); no host sync in a training step; `torch.compile(fullgraph=True)` with no graph breaks, bit-identical to eager; CUDA-graph capture of fwd+bwd (fresh seeds per replay, noise averages out) and of a full Adam step (loss falls); fused accumulation in place with hooks firing, and under `torch.autograd.grad`; outputs not views; **two-process DDP (plain and bucket views), FSDP1 (flat and `use_orig_params`) and FSDP2** over gloo, fused and unfused, bit-exact vs a single-process reference; deterministic mode + flash attention reproduces a block's gradients bit for bit |
 | 8-bit attention (v0.9) | `tests/test_attention_cuda.py` | operand quantizer **bit-exact** vs `reference.int8_token_quantize` / `mxfp8_quantize` (both layouts, σ order, scale layout, mean subtraction, padding, strided inputs, Delta); forward vs `reference.attention_8bit` (< 3%) and exact attention (< 5%); gradients vs exact attention (< 7%) for causal / full, GQA, N = 1…2048, D = 64 / 128, bf16 / fp16; backward bitwise deterministic; gradient layouts; NaN propagation; SDPA fallback; `torch.compile(fullgraph=True)` |
 | Grouped GEMMs, MoE (v0.12–v0.15) | `tests/test_grouped_gemm_cuda.py`, `tests/test_moe_cuda.py`, `tests/test_moe_integration_cuda.py` | ragged M / K vs fp64 and bit-identical to the per-group dense TMA GEMM; unused tiles and empty segments store zeros (or leave accumulated outputs unchanged) between real units; per-group bias epilogue == `D_bf16 + bias[g]` bit for bit on each tile's real rows; MoE (with and without biases, NVFP4 / grouped BF16 / loop) vs a per-token loop, BF16 experts and a per-group fp64 GEMM; bias gradients == routed gradient sums, bias-only training bit-identical; grouped BF16 == loop at bf16 level, deterministic; no host sync in forward + backward; CUDA-graph forward replays == eager bit for bit under changing routing; captured Adam steps learn; `torch.compile(fullgraph=True)` == eager (bit-identical outputs, bias and NVFP4 weight gradients with `emulate_precision_casts`); checkpointing bit-exact; **two-process DDP, FSDP1, FSDP2** bit-exact, fused and unfused; capacity and the shared expert vs a per-token reference (dropped-slot counts exact; a capacity no slot reaches == dropless bit for bit); **two-rank expert parallelism** == the single-process layer per rank (fp32), local expert gradients == the sum over ranks |
+| Expert parallelism, wire, combine (v0.17) | `tests/test_moe_ep_cuda.py` | dequantize **bit-exact** vs `reference.dequantize` (bf16 / fp32, strided message rows, per-row tensor scales); `amax_floor` == quantizing with an extra row at the floor (plain and multi-part paths); NVFP4 message round trip reproduces codes and scales (also with Four Over Six); the router's (row, member) pairs, ids, masks and positions on a worked example; persistent GEMMs bit-identical with an SM margin; **two- and four-process expert parallelism** (flat and two nodes of two; dropless and capacity; 1–7 chunks) == the single-process layer in fp32, every gradient; NVFP4: forward and input gradient with NVFP4 messages **bit-identical** to bf16 messages (also through the node stage), weight gradients and NVFP4 gradient messages by cosine; the same over NCCL on 2 / 4 GPUs; DDP + expert parallelism == one process on both batches (every gradient); fused combine == fp32 reference **bit for bit** (bf16 / fp16 / fp32, vector and scalar paths, strided rows), its gradients == autograd, the layer == the bmm path |
 | Memory / race safety | `tools/sanitize.sh` | compute-sanitizer memcheck, racecheck, synccheck, initcheck over every kernel variant (ragged shapes, TMA and cp.async loops, persistent grids with more units than SMs, split-K, accumulate, the bias / residual epilogue, all producer ops, multi-part inputs, the norm backward, GPU-resident seeds, layer and v0.8 block forward + backward, 8-bit attention forward + backward): 0 findings |
 | Long-run stability | `tools/soak.py` | 8 minutes (v0.7): 18,401 fused + unfused training iterations, 3,682 bit-exact gradient replays, 92,005 GEMMs re-checked bit for bit; 5 minutes (v0.8, residual-fused blocks): 14,474 iterations, 2,896 replays, 72,370 GEMMs; no non-finite values, no hang |
 | Packaging | wheel built and installed into an isolated directory | imports and trains from outside the repository |
@@ -706,6 +789,10 @@ Every benchmark checks correctness against the reference before it times anythin
 
 ## 6. Known limitations and next steps
 
+Done in v0.17: expert parallelism with each token sent once per rank (or node, two-stage), chunked
+exchanges overlapping the experts, NVFP4 messages, an SM margin for the persistent GEMMs, expert parallelism
+under DDP, a fused gather / combine for every MoE path (§4.5, item 5); measured on four RTX PRO 4500
+Blackwell (a second sm_120 model: tests, sanitizers, soak, benchmarks; item 7).
 Done in v0.16: dropless expert parallelism, the shared expert overlapped with the expert parallel
 exchange, expert parallelism measured over NCCL on two RTX 5090s, and native Windows tests on PyTorch 2.11
 (§4.5, items 5 and 7).
@@ -775,9 +862,13 @@ accumulation.
    norm-free MLPs) post-norm, with biases anywhere. Mixture-of-experts MLPs (`nvfp4.moe.MoE`, dropless
    top-k; v0.11, grouped GEMMs since v0.12, sync-free since v0.13, biases and a sync-free BF16 path since
    v0.14, capacity, shared expert and expert parallelism since v0.15, §4.5) cover SwiGLU and GELU experts.
-   Expert parallelism, with a capacity or dropless (v0.16), is verified on one GPU (two gloo processes)
-   and over NCCL on two RTX 5090s (RESULTS.md §8). Only the shared expert overlaps with the exchange;
-   the routed experts wait for their rows.
+   Expert parallelism (fixed-size or variable-size exchanges, nodes, chunks, NVFP4 messages; v0.15–v0.17)
+   is verified with two and four gloo processes on one GPU and over NCCL on two RTX 5090s and four RTX PRO
+   4500 (RESULTS.md §8.1–8.2). Not timed: a real multi-node cluster (the two-stage exchanges ran over pairs
+   of GPUs behind separate PCIe host bridges of one host). Chunks overlap the exchange, but on that host the
+   expert GEMMs run ~1.7x slower while NCCL copies run beside them (memory contention), and an SM margin does
+   not change that; on fast links chunking costs a few percent. The combine direction (expert outputs,
+   input gradients) always travels in bf16.
 6. **Framework coverage.** DDP, FSDP1 and FSDP2 are tested with two ranks on one GPU over gloo and
    (v0.8) with NCCL across two physical RTX 5090s, bit-identical to a single process. Data-parallel
    *speed* depends on the host: on the rented two-GPU machine all-reduce ran at 2 GB/s (no P2P), so DDP
@@ -797,6 +888,13 @@ accumulation.
    at a time (tested against the flash backward on Linux). Its gloo crashes on all_reduce of CUDA
    tensors (an access violation, even with one rank; all_to_all works), so DDP / FSDP over gloo on
    Windows with that PyTorch is unusable and those tests skip (they passed with 2.7.1).
+   v0.17 ran the suite, the sanitizers and the soak on an RTX PRO 4500 Blackwell (82 SMs, 200 W, 32 GB;
+   PyTorch 2.11, CUDA 12.8), the first sm_120 part besides the RTX 5090s: all pass (after two fixes for
+   PyTorch 2.11's torch.compile: the attention backward's flash check is now decided at import, and the MoE
+   compile test compares numerically before 2.14, whose inductor rounds bf16 casts like eager). The GEMM
+   reaches 491 TFLOPS there, 1.0–2.0x cuBLASLt's NVFP4, and the training-step gains match the larger parts
+   (RESULTS.md §9). The 8-bit attention does not pay there: 0.77–1.01x SDPA forward + backward (it was
+   tuned on the 5090's 170 SMs and power budget).
 
 ## 7. 8-bit attention (`csrc/attention.cu`, `nvfp4/attention.py`, v0.9)
 

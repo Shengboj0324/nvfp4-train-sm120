@@ -1,0 +1,11 @@
+W1126 03:09:19.847000 6026 torch/distributed/run.py:851] 
+W1126 03:09:19.847000 6026 torch/distributed/run.py:851] *****************************************
+W1126 03:09:19.847000 6026 torch/distributed/run.py:851] Setting OMP_NUM_THREADS environment variable for each process to be 1 in default, to avoid your system being overloaded, please further tune the variable for optimal performance in your application as needed. 
+W1126 03:09:19.847000 6026 torch/distributed/run.py:851] *****************************************
+d=1024 d_ff=2816 E=8 k=2 T=16384 shared=0 bf16  local 19.65 ms  ep cap 1.25 34.62 ms  ep dropless 25.28 ms  ep dropless chunks 2 24.20 ms  ep dropless chunks 4 28.51 ms  ep dropless chunks 2 margin 8 24.14 ms  ep dropless chunks 4 margin 8 28.48 ms
+d=1024 d_ff=2816 E=8 k=2 T=16384 shared=0 nvfp4 local 12.56 ms  ep cap 1.25 23.05 ms  ep dropless 19.33 ms  ep dropless chunks 2 18.99 ms  ep dropless chunks 4 25.41 ms  ep dropless chunks 2 margin 8 18.78 ms  ep dropless chunks 4 margin 8 25.27 ms  ep wire nvfp4 18.81 ms  ep wire nvfp4 chunks 2 19.55 ms  ep wire nvfp4+grad chunks 2 19.83 ms  ep wire nvfp4 chunks 2 margin 8 19.36 ms  ep wire nvfp4 chunks 4 margin 8 26.09 ms
+  a2a of 80 MiB: 2.03 ms (19.3 GiB/s sent per GPU); all-reduce of 132 MiB expert gradients: 7.37 ms
+d=2048 d_ff=1408 E=32 k=4 T=16384 shared=2816 bf16  local 60.81 ms  ep cap 1.25 107.17 ms  ep cap serial 116.66 ms  ep dropless 63.38 ms  ep dropless chunks 2 67.48 ms  ep dropless chunks 4 79.34 ms  ep dropless chunks 2 margin 8 67.62 ms  ep dropless chunks 4 margin 8 79.45 ms
+d=2048 d_ff=1408 E=32 k=4 T=16384 shared=2816 nvfp4 local 38.15 ms  ep cap 1.25 72.57 ms  ep cap serial 76.38 ms  ep dropless 47.33 ms  ep dropless chunks 2 51.26 ms  ep dropless chunks 4 63.82 ms  ep dropless chunks 2 margin 8 49.87 ms  ep dropless chunks 4 margin 8 62.56 ms  ep wire nvfp4 47.01 ms  ep wire nvfp4 chunks 2 51.32 ms  ep wire nvfp4+grad chunks 2 52.52 ms  ep wire nvfp4 chunks 2 margin 8 50.07 ms  ep wire nvfp4 chunks 4 margin 8 63.41 ms
+  a2a of 320 MiB: 8.01 ms (19.5 GiB/s sent per GPU); all-reduce of 528 MiB expert gradients: 27.54 ms
+[guard] elapsed 81s | peak GPU temp 66C, power 202W, GPU mem 11810MB | min host mem avail 240737MB | cooldown 0s

@@ -1,0 +1,152 @@
+== session start 2026-11-26T03:05:36Z
+
+==================== env ====================
+Thu Nov 26 03:05:36 2026       
++-----------------------------------------------------------------------------------------+
+| NVIDIA-SMI 595.112.07             Driver Version: 595.112.07     CUDA Version: 13.2     |
++-----------------------------------------+------------------------+----------------------+
+| GPU  Name                 Persistence-M | Bus-Id          Disp.A | Volatile Uncorr. ECC |
+| Fan  Temp   Perf          Pwr:Usage/Cap |           Memory-Usage | GPU-Util  Compute M. |
+|                                         |                        |               MIG M. |
+|=========================================+========================+======================|
+|   0  NVIDIA RTX PRO 4500 Blac...    On  |   00000000:01:00.0 Off |                  Off |
+| 31%   31C    P8              5W /  200W |       2MiB /  32623MiB |      0%      Default |
+|                                         |                        |                  N/A |
++-----------------------------------------+------------------------+----------------------+
+|   1  NVIDIA RTX PRO 4500 Blac...    On  |   00000000:81:00.0 Off |                  Off |
+| 34%   34C    P8              8W /  200W |       2MiB /  32623MiB |      0%      Default |
+|                                         |                        |                  N/A |
++-----------------------------------------+------------------------+----------------------+
+|   2  NVIDIA RTX PRO 4500 Blac...    On  |   00000000:82:00.0 Off |                  Off |
+| 31%   31C    P8             12W /  200W |       2MiB /  32623MiB |      0%      Default |
+|                                         |                        |                  N/A |
++-----------------------------------------+------------------------+----------------------+
+|   3  NVIDIA RTX PRO 4500 Blac...    On  |   00000000:C1:00.0 Off |                  Off |
+| 31%   31C    P8             13W /  200W |       2MiB /  32623MiB |      0%      Default |
+|                                         |                        |                  N/A |
++-----------------------------------------+------------------------+----------------------+
+
++-----------------------------------------------------------------------------------------+
+| Processes:                                                                              |
+|  GPU   GI   CI              PID   Type   Process name                        GPU Memory |
+|        ID   ID                                                               Usage      |
+|=========================================================================================|
+|  No running processes found                                                             |
++-----------------------------------------------------------------------------------------+
+index, name, compute_cap, memory.total [MiB], power.limit [W], clocks.max.sm [MHz], pcie.link.gen.max, pcie.link.width.max
+0, NVIDIA RTX PRO 4500 Blackwell, 12.0, 32623 MiB, 200.00 W, 3090 MHz, 4, 16
+1, NVIDIA RTX PRO 4500 Blackwell, 12.0, 32623 MiB, 200.00 W, 3090 MHz, 4, 16
+2, NVIDIA RTX PRO 4500 Blackwell, 12.0, 32623 MiB, 200.00 W, 3090 MHz, 4, 16
+3, NVIDIA RTX PRO 4500 Blackwell, 12.0, 32623 MiB, 200.00 W, 3090 MHz, 4, 16
+	[4mGPU0	GPU1	GPU2	GPU3	CPU Affinity	NUMA Affinity	GPU NUMA ID[0m
+GPU0	 X 	NODE	NODE	NODE	0-63	0		N/A
+GPU1	NODE	 X 	PHB	NODE	0-63	0		N/A
+GPU2	NODE	PHB	 X 	NODE	0-63	0		N/A
+GPU3	NODE	NODE	NODE	 X 	0-63	0		N/A
+
+Legend:
+
+  X    = Self
+  SYS  = Connection traversing PCIe as well as the SMP interconnect between NUMA nodes (e.g., QPI/UPI)
+  NODE = Connection traversing PCIe as well as the interconnect between PCIe Host Bridges within a NUMA node
+  PHB  = Connection traversing PCIe as well as a PCIe Host Bridge (typically the CPU)
+  PXB  = Connection traversing multiple PCIe bridges (without traversing the PCIe Host Bridge)
+  PIX  = Connection traversing at most a single PCIe bridge
+  NV#  = Connection traversing a bonded set of # NVLinks
+driver supports CUDA 13.2
+nvcc 12.8 at /usr/local/cuda
+ERROR: Could not find a version that satisfies the requirement torch==2.14.1 (from versions: 2.7.0+cu128, 2.7.1+cu128, 2.8.0+cu128, 2.9.0+cu128, 2.9.1+cu128, 2.10.0+cu128, 2.11.0+cu128)
+ERROR: No matching distribution found for torch==2.14.1
+torch 2.11.0+cu128 cuda 12.8 ['NVIDIA RTX PRO 4500 Blackwell', 'NVIDIA RTX PRO 4500 Blackwell', 'NVIDIA RTX PRO 4500 Blackwell', 'NVIDIA RTX PRO 4500 Blackwell']
+0ddad55 MoE: fused gather / combine kernels (csrc/moe_combine.cu) for the combine, the EP partial sums and the dispatch backward; NVFP4_MOE_FUSED_COMBINE switch; v0.17 pod results, wire study
+== env: ok (107 s)
+
+==================== build ====================
+ptxas info    : Used 56 registers, used 1 barriers, 18968 bytes smem
+    8 bytes stack frame, 8 bytes spill stores, 12 bytes spill loads
+ptxas info    : Used 80 registers, used 1 barriers, 8 bytes cumulative stack size, 18968 bytes smem
+ptxas info    : Used 48 registers, used 1 barriers, 16680 bytes smem
+ptxas info    : Used 80 registers, used 1 barriers, 16688 bytes smem
+ptxas info    : Used 51 registers, used 1 barriers, 18968 bytes smem
+ptxas info    : Used 80 registers, used 1 barriers, 16 bytes cumulative stack size, 18968 bytes smem
+ptxas info    : Used 48 registers, used 1 barriers, 16680 bytes smem
+ptxas info    : Used 80 registers, used 1 barriers, 16688 bytes smem
+ptxas info    : Used 56 registers, used 1 barriers, 18968 bytes smem
+ptxas info    : Used 89 registers, used 1 barriers, 18968 bytes smem
+ptxas info    : Used 38 registers, used 1 barriers, 32 bytes smem
+ptxas info    : Used 48 registers, used 1 barriers, 16680 bytes smem
+ptxas info    : Used 80 registers, used 1 barriers, 16688 bytes smem
+ptxas info    : Used 54 registers, used 1 barriers, 18968 bytes smem
+ptxas info    : Used 89 registers, used 1 barriers, 18968 bytes smem
+ptxas info    : Used 30 registers, used 1 barriers, 32 bytes smem
+ptxas info    : Used 48 registers, used 1 barriers, 16680 bytes smem
+ptxas info    : Used 80 registers, used 1 barriers, 16688 bytes smem
+x86_64-linux-gnu-g++ -shared -Wl,-O1 -Wl,-Bsymbolic-functions -Wl,-Bsymbolic-functions -g -fwrapv -O2 -Wl,-Bsymbolic-functions -g -fwrapv -O2 -g -fstack-protector-strong -Wformat -Werror=format-security -Wdate-time -D_FORTIFY_SOURCE=2 /workspace/nvfp4-train-sm120/build/temp.linux-x86_64-3.10/csrc/attention.o /workspace/nvfp4-train-sm120/build/temp.linux-x86_64-3.10/csrc/bindings.o /workspace/nvfp4-train-sm120/build/temp.linux-x86_64-3.10/csrc/gemm.o /workspace/nvfp4-train-sm120/build/temp.linux-x86_64-3.10/csrc/gemm_tma.o /workspace/nvfp4-train-sm120/build/temp.linux-x86_64-3.10/csrc/moe_combine.o /workspace/nvfp4-train-sm120/build/temp.linux-x86_64-3.10/csrc/norm.o /workspace/nvfp4-train-sm120/build/temp.linux-x86_64-3.10/csrc/quantize.o /workspace/nvfp4-train-sm120/build/temp.linux-x86_64-3.10/csrc/quantize_dual.o -L/workspace/venv/lib/python3.10/site-packages/torch/lib -L/usr/local/cuda/lib64 -lc10 -ltorch -ltorch_cpu -ltorch_python -lcudart -lc10_cuda -ltorch_cuda -o build/lib.linux-x86_64-3.10/nvfp4/_C.cpython-310-x86_64-linux-gnu.so
+== build: ok (72 s)
+
+==================== ep ====================
+97 passed in 39.76s
+W1126 03:09:19.847000 6026 torch/distributed/run.py:851] 
+W1126 03:09:19.847000 6026 torch/distributed/run.py:851] *****************************************
+W1126 03:09:19.847000 6026 torch/distributed/run.py:851] Setting OMP_NUM_THREADS environment variable for each process to be 1 in default, to avoid your system being overloaded, please further tune the variable for optimal performance in your application as needed. 
+W1126 03:09:19.847000 6026 torch/distributed/run.py:851] *****************************************
+d=1024 d_ff=2816 E=8 k=2 T=16384 shared=0 bf16  local 19.65 ms  ep cap 1.25 34.62 ms  ep dropless 25.28 ms  ep dropless chunks 2 24.20 ms  ep dropless chunks 4 28.51 ms  ep dropless chunks 2 margin 8 24.14 ms  ep dropless chunks 4 margin 8 28.48 ms
+d=1024 d_ff=2816 E=8 k=2 T=16384 shared=0 nvfp4 local 12.56 ms  ep cap 1.25 23.05 ms  ep dropless 19.33 ms  ep dropless chunks 2 18.99 ms  ep dropless chunks 4 25.41 ms  ep dropless chunks 2 margin 8 18.78 ms  ep dropless chunks 4 margin 8 25.27 ms  ep wire nvfp4 18.81 ms  ep wire nvfp4 chunks 2 19.55 ms  ep wire nvfp4+grad chunks 2 19.83 ms  ep wire nvfp4 chunks 2 margin 8 19.36 ms  ep wire nvfp4 chunks 4 margin 8 26.09 ms
+  a2a of 80 MiB: 2.03 ms (19.3 GiB/s sent per GPU); all-reduce of 132 MiB expert gradients: 7.37 ms
+d=2048 d_ff=1408 E=32 k=4 T=16384 shared=2816 bf16  local 60.81 ms  ep cap 1.25 107.17 ms  ep cap serial 116.66 ms  ep dropless 63.38 ms  ep dropless chunks 2 67.48 ms  ep dropless chunks 4 79.34 ms  ep dropless chunks 2 margin 8 67.62 ms  ep dropless chunks 4 margin 8 79.45 ms
+d=2048 d_ff=1408 E=32 k=4 T=16384 shared=2816 nvfp4 local 38.15 ms  ep cap 1.25 72.57 ms  ep cap serial 76.38 ms  ep dropless 47.33 ms  ep dropless chunks 2 51.26 ms  ep dropless chunks 4 63.82 ms  ep dropless chunks 2 margin 8 49.87 ms  ep dropless chunks 4 margin 8 62.56 ms  ep wire nvfp4 47.01 ms  ep wire nvfp4 chunks 2 51.32 ms  ep wire nvfp4+grad chunks 2 52.52 ms  ep wire nvfp4 chunks 2 margin 8 50.07 ms  ep wire nvfp4 chunks 4 margin 8 63.41 ms
+  a2a of 320 MiB: 8.01 ms (19.5 GiB/s sent per GPU); all-reduce of 528 MiB expert gradients: 27.54 ms
+[guard] elapsed 81s | peak GPU temp 66C, power 202W, GPU mem 11810MB | min host mem avail 240737MB | cooldown 0s
+W1126 03:10:41.200000 6286 torch/distributed/run.py:851] 
+W1126 03:10:41.200000 6286 torch/distributed/run.py:851] *****************************************
+W1126 03:10:41.200000 6286 torch/distributed/run.py:851] Setting OMP_NUM_THREADS environment variable for each process to be 1 in default, to avoid your system being overloaded, please further tune the variable for optimal performance in your application as needed. 
+W1126 03:10:41.200000 6286 torch/distributed/run.py:851] *****************************************
+d=1024 d_ff=2816 E=8 k=2 T=16384 shared=0 bf16  local 19.88 ms  ep cap 1.25 134.28 ms  ep dropless 93.90 ms  ep dropless chunks 2 66.00 ms  ep dropless chunks 4 63.12 ms  ep dropless chunks 2 margin 8 65.43 ms  ep dropless chunks 4 margin 8 63.21 ms  ep nodes 2 44.46 ms  ep nodes 2 chunks 2 margin 8 114.83 ms
+d=1024 d_ff=2816 E=8 k=2 T=16384 shared=0 nvfp4 local 12.64 ms  ep cap 1.25 88.05 ms  ep dropless 86.41 ms  ep dropless chunks 2 65.57 ms  ep dropless chunks 4 62.41 ms  ep dropless chunks 2 margin 8 65.81 ms  ep dropless chunks 4 margin 8 61.93 ms  ep wire nvfp4 80.43 ms  ep wire nvfp4 chunks 2 60.79 ms  ep wire nvfp4+grad chunks 2 53.90 ms  ep wire nvfp4 chunks 2 margin 8 60.53 ms  ep wire nvfp4 chunks 4 margin 8 56.01 ms  ep nodes 2 38.21 ms  ep nodes 2 chunks 2 margin 8 103.79 ms  ep nodes 2 wire nvfp4 chunks 2 margin 8 98.03 ms
+  a2a of 80 MiB: 18.46 ms (3.2 GiB/s sent per GPU); all-reduce of 132 MiB expert gradients: 38.55 ms
+d=2048 d_ff=1408 E=32 k=4 T=16384 shared=2816 bf16  local 61.33 ms  ep cap 1.25 491.91 ms  ep cap serial 516.20 ms  ep dropless 207.90 ms  ep dropless chunks 2 161.55 ms  ep dropless chunks 4 167.80 ms  ep dropless chunks 2 margin 8 162.03 ms  ep dropless chunks 4 margin 8 167.48 ms  ep nodes 2 110.62 ms  ep nodes 2 chunks 2 margin 8 227.76 ms
+d=2048 d_ff=1408 E=32 k=4 T=16384 shared=2816 nvfp4 local 38.21 ms  ep cap 1.25 322.83 ms  ep cap serial 342.24 ms  ep dropless 196.44 ms  ep dropless chunks 2 162.36 ms  ep dropless chunks 4 166.11 ms  ep dropless chunks 2 margin 8 162.92 ms  ep dropless chunks 4 margin 8 165.05 ms  ep wire nvfp4 170.09 ms  ep wire nvfp4 chunks 2 147.24 ms  ep wire nvfp4+grad chunks 2 136.95 ms  ep wire nvfp4 chunks 2 margin 8 147.14 ms  ep wire nvfp4 chunks 4 margin 8 149.62 ms  ep nodes 2 96.14 ms  ep nodes 2 chunks 2 margin 8 232.95 ms  ep nodes 2 wire nvfp4 chunks 2 margin 8 214.76 ms
+  a2a of 320 MiB: 75.13 ms (3.1 GiB/s sent per GPU); all-reduce of 528 MiB expert gradients: 158.08 ms
+[guard] elapsed 221s | peak GPU temp 66C, power 200W, GPU mem 11844MB | min host mem avail 235393MB | cooldown 0s
+/workspace/venv/lib/python3.10/site-packages/torch/autograd/graph.py:869: UserWarning: The AccumulateGrad node's stream does not match the stream of the node that produced the incoming gradient. This may incur unnecessary synchronization and break CUDA graph capture if the AccumulateGrad node's stream is the default stream. This mismatch is caused by an AccumulateGrad node created prior to the current iteration being kept alive. This can happen if the autograd graph is still being kept alive by tensors such as the loss, or if you are using DDP, which will stash a reference to the node. To resolve the mismatch, delete all references to the autograd graph or ensure that DDP initialization is performed under the same stream as subsequent forwards. If the mismatch is intentional, you can use torch.autograd.graph.set_warn_on_accumulate_grad_stream_mismatch(False) to suppress this warning. (Triggered internally at /pytorch/torch/csrc/autograd/input_buffer.cpp:240.)
+  return Variable._execution_engine.run_backward(  # Calls into the C++ engine to run the backward pass
+{"d": 1024, "d_ff": 2816, "experts": 8, "top_k": 2, "activation": "swiglu", "tokens": 16384, "bf16_ms": 21.575, "bf16_grouped_ms": 20.956, "bf16_grouped_graph_ms": 20.87, "nvfp4_ms": 12.409, "nvfp4_graph_ms": 12.259, "speedup": 1.739, "speedup_graph": 1.76, "speedup_vs_grouped": 1.689, "speedup_graph_vs_grouped": 1.702}
+{"d": 2048, "d_ff": 5632, "experts": 8, "top_k": 2, "activation": "swiglu", "tokens": 16384, "bf16_ms": 70.216, "bf16_grouped_ms": 69.767, "bf16_grouped_graph_ms": 69.746, "nvfp4_ms": 34.604, "nvfp4_graph_ms": 34.491, "speedup": 2.029, "speedup_graph": 2.036, "speedup_vs_grouped": 2.016, "speedup_graph_vs_grouped": 2.022}
+{"d": 2048, "d_ff": 1408, "experts": 32, "top_k": 4, "activation": "swiglu", "tokens": 16384, "bf16_ms": 53.093, "bf16_grouped_ms": 48.279, "bf16_grouped_graph_ms": 48.188, "nvfp4_ms": 27.722, "nvfp4_graph_ms": 27.556, "speedup": 1.915, "speedup_graph": 1.927, "speedup_vs_grouped": 1.742, "speedup_graph_vs_grouped": 1.749}
+{"d": 768, "d_ff": 1536, "experts": 8, "top_k": 2, "activation": "gelu_tanh", "tokens": 16384, "bf16_ms": 7.205, "bf16_grouped_ms": 6.854, "bf16_grouped_graph_ms": 6.448, "nvfp4_ms": 4.722, "nvfp4_graph_ms": 4.492, "speedup": 1.526, "speedup_graph": 1.604, "speedup_vs_grouped": 1.452, "speedup_graph_vs_grouped": 1.435}
+{"d": 2048, "d_ff": 1408, "experts": 32, "top_k": 4, "activation": "swiglu", "tokens": 16384, "capacity_factor": 1.25, "shared_d_ff": 2816, "bf16_ms": 71.252, "bf16_grouped_ms": 65.954, "bf16_grouped_graph_ms": 65.86, "nvfp4_ms": 37.394, "nvfp4_graph_ms": 37.22, "speedup": 1.905, "speedup_graph": 1.914, "speedup_vs_grouped": 1.764, "speedup_graph_vs_grouped": 1.769}
+[guard] elapsed 35s | peak GPU temp 68C, power 201W, GPU mem 17504MB | min host mem avail 246153MB | cooldown 0s
+== ep: ok (380 s)
+
+==================== eprof ====================
+  _warn_once(
+dropless         wall   49.19  compute   40.03 (busy   40.03, idle   9.16)  nccl   31.52  host sync   0.00  kernels/step 464
+chunks2          wall   52.26  compute   47.09 (busy   47.09, idle   5.18)  nccl   40.41  host sync   0.00  kernels/step 708
+chunks2_margin8  wall   50.81  compute   46.03 (busy   46.03, idle   4.77)  nccl   42.02  host sync   0.00  kernels/step 708
+wire_nvfp4       wall   48.04  compute   41.41 (busy   41.41, idle   6.63)  nccl   26.53  host sync   0.00  kernels/step 473
+cap1.25          wall   73.35  compute   47.49 (busy   47.49, idle  25.86)  nccl   74.68  host sync   0.00  kernels/step 380
+dropless {"void nvfp4::gemm::tma::nvfp4_gemm_tma_kernel<__nv_bfloat16, false, tru": 7.06, "void nvfp4::gemm::tma::nvfp4_gemm_tma_kernel<float, true, true>(nvfp4:": 6.81, "void at::native::vectorized_elementwise_kernel<4, at::native::bfloat16": 2.07, "void at::native::vectorized_elementwise_kernel<4, at::native::CUDAFunc": 1.83, "void nvfp4::gemm::tma::nvfp4_gemm_tma_kernel<float, false, true>(nvfp4": 1.79, "void nvfp4::combine::combine_fwd_kernel<__nv_bfloat16, 8>(__nv_bfloat1": 1.65, "void at::native::vectorized_gather_kernel<16, long>(char*, char*, long": 1.38, "void nvfp4::dual::dual_quantize_kernel<__nv_bfloat16, 0, false>(__nv_b": 1.36, "void nvfp4::dual::dual_quantize_kernel<__nv_bfloat16, 6, false>(__nv_b": 1.24, "void nvfp4::dual::amax_tile_kernel<__nv_bfloat16, 6, false>(__nv_bfloa": 1.2, "void at::native::(anonymous namespace)::CatArrayBatchedCopy_vectorized": 1.07, "void nvfp4::combine::combine_bwd_rows_kernel<__nv_bfloat16, 8>(__nv_bf": 1.01}
+chunks2 {"void nvfp4::gemm::tma::nvfp4_gemm_tma_kernel<float, true, true>(nvfp4:": 8.18, "void nvfp4::gemm::tma::nvfp4_gemm_tma_kernel<__nv_bfloat16, false, tru": 6.95, "void at::native::vectorized_elementwise_kernel<4, at::native::CUDAFunc": 4.01, "void at::native::vectorized_elementwise_kernel<4, at::native::bfloat16": 2.11, "void nvfp4::gemm::tma::nvfp4_gemm_tma_kernel<float, false, true>(nvfp4": 1.87, "void nvfp4::dual::dual_quantize_kernel<float, 0, false>(float const*, ": 1.81, "void at::native::vectorized_elementwise_kernel<4, at::native::FillFunc": 1.58, "void nvfp4::combine::combine_fwd_kernel<__nv_bfloat16, 8>(__nv_bfloat1": 1.58, "void nvfp4::dual::amax_flat_kernel<float>(float const*, long, unsigned": 1.53, "void nvfp4::dual::dual_quantize_kernel<__nv_bfloat16, 0, false>(__nv_b": 1.39, "void at::native::elementwise_kernel<128, 4, at::native::gpu_kernel_imp": 1.34, "void at::native::(anonymous namespace)::CatArrayBatchedCopy_vectorized": 1.32}
+chunks2_margin8 {"void nvfp4::gemm::tma::nvfp4_gemm_tma_kernel<float, true, true>(nvfp4:": 7.63, "void nvfp4::gemm::tma::nvfp4_gemm_tma_kernel<__nv_bfloat16, false, tru": 6.36, "void at::native::vectorized_elementwise_kernel<4, at::native::CUDAFunc": 4.01, "void at::native::vectorized_elementwise_kernel<4, at::native::bfloat16": 2.1, "void nvfp4::dual::dual_quantize_kernel<float, 0, false>(float const*, ": 1.82, "void nvfp4::gemm::tma::nvfp4_gemm_tma_kernel<float, false, true>(nvfp4": 1.79, "void at::native::vectorized_elementwise_kernel<4, at::native::FillFunc": 1.58, "void nvfp4::combine::combine_fwd_kernel<__nv_bfloat16, 8>(__nv_bfloat1": 1.58, "void nvfp4::dual::amax_flat_kernel<float>(float const*, long, unsigned": 1.53, "void nvfp4::dual::dual_quantize_kernel<__nv_bfloat16, 0, false>(__nv_b": 1.4, "void at::native::elementwise_kernel<128, 4, at::native::gpu_kernel_imp": 1.35, "void at::native::(anonymous namespace)::CatArrayBatchedCopy_vectorized": 1.32}
+wire_nvfp4 {"void nvfp4::gemm::tma::nvfp4_gemm_tma_kernel<__nv_bfloat16, false, tru": 7.06, "void nvfp4::gemm::tma::nvfp4_gemm_tma_kernel<float, true, true>(nvfp4:": 6.78, "void at::native::vectorized_elementwise_kernel<4, at::native::bfloat16": 2.07, "void at::native::vectorized_elementwise_kernel<4, at::native::CUDAFunc": 1.83, "void nvfp4::gemm::tma::nvfp4_gemm_tma_kernel<float, false, true>(nvfp4": 1.82, "void nvfp4::combine::combine_fwd_kernel<__nv_bfloat16, 8>(__nv_bfloat1": 1.66, "void nvfp4::dual::dual_quantize_kernel<__nv_bfloat16, 0, false>(__nv_b": 1.55, "void at::native::vectorized_gather_kernel<16, long>(char*, char*, long": 1.4, "void nvfp4::dual::dual_quantize_kernel<__nv_bfloat16, 6, false>(__nv_b": 1.24, "void nvfp4::dual::amax_tile_kernel<__nv_bfloat16, 6, false>(__nv_bfloa": 1.18, "void nvfp4::dequantize_kernel<__nv_bfloat16>(unsigned char const*, lon": 1.13, "void at::native::(anonymous namespace)::CatArrayBatchedCopy_vectorized": 1.04}
+cap1.25 {"void nvfp4::gemm::tma::nvfp4_gemm_tma_kernel<float, true, true>(nvfp4:": 7.78, "void nvfp4::gemm::tma::nvfp4_gemm_tma_kernel<__nv_bfloat16, false, tru": 7.32, "void at::native::vectorized_gather_kernel<16, long>(char*, char*, long": 2.69, "void at::native::indexFuncLargeIndex<c10::BFloat16, long, unsigned int": 2.45, "void at::native::vectorized_elementwise_kernel<4, at::native::bfloat16": 2.34, "void at::native::(anonymous namespace)::CatArrayBatchedCopy_vectorized": 2.15, "void nvfp4::gemm::tma::nvfp4_gemm_tma_kernel<float, false, true>(nvfp4": 2.12, "void nvfp4::combine::combine_fwd_kernel<__nv_bfloat16, 8>(__nv_bfloat1": 1.84, "void at::native::vectorized_elementwise_kernel<4, at::native::CUDAFunc": 1.82, "void nvfp4::dual::dual_quantize_kernel<__nv_bfloat16, 0, false>(__nv_b": 1.65, "void at::native::vectorized_elementwise_kernel<4, at::native::FillFunc": 1.51, "void nvfp4::dual::dual_quantize_kernel<__nv_bfloat16, 6, false>(__nv_b": 1.49}
+[guard] elapsed 17s | peak GPU temp 61C, power 107W, GPU mem 7085MB | min host mem avail 242829MB | cooldown 0s
+  _warn_once(
+dropless         wall  200.51  compute   42.46 (busy   42.46, idle 158.05)  nccl  339.19  host sync   0.00  kernels/step 464
+chunks2          wall  164.67  compute   55.44 (busy   55.40, idle 109.27)  nccl  315.70  host sync   0.00  kernels/step 708
+chunks2_margin8  wall  164.42  compute   51.05 (busy   51.01, idle 113.41)  nccl  315.01  host sync   0.00  kernels/step 708
+wire_nvfp4       wall  172.80  compute   44.48 (busy   44.47, idle 128.33)  nccl  280.71  host sync   0.00  kernels/step 473
+cap1.25          wall  328.75  compute   47.32 (busy   47.32, idle 281.43)  nccl  589.22  host sync   0.00  kernels/step 380
+dropless {"void nvfp4::gemm::tma::nvfp4_gemm_tma_kernel<__nv_bfloat16, false, tru": 7.12, "void nvfp4::gemm::tma::nvfp4_gemm_tma_kernel<float, true, true>(nvfp4:": 7.11, "void at::native::vectorized_elementwise_kernel<4, at::native::bfloat16": 2.06, "void nvfp4::gemm::tma::nvfp4_gemm_tma_kernel<float, false, true>(nvfp4": 2.05, "void nvfp4::combine::combine_fwd_kernel<__nv_bfloat16, 8>(__nv_bfloat1": 1.97, "void at::native::vectorized_elementwise_kernel<4, at::native::CUDAFunc": 1.83, "void at::native::vectorized_gather_kernel<16, long>(char*, char*, long": 1.62, "void at::native::(anonymous namespace)::CatArrayBatchedCopy_vectorized": 1.43, "void nvfp4::dual::dual_quantize_kernel<__nv_bfloat16, 0, false>(__nv_b": 1.4, "void nvfp4::dual::dual_quantize_kernel<__nv_bfloat16, 6, false>(__nv_b": 1.24, "void nvfp4::dual::amax_tile_kernel<__nv_bfloat16, 6, false>(__nv_bfloa": 1.24, "void nvfp4::combine::combine_bwd_rows_kernel<__nv_bfloat16, 8>(__nv_bf": 1.16}
+chunks2 {"void nvfp4::gemm::tma::nvfp4_gemm_tma_kernel<float, true, true>(nvfp4:": 10.79, "void nvfp4::gemm::tma::nvfp4_gemm_tma_kernel<__nv_bfloat16, false, tru": 10.65, "void at::native::vectorized_elementwise_kernel<4, at::native::CUDAFunc": 2.93, "void nvfp4::gemm::tma::nvfp4_gemm_tma_kernel<float, false, true>(nvfp4": 2.81, "void at::native::vectorized_elementwise_kernel<4, at::native::bfloat16": 2.1, "void nvfp4::combine::combine_fwd_kernel<__nv_bfloat16, 8>(__nv_bfloat1": 1.88, "void nvfp4::dual::amax_tile_kernel<__nv_bfloat16, 6, false>(__nv_bfloa": 1.78, "void at::native::(anonymous namespace)::CatArrayBatchedCopy_vectorized": 1.72, "void at::native::vectorized_gather_kernel<16, long>(char*, char*, long": 1.54, "void nvfp4::dual::dual_quantize_kernel<__nv_bfloat16, 0, false>(__nv_b": 1.38, "void at::native::vectorized_elementwise_kernel<4, at::native::FillFunc": 1.32, "void nvfp4::dual::dual_quantize_kernel<__nv_bfloat16, 6, false>(__nv_b": 1.26}
+chunks2_margin8 {"void nvfp4::gemm::tma::nvfp4_gemm_tma_kernel<__nv_bfloat16, false, tru": 10.26, "void nvfp4::gemm::tma::nvfp4_gemm_tma_kernel<float, true, true>(nvfp4:": 8.05, "void at::native::vectorized_elementwise_kernel<4, at::native::CUDAFunc": 2.93, "void at::native::vectorized_elementwise_kernel<4, at::native::bfloat16": 2.12, "void nvfp4::combine::combine_fwd_kernel<__nv_bfloat16, 8>(__nv_bfloat1": 1.86, "void nvfp4::gemm::tma::nvfp4_gemm_tma_kernel<float, false, true>(nvfp4": 1.79, "void at::native::(anonymous namespace)::CatArrayBatchedCopy_vectorized": 1.72, "void nvfp4::dual::amax_tile_kernel<__nv_bfloat16, 6, false>(__nv_bfloa": 1.63, "void at::native::vectorized_gather_kernel<16, long>(char*, char*, long": 1.53, "void at::native::elementwise_kernel<128, 4, at::native::gpu_kernel_imp": 1.37, "void nvfp4::dual::dual_quantize_kernel<__nv_bfloat16, 0, false>(__nv_b": 1.37, "void nvfp4::dual::dual_quantize_kernel<__nv_bfloat16, 6, false>(__nv_b": 1.26}
+wire_nvfp4 {"void nvfp4::gemm::tma::nvfp4_gemm_tma_kernel<float, true, true>(nvfp4:": 7.15, "void nvfp4::gemm::tma::nvfp4_gemm_tma_kernel<__nv_bfloat16, false, tru": 7.12, "void nvfp4::gemm::tma::nvfp4_gemm_tma_kernel<float, false, true>(nvfp4": 2.12, "void at::native::vectorized_elementwise_kernel<4, at::native::bfloat16": 2.06, "void nvfp4::combine::combine_fwd_kernel<__nv_bfloat16, 8>(__nv_bfloat1": 1.98, "void at::native::vectorized_elementwise_kernel<4, at::native::CUDAFunc": 1.83, "void nvfp4::dequantize_kernel<__nv_bfloat16>(unsigned char const*, lon": 1.69, "void nvfp4::dual::dual_quantize_kernel<__nv_bfloat16, 0, false>(__nv_b": 1.63, "void at::native::vectorized_gather_kernel<16, long>(char*, char*, long": 1.62, "void at::native::(anonymous namespace)::CatArrayBatchedCopy_vectorized": 1.4, "void nvfp4::dual::amax_tile_kernel<__nv_bfloat16, 6, false>(__nv_bfloa": 1.25, "void nvfp4::dual::dual_quantize_kernel<__nv_bfloat16, 6, false>(__nv_b": 1.23}
+cap1.25 {"void nvfp4::gemm::tma::nvfp4_gemm_tma_kernel<float, true, true>(nvfp4:": 8.24, "void nvfp4::gemm::tma::nvfp4_gemm_tma_kernel<__nv_bfloat16, false, tru": 7.32, "void at::native::indexFuncLargeIndex<c10::BFloat16, long, unsigned int": 2.71, "void at::native::vectorized_gather_kernel<16, long>(char*, char*, long": 2.7, "void at::native::vectorized_elementwise_kernel<4, at::native::bfloat16": 2.32, "void nvfp4::gemm::tma::nvfp4_gemm_tma_kernel<float, false, true>(nvfp4": 2.13, "void at::native::(anonymous namespace)::CatArrayBatchedCopy_vectorized": 2.08, "void nvfp4::combine::combine_fwd_kernel<__nv_bfloat16, 8>(__nv_bfloat1": 1.84, "void at::native::vectorized_elementwise_kernel<4, at::native::CUDAFunc": 1.83, "void nvfp4::dual::dual_quantize_kernel<__nv_bfloat16, 0, false>(__nv_b": 1.62, "void nvfp4::dual::dual_quantize_kernel<__nv_bfloat16, 6, false>(__nv_b": 1.47, "void nvfp4::dual::amax_tile_kernel<__nv_bfloat16, 6, false>(__nv_bfloa": 1.32}
+[guard] elapsed 21s | peak GPU temp 54C, power 107W, GPU mem 6722MB | min host mem avail 238586MB | cooldown 0s
+== eprof: ok (37 s)
+
+== summary
+  env: ok
+  build: ok
+  ep: ok
+  eprof: ok

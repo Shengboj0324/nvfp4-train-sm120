@@ -150,7 +150,7 @@ grows with the share of attention in the step (long context). Errors are those o
 forward (output ~1–3% relative to exact attention, vs ~0.2% for BF16 flash attention); validate on your
 model.
 
-### 3.4 Mixture of experts (v0.11; grouped GEMMs v0.12; sync-free v0.13; biases v0.14; capacity, shared expert, expert parallelism v0.15; dropless expert parallelism v0.16)
+### 3.4 Mixture of experts (v0.11; grouped GEMMs v0.12; sync-free v0.13; biases v0.14; capacity, shared expert, expert parallelism v0.15; dropless expert parallelism v0.16; variable-size exchanges, nodes, chunks, NVFP4 messages, fused combine v0.17)
 
 ```python
 from nvfp4.moe import MoE
@@ -170,21 +170,41 @@ loss = loss + 0.01 * moe.aux_loss             # Switch load-balancing loss (1.0 
   token goes through with weight 1, added to the routed output (DeepSeek-MoE). n shared experts of hidden
   h are one of hidden n h. Parameters `shared_w_*` [1, ., .] and `shared_b_*`, `moe.shared_weights()`.
   It runs in NVFP4 with the experts, through the same grouped kernels.
-- **Expert parallelism** (`ep_group=group`, v0.15; dropless v0.16): rank r of a W-rank process group
-  holds experts [r E/W, (r+1) E/W); `w_*` / `b_*` have E/W rows, while the router and the shared expert
-  are replicated. The routed slots go to their expert's rank and back by two all-to-alls.
-  - With a capacity the exchanges have a fixed size ([W, E/W, C, d] rows) and nothing is read on the
+- **Expert parallelism** (`ep_group=group`, v0.15–v0.17): rank r of a W-rank process group holds experts
+  [r E/W, (r+1) E/W); `w_*` / `b_*` have E/W rows, while the router and the shared expert are replicated.
+  Two exchange modes (`moe.ep_dispatch`: "auto", "fixed", "variable"):
+  - "fixed" (the default with a `capacity_factor` and none of the options below): every kept slot goes to
+    its expert's rank in a fixed-size all-to-all ([W, E/W, C, d] rows) and back. Nothing is read on the
     host, so a step stays CUDA-graph capturable.
-  - Dropless (no `capacity_factor`, v0.16) the row counts are exchanged first and read on the host once
-    per forward, and the rows travel in variable-size all-to-alls (as Megatron-LM's dropless
-    dispatcher does). Such a step cannot be captured in a CUDA graph.
+  - "variable" (the default without a capacity; v0.17): each token goes once to every rank holding one of
+    its experts, with their ids and routing weights, and that rank returns one row, the weighted sum of
+    its experts' outputs. Top-k > 1 sends fewer rows than slots (top-4 of 32 experts on two ranks: 1.9
+    rows per token instead of 4). One integer all-to-all of counts, read on the host once per forward,
+    sizes every message: not capturable. Dropped slots (with a capacity) are not sent.
+  - `ep_node_size=L` (constructor; v0.17): ranks r L … r L + L − 1 form a node. A token crosses to another
+    node once per node, to the rank with the sender's position there, which forwards it within its node
+    and sums the node's rows on the way back: two-stage exchanges for clusters (or hosts) whose links
+    between groups of GPUs are slower than within them.
+  - `moe.ep_chunks = n` (v0.17): the tokens go in n chunks, the next chunk's rows travelling while this
+    chunk's experts run. It pays when the exchange dominates (RESULTS.md §8.2); on fast links it costs a
+    few percent. `nvfp4.ops.set_sm_margin(k)` leaves k SMs free in the persistent GEMMs for the transfers.
+  - `moe.ep_wire = "nvfp4"` (NVFP4 experts; v0.17): the activations travel as NVFP4 with the group's tensor
+    scale, 3.6x fewer bytes than bf16. The forward and the input gradient are bit-identical to bf16
+    messages; only the weight gradients' token-wise quantization reads the dequantized rows.
+    `moe.ep_wire_grad = "nvfp4"` also sends the gradients to the experts as stochastically rounded NVFP4
+    (unbiased, rounded a second time by the experts). Loss effect in RESULTS.md §8.3.
   - The shared expert runs while the expert outputs travel back, and its backward while their gradients
     go out (v0.16; `moe.ep_overlap = False` runs it after the exchange).
-  - The local experts' gradients already sum every rank's tokens: keep the expert parameters out of
-    data-parallel gradient averaging over the same ranks (for example DDP's
-    `_set_params_and_buffers_to_ignore_for_model`, or a separate group).
-  - Tested with two processes on one GPU (gloo) and over NCCL on two RTX 5090s; speed across GPUs in
-    RESULTS.md §8 (`bench/bench_moe_ep.py`).
+  - With data parallelism over the same ranks: the local experts' gradients already sum every rank's
+    tokens, so call `nvfp4.moe.ignore_expert_parameters_in_ddp(model)` before wrapping in DDP and
+    `nvfp4.moe.scale_expert_grads(model)` before clipping / the optimizer step (multiplies them by 1 / W,
+    matching DDP's average; v0.17, tested against one process). `experiments/train_gpt.py --moe-ep` trains
+    that way (`--moe-ep-chunks`, `--moe-ep-node-size`, `--moe-ep-wire`, `--sm-margin`).
+  - `moe.last_ep_rows`: rows this rank sent to other ranks in the last forward (across nodes, within its
+    node).
+  - Tested with two and four processes on one GPU (gloo), over NCCL on two RTX 5090s and on four RTX PRO
+    4500 Blackwell (two nodes of two); speed in RESULTS.md §8.1–8.2 (`bench/bench_moe_ep.py`,
+    `bench/profile_moe_ep.py`).
 - **Parameters.** Expert weights are stacked: `w_gate`, `w_up` [E, d_ff, d] and `w_down` [E, d, d_ff]
   (SwiGLU), or `w_fc1` [E, d_ff, d] and `w_fc2` [E, d, d_ff] (GELU). With `bias=True` every projection
   has per-expert biases, `b_gate`, `b_up` [E, d_ff] and `b_down` [E, d] (`b_fc1`, `b_fc2`;

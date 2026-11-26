@@ -1,0 +1,1 @@
+0ddad55 MoE: fused gather / combine kernels (csrc/moe_combine.cu) for the combine, the EP partial sums and the dispatch backward; NVFP4_MOE_FUSED_COMBINE switch; v0.17 pod results, wire study
