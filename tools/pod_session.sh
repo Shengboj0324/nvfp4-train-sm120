@@ -13,6 +13,7 @@
 #   gpt     GPT-124M, 3000 steps: BF16 and NVFP4 on one GPU, NVFP4 with DDP over all GPUs (NCCL)
 #   ep      MoE expert parallelism over all GPUs (NCCL): the MoE tests, bench/bench_moe_ep.py (two GPUs; with
 #           four, also all four with two-stage exchanges over pairs of GPUs), bench_moe.py
+#   eprof   bench/profile_moe_ep.py on two GPUs (and four): where an expert-parallel step's time goes
 #   moegpt  MoE GPT (8 experts, top-2) over all GPUs: experts replicated (DDP) vs expert parallelism (plain;
 #           chunked with NVFP4 messages; with four GPUs, nodes of two), tokens/s and loss
 # Everything ends up in $OUT (default /workspace/nvfp4_results) and $OUT.tar.gz.
@@ -199,6 +200,20 @@ do_ep() {
   return $st
 }
 
+do_eprof() {
+  cd "$REPO" || return 1
+  export PYTHONPATH=$REPO
+  local st=0 ngpu
+  ngpu=$(nvidia-smi -L | wc -l)
+  CUDA_VISIBLE_DEVICES=0,1 python tools/guard.py --log "$OUT/eprof2.csv" -- torchrun --standalone --nproc_per_node 2     bench/profile_moe_ep.py --out "$OUT/profile_ep2" > "$OUT/eprof2.log" 2>&1 || st=1
+  grep -v "guard] sample" "$OUT/eprof2.log" | tail -12
+  if [ "$ngpu" -ge 4 ]; then
+    CUDA_VISIBLE_DEVICES=0,1,2,3 python tools/guard.py --log "$OUT/eprof4.csv" -- torchrun --standalone       --nproc_per_node 4 bench/profile_moe_ep.py --out "$OUT/profile_ep4" > "$OUT/eprof4.log" 2>&1 || st=1
+    grep -v "guard] sample" "$OUT/eprof4.log" | tail -12
+  fi
+  return $st
+}
+
 do_moegpt() {
   cd "$REPO" || return 1
   export PYTHONPATH=$REPO NVFP4_DATA=${NVFP4_DATA:-/workspace/nvfp4_data}
@@ -237,6 +252,7 @@ for p in $PHASES; do
     bench) phase bench do_bench ;;
     gpt) phase gpt do_gpt ;;
     ep) phase ep do_ep ;;
+    eprof) phase eprof do_eprof ;;
     moegpt) phase moegpt do_moegpt ;;
   esac
 done
