@@ -63,7 +63,10 @@ def main():
     def beside(fn, iters):
         """fn's time while all-to-alls run: enough of them queued on NCCL's stream to outlast the GEMMs."""
         alone = timed(fn, 3)
-        reps = max(2, int(alone * iters / a2a_ms) + 2)
+        # every rank must queue the same number of collectives: rank 0's count (per-rank timings differ)
+        n = torch.tensor([max(2, int(alone * iters / a2a_ms) + 2)], device=dev)
+        dist.broadcast(n, 0)
+        reps = int(n.item())
         dist.barrier()
         torch.cuda.synchronize()
         works = [dist.all_to_all_single(out, buf, async_op=True) for _ in range(reps)]
