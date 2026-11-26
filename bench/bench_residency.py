@@ -65,6 +65,7 @@ def main():
     res = {"sms": props.multi_processor_count, "shape": [a.m, a.n, a.k], "device": props.name}
     for f in range(3):
         gemm()
+    ext.hold(1, 1000)  # load the spin kernel before timing (lazy module loading delayed the first hold)
     torch.cuda.synchronize()
     for mode in ("static", "dynamic"):
         ops.set_dynamic_tiles(mode == "dynamic")

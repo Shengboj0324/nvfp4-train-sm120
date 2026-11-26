@@ -23,12 +23,12 @@ from nvfp4 import convert_linears, ops
 from nvfp4.moe import MoE
 
 VARIANTS = {  # name: (constructor kwargs, attributes, SM margin); attributes "_fused": the fused combine on / off,
-    # "_dynamic": dynamic tile claiming in the GEMMs (ops.set_dynamic_tiles)
+    # (MoE.ep_dynamic_tiles defaults to "auto": on with chunks; the "_static" variants turn it off)
     "dropless": ({}, {}, 0),
     "chunks2": ({}, {"ep_chunks": 2}, 0),
     "chunks2_serial": ({}, {"ep_chunks": 2, "ep_serial": True}, 0),
     "chunks2_margin8": ({}, {"ep_chunks": 2}, 8),
-    "chunks2_dynamic": ({}, {"ep_chunks": 2, "_dynamic": True}, 0),
+    "chunks2_static": ({}, {"ep_chunks": 2, "ep_dynamic_tiles": False}, 0),
     "wire_nvfp4": ({}, {"ep_wire": "nvfp4"}, 0),
     "wire_fp8_return": ({}, {"ep_wire": "nvfp4", "ep_wire_return": "fp8"}, 0),
     "cap1.25": ({"capacity_factor": 1.25}, {}, 0),
@@ -43,7 +43,7 @@ def node_variants(L):
         "nodes_chunks2_margin8": (n, {"ep_chunks": 2, "ep_serial": False}, 8),
         "nodes_chunks2_unfused": (n, {"ep_chunks": 2, "ep_serial": False, "_fused": False}, 0),
         "nodes_chunks2_serial": (n, {"ep_chunks": 2, "ep_serial": True}, 0),
-        "nodes_chunks2_serial_dynamic": (n, {"ep_chunks": 2, "ep_serial": True, "_dynamic": True}, 0),
+        "nodes_chunks2_serial_static": (n, {"ep_chunks": 2, "ep_serial": True, "ep_dynamic_tiles": False}, 0),
         "nodes_chunks4_serial": (n, {"ep_chunks": 4, "ep_serial": True}, 0),
         "nodes_fp8_return": (n, {"ep_wire": "nvfp4", "ep_wire_return": "fp8"}, 0),
     }
@@ -92,7 +92,6 @@ def main():
         convert_linears(m)
         attrs = dict(attrs)
         moe_mod._FUSED_COMBINE = attrs.pop("_fused", True)
-        ops.set_dynamic_tiles(attrs.pop("_dynamic", False))
         for k, v in attrs.items():
             setattr(m, k, v)
         ops.set_sm_margin(margin)
@@ -113,7 +112,6 @@ def main():
             torch.cuda.synchronize()
             wall = (time.perf_counter() - t0) * 1e3 / a.steps
         ops.set_sm_margin(0)
-        ops.set_dynamic_tiles(False)
         moe_mod._FUSED_COMBINE = True
         if rank == 0:
             prof.export_chrome_trace(os.path.join(a.out, f"trace_{name}_rank0.json"))

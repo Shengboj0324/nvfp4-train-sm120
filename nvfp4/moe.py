@@ -103,6 +103,23 @@ def _fused(t: torch.Tensor) -> bool:
     return bool(ok)
 
 
+class _TileScope(torch.autograd.Function):
+    """Identity whose backward sets ``ops.set_dynamic_tiles(on)``: placed on an expert-parallel layer's output
+    (on) and input (the previous setting), it brackets the layer's backward, whose GEMMs then claim their
+    tiles at run time while the gradient exchanges' NCCL kernels hold SMs (autograd runs a layer's nodes
+    between its output's and its input's)."""
+
+    @staticmethod
+    def forward(ctx, x, on: bool):
+        ctx.on = on
+        return x.view_as(x)
+
+    @staticmethod
+    def backward(ctx, g):
+        ops.set_dynamic_tiles(ctx.on)
+        return g, None
+
+
 class _GatherCombine(torch.autograd.Function):
     """out[r] = sum_j w[r, j] rows[pos[r, j]] (w None: weight 1; pos outside [0, len(rows)): nothing), in fp32
     with one rounding to rows' dtype, by one kernel that reads each row once (csrc/moe_combine.cu). Backward by
@@ -727,7 +744,14 @@ class MoE(nn.Module):
         unchanged, only the weight gradient's token-wise quantization sees the dequantized rows) and
         ``ep_wire_grad = "nvfp4"`` the gradients sent to the experts (stochastically rounded, unbiased).
         ``last_ep_rows``: rows this rank sent to other ranks in the last forward (across nodes, within its node).
+        ``ep_wire_return = "fp8"``: the return direction (expert outputs, and the input gradients going back)
+        as MXFP8 (e4m3 with a power-of-two scale per 32 values; gradients stochastically rounded), 1.94x fewer
+        bytes than bf16 (CUDA and d % 128 == 0; else bf16). ``ep_serial`` ("auto": with chunks and nodes): every exchange
+        issued from one side stream, one at a time, so rail and node collectives never run concurrently.
     The shared expert runs while the expert outputs travel back (``ep_overlap = False``: after them).
+    ``ep_dynamic_tiles`` ("auto": with chunks or an overlapped shared expert): the layer's GEMMs, forward and
+    backward, claim their tiles at run time (``ops.set_dynamic_tiles``) so that SMs held by NCCL do not
+    delay them.
 
     After forward, ``aux_loss`` holds the Switch Transformer load-balancing loss E * sum_e f_e P_e (f_e:
     fraction of routed slots, P_e: mean router probability of expert e; before dropping; this rank's tokens),
@@ -787,6 +811,7 @@ class MoE(nn.Module):
         self.ep_wire_grad = "bf16"
         self.ep_wire_return = "bf16"
         self.ep_serial = "auto"
+        self.ep_dynamic_tiles = "auto"
         self.wgrad_rht = True
         self.fuse_wgrad_accumulation = False
         self.cache_weight_quantization = False
@@ -965,6 +990,34 @@ class MoE(nn.Module):
         return ys.index_select(0, pos.view(-1))
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
+        dyn = self._dynamic_tiles()
+        if not dyn:
+            return self._forward(x)
+        prev = ops.dynamic_tiles()
+        ops.set_dynamic_tiles(True)
+        # the backward is bracketed only when the input takes a gradient: its node restores the setting last
+        scoped = x.requires_grad and torch.is_grad_enabled()
+        try:
+            y = self._forward(_TileScope.apply(x, prev) if scoped else x)
+        finally:
+            ops.set_dynamic_tiles(prev)
+        return _TileScope.apply(y, True) if scoped else y
+
+    def _dynamic_tiles(self) -> bool:
+        """Whether this forward (and its backward) runs its GEMMs with dynamic tile claiming
+        (``ops.set_dynamic_tiles``): ``ep_dynamic_tiles`` "auto" turns it on while expert-parallel exchanges
+        overlap GEMMs (``ep_chunks`` > 1, or the shared expert during the exchanges), where NCCL's kernels hold
+        SMs that the fixed tile assignment would wait for (the GEMMs ran 1.7x slower; RESULTS.md §8.6)."""
+        v = self.ep_dynamic_tiles
+        if v not in ("auto", True, False):
+            raise ValueError(f"ep_dynamic_tiles must be 'auto', True or False, got {v!r}")
+        if self.ep_group is None or not torch.cuda.is_available() or not ops.available():
+            return False
+        if v != "auto":
+            return bool(v)
+        return self.ep_chunks > 1 or bool(self.shared_d_ff and self.ep_overlap)
+
+    def _forward(self, x: torch.Tensor) -> torch.Tensor:
         lead = x.shape[:-1]
         x2d = x.reshape(-1, self.d)
         T, k, E = x2d.shape[0], self.top_k, self.n_experts

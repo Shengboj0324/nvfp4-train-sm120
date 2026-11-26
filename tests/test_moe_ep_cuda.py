@@ -233,6 +233,51 @@ def _check_return(rank, world, group, node):
         assert _cos(a, b) > 0.995, _cos(a, b)
 
 
+def _check_dynamic(rank, world, group, node):
+    """ep_dynamic_tiles: the layer's GEMMs (forward and backward) claim tiles at run time, with the same bits
+    as the fixed assignment; the global setting is on only inside the layer's forward and backward. (A margin
+    leaves 2 CTAs, so that these small GEMMs have more tiles than CTAs and claiming engages.)"""
+    _, ep = _pair(world, rank, group, True, None, node)
+    ep.ep_dispatch, ep.ep_chunks = "variable", 2
+    x, g = _data(rank)
+    seen = []
+    ops.set_sm_margin(torch.cuda.get_device_properties(0).multi_processor_count - 2)
+    try:
+        ep.ep_dynamic_tiles = False
+        want = _run_nvfp4(ep, x, g)
+        ep.ep_dynamic_tiles = "auto"  # chunks 2: on
+
+        def spy(t):
+            seen.append(("bwd", ops.dynamic_tiles()))
+            return t
+        torch.manual_seed(11)
+        xe = x.clone().requires_grad_()
+        ep.zero_grad(set_to_none=True)
+        with torch.autocast("cuda", dtype=torch.bfloat16):
+            y = ep(xe)
+        assert not ops.dynamic_tiles()  # restored after the forward
+        y.register_hook(spy)  # runs before the layer's backward: still off
+        calls, real = [], ops.set_dynamic_tiles
+        ops.set_dynamic_tiles = lambda on: (calls.append(on), real(on))[1]
+        try:
+            y.backward(g.bfloat16())
+        finally:
+            ops.set_dynamic_tiles = real
+        assert calls == [True, False], calls  # on at the layer's output, restored at its input
+        assert not ops.dynamic_tiles()  # restored after the backward
+        got = (y.detach(), xe.grad, {n: p.grad.clone() for n, p in ep.named_parameters()})
+    finally:
+        ops.set_sm_margin(0)
+        ops.set_dynamic_tiles(False)
+    assert seen == [("bwd", False)]
+    assert torch.equal(got[0], want[0]) and torch.equal(got[1], want[1])
+    for n in want[2]:
+        assert torch.equal(got[2][n], want[2][n]), n
+    ep.ep_dynamic_tiles = "bad"
+    with pytest.raises(ValueError):
+        ep(x)
+
+
 def _worker(rank, world, port, configs, backend="gloo"):
     import datetime
 
@@ -248,6 +293,8 @@ def _worker(rank, world, port, configs, backend="gloo"):
                 _check_fp32(rank, world, dist.group.WORLD, *args)
             elif kind == "ret":
                 _check_return(rank, world, dist.group.WORLD, *args)
+            elif kind == "dyn":
+                _check_dynamic(rank, world, dist.group.WORLD, *args)
             else:
                 _check_nvfp4(rank, world, dist.group.WORLD, *args)
             dist.barrier()
@@ -267,7 +314,8 @@ def _spawn(world, configs, backend="gloo"):
 
 def test_variable_ep_two_ranks():
     _spawn(2, [("fp32", None, 1, 1), ("fp32", 0.75, 1, 3), ("fp32", None, 2, 2), ("fp32", None, 1, 7),
-               ("fp32", None, 1, 3, True), ("nvfp4", 1), ("nvfp4", 2), ("ret", 1), ("ret", 2)])
+               ("fp32", None, 1, 3, True), ("nvfp4", 1), ("nvfp4", 2), ("ret", 1), ("ret", 2),
+               ("dyn", 1), ("dyn", 2)])
 
 
 def test_variable_ep_two_nodes_of_two():
@@ -282,7 +330,7 @@ def test_multi_gpu_nccl_variable_ep():
         pytest.skip("needs two sm_120 GPUs")
     if n >= 4:
         _spawn(4, [("fp32", None, 2, 1), ("fp32", None, 1, 3), ("fp32", 0.75, 2, 2), ("fp32", None, 2, 2, False),
-                   ("nvfp4", 2), ("nvfp4", 1), ("ret", 2)], "nccl")
+                   ("nvfp4", 2), ("nvfp4", 1), ("ret", 2), ("dyn", 2)], "nccl")
     else:
         _spawn(2, [("fp32", None, 1, 1), ("fp32", 0.75, 1, 3), ("fp32", None, 2, 2), ("nvfp4", 1), ("nvfp4", 2)],
                "nccl")
