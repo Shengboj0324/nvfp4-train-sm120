@@ -8,7 +8,7 @@ std::vector<torch::Tensor> nvfp4_quantize_dual(torch::Tensor x, bool do_row, boo
                                                bool row_sr, int64_t row_seed, bool col_sr, int64_t col_seed,
                                                bool col_rht, int64_t rht_seed, int64_t col_pad,
                                                const OptTensor& row_seed_t, const OptTensor& col_seed_t, const OptTensor& rht_seed_t,
-                                               const OptTensor& amax_floor);
+                                               const OptTensor& amax_floor, int64_t row_terms);
 torch::Tensor nvfp4_dequantize(torch::Tensor data, torch::Tensor scales, torch::Tensor gdec, at::ScalarType out_dtype);
 torch::Tensor nvfp4_combine_fwd(torch::Tensor rows, torch::Tensor pos, c10::optional<torch::Tensor> w);
 torch::Tensor nvfp4_combine_bwd_rows(torch::Tensor g, torch::Tensor inv, c10::optional<torch::Tensor> w, int64_t k);
@@ -25,12 +25,13 @@ std::vector<torch::Tensor> nvfp4_layernorm_quantize_dual(torch::Tensor x, torch:
                                                          double eps, bool do_row, bool do_col, bool row_sr,
                                                          int64_t row_seed, bool col_sr, int64_t col_seed, bool col_rht,
                                                          int64_t rht_seed, int64_t col_pad, const OptTensor& row_seed_t,
-                                                         const OptTensor& col_seed_t, const OptTensor& rht_seed_t);
+                                                         const OptTensor& col_seed_t, const OptTensor& rht_seed_t,
+                                                         int64_t row_terms);
 std::vector<torch::Tensor> nvfp4_gelu_quantize_dual(torch::Tensor h, bool do_row, bool do_col, bool row_sr,
                                                     int64_t row_seed, bool col_sr, int64_t col_seed, bool col_rht,
                                                     int64_t rht_seed, int64_t col_pad, const OptTensor& row_seed_t,
                                                     const OptTensor& col_seed_t, const OptTensor& rht_seed_t,
-                                                    const OptTensor& bias, bool exact);
+                                                    const OptTensor& bias, bool exact, int64_t row_terms);
 std::vector<torch::Tensor> nvfp4_gelu_backward_quantize_dual(torch::Tensor dy, torch::Tensor h, bool do_row,
                                                              bool do_col, bool row_sr, int64_t row_seed, bool col_sr,
                                                              int64_t col_seed, bool col_rht, int64_t rht_seed,
@@ -41,13 +42,13 @@ std::vector<torch::Tensor> nvfp4_rmsnorm_quantize_dual(torch::Tensor x, torch::T
                                                        bool do_col, bool row_sr, int64_t row_seed, bool col_sr,
                                                        int64_t col_seed, bool col_rht, int64_t rht_seed, int64_t col_pad,
                                                        const OptTensor& row_seed_t, const OptTensor& col_seed_t,
-                                                       const OptTensor& rht_seed_t);
+                                                       const OptTensor& rht_seed_t, int64_t row_terms);
 std::vector<torch::Tensor> nvfp4_swiglu_quantize_dual(torch::Tensor g, torch::Tensor u, bool do_row, bool do_col,
                                                       bool row_sr, int64_t row_seed, bool col_sr, int64_t col_seed,
                                                       bool col_rht, int64_t rht_seed, int64_t col_pad,
                                                       const OptTensor& row_seed_t, const OptTensor& col_seed_t,
                                                       const OptTensor& rht_seed_t, const OptTensor& bias_g,
-                                                      const OptTensor& bias_u);
+                                                      const OptTensor& bias_u, int64_t row_terms);
 std::vector<torch::Tensor> nvfp4_swiglu_backward_quantize_dual(torch::Tensor dy, torch::Tensor g, torch::Tensor u,
                                                                bool gate, bool do_row, bool do_col, bool row_sr,
                                                                int64_t row_seed, bool col_sr, int64_t col_seed,
@@ -99,7 +100,7 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
         py::arg("x"), py::arg("do_row") = true, py::arg("do_col") = true, py::arg("block_2d") = false,
         py::arg("row_sr") = false, py::arg("row_seed") = 0, py::arg("col_sr") = false, py::arg("col_seed") = 0,
         py::arg("col_rht") = false, py::arg("rht_seed") = 0, py::arg("col_pad") = 16, py::arg("row_seed_t") = py::none(), py::arg("col_seed_t") = py::none(),
-        py::arg("rht_seed_t") = py::none(), py::arg("amax_floor") = py::none());
+        py::arg("rht_seed_t") = py::none(), py::arg("amax_floor") = py::none(), py::arg("row_terms") = 1);
   m.def("combine_fwd", &nvfp4_combine_fwd, "out[r] = sum_j w[r, j] rows[pos[r, j]] (MoE combine)", py::arg("rows"),
         py::arg("pos"), py::arg("w") = py::none());
   m.def("combine_bwd_rows", &nvfp4_combine_bwd_rows, "MoE combine backward: the rows' gradient by gather", py::arg("g"),
@@ -124,13 +125,13 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
         py::arg("x"), py::arg("gamma"), py::arg("beta"), py::arg("eps"), py::arg("do_row") = true,
         py::arg("do_col") = true, py::arg("row_sr") = false, py::arg("row_seed") = 0, py::arg("col_sr") = false,
         py::arg("col_seed") = 0, py::arg("col_rht") = false, py::arg("rht_seed") = 0, py::arg("col_pad") = 16, py::arg("row_seed_t") = py::none(), py::arg("col_seed_t") = py::none(),
-        py::arg("rht_seed_t") = py::none());
+        py::arg("rht_seed_t") = py::none(), py::arg("row_terms") = 1);
   m.def("gelu_quantize_dual", &nvfp4_gelu_quantize_dual, "GELU(h + bias) (tanh or exact) fused into quantize_dual",
         py::arg("h"), py::arg("do_row") = true, py::arg("do_col") = true, py::arg("row_sr") = false,
         py::arg("row_seed") = 0, py::arg("col_sr") = false, py::arg("col_seed") = 0, py::arg("col_rht") = false,
         py::arg("rht_seed") = 0, py::arg("col_pad") = 16, py::arg("row_seed_t") = py::none(),
         py::arg("col_seed_t") = py::none(), py::arg("rht_seed_t") = py::none(), py::arg("bias") = py::none(),
-        py::arg("exact") = false);
+        py::arg("exact") = false, py::arg("row_terms") = 1);
   m.def("gelu_backward_quantize_dual", &nvfp4_gelu_backward_quantize_dual,
         "GELU backward (dy * gelu'(h + bias)) fused into quantize_dual (+ per-tile column sums)", py::arg("dy"),
         py::arg("h"), py::arg("do_row") = true, py::arg("do_col") = true, py::arg("row_sr") = false,
@@ -143,13 +144,14 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
         py::arg("gamma"), py::arg("eps"), py::arg("do_row") = true, py::arg("do_col") = true, py::arg("row_sr") = false, py::arg("row_seed") = 0,
         py::arg("col_sr") = false, py::arg("col_seed") = 0, py::arg("col_rht") = false, py::arg("rht_seed") = 0,
         py::arg("col_pad") = 16, py::arg("row_seed_t") = py::none(), py::arg("col_seed_t") = py::none(),
-        py::arg("rht_seed_t") = py::none());
+        py::arg("rht_seed_t") = py::none(), py::arg("row_terms") = 1);
   m.def("swiglu_quantize_dual", &nvfp4_swiglu_quantize_dual,
         "SwiGLU (silu(g + bias_g) * (u + bias_u)) fused into quantize_dual", py::arg("g"), py::arg("u"),
         py::arg("do_row") = true, py::arg("do_col") = true, py::arg("row_sr") = false, py::arg("row_seed") = 0,
         py::arg("col_sr") = false, py::arg("col_seed") = 0, py::arg("col_rht") = false, py::arg("rht_seed") = 0,
         py::arg("col_pad") = 16, py::arg("row_seed_t") = py::none(), py::arg("col_seed_t") = py::none(),
-        py::arg("rht_seed_t") = py::none(), py::arg("bias_g") = py::none(), py::arg("bias_u") = py::none());
+        py::arg("rht_seed_t") = py::none(), py::arg("bias_g") = py::none(), py::arg("bias_u") = py::none(),
+        py::arg("row_terms") = 1);
   m.def("swiglu_backward_quantize_dual", &nvfp4_swiglu_backward_quantize_dual,
         "SwiGLU backward (gradient w.r.t. g if gate else u) fused into quantize_dual", py::arg("dy"), py::arg("g"),
         py::arg("u"), py::arg("gate"), py::arg("do_row") = true, py::arg("do_col") = true, py::arg("row_sr") = false, py::arg("row_seed") = 0,

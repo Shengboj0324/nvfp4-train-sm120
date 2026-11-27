@@ -95,15 +95,15 @@ class WeightQuantCache:
     capture turns its cache off for good (replays change weights without running any Python).
     """
 
-    __slots__ = ("key", "wq", "wtq", "hits", "misses", "bypass")
+    __slots__ = ("key", "wq", "wtq", "wq2", "hits", "misses", "bypass")
 
     def __init__(self):
-        self.key = self.wq = self.wtq = None
+        self.key = self.wq = self.wtq = self.wq2 = None  # wq2: [W | W] for two-term forwards
         self.hits = self.misses = 0
         self.bypass = False
 
     def clear(self) -> None:
-        self.key = self.wq = self.wtq = None
+        self.key = self.wq = self.wtq = self.wq2 = None
 
     # copies / pickles of a module start with an empty cache (no tensors serialized)
     def __deepcopy__(self, memo):
@@ -153,24 +153,32 @@ def quantized_weight(weight: torch.Tensor, need_t: bool, backend_name: str, cach
         cache.hits += 1
         return cache.wq, (cache.wtq if need_t else None)
     wq, wtq = _quantize_weight(be, weight.detach(), need_t)
-    cache.key, cache.wq, cache.wtq = key, wq, wtq
+    cache.key, cache.wq, cache.wtq, cache.wq2 = key, wq, wtq, None
     cache.misses += 1
     return wq, wtq
 
 
 def dgrad_weight_operand(backend_name: str, weight: torch.Tensor, need_dgrad: bool, cache: WeightQuantCache | None,
-                         row_seed=None):
+                         row_seed=None, terms: int = 1):
     """(W for fprop, the dgrad operand W^T or None). Normally W^T is the transpose of W's 16x16-block
     quantization (or the 1x16 re-quantization, see _quantize_weight). With MS-EDEN on dgrad
     (``ops.set_ms_eden(True, dgrad=True)``) it is the dequantized fprop weight, transposed and quantized along N
     after the 64-point RHT that the output gradient's row quantization with ``row_seed`` (its row SR seed)
     applies, so that the rotations cancel in dX = (R dY)(R W^T)^T. A stacked [E, N, K] weight gives
-    [K, E N] (see ops.stack_transposed)."""
+    [K, E N] (see ops.stack_transposed). ``terms=2``: the fprop operand is [W | W] (ops.two_term_weight, cached
+    with W), for activations quantized with row_terms=2."""
     rot = need_dgrad and ops.ms_eden_dgrad()
     wq, wtq = quantized_weight(weight, need_dgrad and not rot, backend_name, cache)
     if rot:
         _, wtq = _BACKENDS[backend_name].dual(wq.dequantize(), row=False, col=True,
                                               rht_seed=ops.row_rht_seed(row_seed), col_pad=ALIGN)
+    if terms == 2:
+        if cache is not None and cache.wq is wq:
+            if cache.wq2 is None:
+                cache.wq2 = ops.two_term_weight(wq)
+            wq = cache.wq2
+        else:
+            wq = ops.two_term_weight(wq)
     return wq, wtq
 
 
@@ -251,10 +259,13 @@ class _NVFP4LinearFn(torch.autograd.Function):
         # [dY row SR, dY^T SR, RHT]: drawn once per call; the backward reuses the RHT seed of X^T
         seeds = draw_seeds(3, x2d.device) if need_dgrad or need_wgrad else None
         rht = seeds[2] if need_wgrad and wgrad_rht else None
-        # X  -> rowwise for fprop, and (if wgrad) X^T along tokens, RHT, zero-padded to ALIGN tokens
-        xq, xtq = be.dual(x2d, col=need_wgrad, rht_seed=rht, col_pad=ALIGN)
-        # W  -> 16x16 tiles; W^T (exact transpose) for dgrad
-        wq, wtq = dgrad_weight_operand(backend_name, weight, need_dgrad, wcache, seeds[0] if need_dgrad else None)
+        # X  -> rowwise for fprop (two terms with ops.set_fprop_terms(2)), and (if wgrad) X^T along tokens, RHT,
+        #       zero-padded to ALIGN tokens
+        terms = ops.fprop_terms()
+        xq, xtq = be.dual(x2d, col=need_wgrad, rht_seed=rht, col_pad=ALIGN, **({"row_terms": 2} if terms == 2 else {}))
+        # W  -> 16x16 tiles ([W | W] for two terms); W^T (exact transpose) for dgrad
+        wq, wtq = dgrad_weight_operand(backend_name, weight, need_dgrad, wcache, seeds[0] if need_dgrad else None,
+                                       terms=terms)
         if backend_name == "cuda" and (bias is not None or residual is not None):
             y = ops.gemm(xq, wq, out_dtype, bias=bias, residual=residual)  # [M, out], epilogue fused
         else:

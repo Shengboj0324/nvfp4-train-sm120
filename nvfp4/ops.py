@@ -100,6 +100,34 @@ def weight_blocks() -> str:
     return _WEIGHT_BLOCKS[0]
 
 
+_FPROP_TERMS = [1]
+
+
+def set_fprop_terms(n: int) -> None:
+    """Recipe switch: the NVFP4 layers' forward GEMMs take their activations in ``n`` NVFP4 terms (1, the default,
+    or 2). With 2 the activation quantizer also quantizes its own rounding error, x ~ Q(x) + Q(x - deq Q(x)) with
+    one tensor scale, and the forward GEMM runs [Q1 | Q2] [W | W]^T: one NVFP4 GEMM of twice the depth on the same
+    kernel (the cost of an MXFP8 GEMM on RTX 50, whose FP4 rate is twice the FP8 rate), with the activations
+    about as accurate as MXFP8 (2-3 more bits). The forward activation error causes most of NVFP4's loss gap
+    (docs/DESIGN.md §2.5); the backward is unchanged. Applies to NVFP4Linear and the nvfp4.fused sub-blocks
+    (their norm / GELU / SwiGLU producers quantize both terms from one read), not to mixture-of-experts experts.
+    Read at every forward."""
+    if n not in (1, 2):
+        raise ValueError(f"fprop terms must be 1 or 2, got {n!r}")
+    _FPROP_TERMS[0] = int(n)
+
+
+def fprop_terms() -> int:
+    """The number of NVFP4 terms of the forward activations (``set_fprop_terms``)."""
+    return _FPROP_TERMS[0]
+
+
+def two_term_weight(wq: "NVFP4Tensor") -> "NVFP4Tensor":
+    """[W | W] along K: the weight operand of a forward GEMM whose activations have two terms (row_terms=2)."""
+    return NVFP4Tensor(torch.cat([wq.data, wq.data], 1), _scales_ld16(torch.cat([wq.scales, wq.scales], 1)),
+                       wq.gdec)
+
+
 _HIGH_PRECISION = [False]
 
 
@@ -223,7 +251,7 @@ def quantize(x: torch.Tensor, *, transpose: bool = False, block_2d: bool = False
 def quantize_dual(x: torch.Tensor | list[torch.Tensor] | tuple[torch.Tensor, ...], *, row: bool = True,
                   col: bool = True, block_2d: bool = False, row_sr_seed: Seed = None, col_sr_seed: Seed = None,
                   rht_seed: Seed = None, col_pad: int = 16, bias_grad: bool = False,
-                  amax_floor: torch.Tensor | None = None):
+                  amax_floor: torch.Tensor | None = None, row_terms: int = 1):
     """One read of ``x`` [R, C] -> (``x`` quantized along C, ``x.T`` quantized along R).
 
     The second output is padded with zero rows of ``x`` to a multiple of ``col_pad`` and optionally
@@ -239,8 +267,13 @@ def quantize_dual(x: torch.Tensor | list[torch.Tensor] | tuple[torch.Tensor, ...
     ``amax_floor`` (one fp32 element on x's device): the tensor scale of the row output (and of the col output
     without RHT) comes from max(amax(x), amax_floor) instead of amax(x), e.g. one scale for the ranks of an
     expert-parallel group (re-quantizing dequantized values with the same scale reproduces the codes).
+    ``row_terms=2`` (round-to-nearest row output with 1x16 blocks, single-tensor input): the row output is
+    ``[Q(x) | Q(x - deq Q(x))]`` along C ([R, C] bytes, [R, C/8] scales, x's tensor scale for both terms), the
+    activation operand of a two-term forward GEMM against ``two_term_weight(W)`` (see ``set_fprop_terms``).
     """
     if isinstance(x, (list, tuple)) or bias_grad:
+        if row_terms != 1:
+            raise ValueError("row_terms = 2 is not supported for multi-part inputs / bias_grad")
         parts = list(x) if isinstance(x, (list, tuple)) else [x]
         if block_2d:
             raise ValueError("block_2d is not supported for multi-part inputs / bias_grad")
@@ -250,7 +283,7 @@ def quantize_dual(x: torch.Tensor | list[torch.Tensor] | tuple[torch.Tensor, ...
         pair = _pair(outs[:6], row, col)
         return (*pair, _colsums(outs[6], bias_grad)) if bias_grad else pair
     outs = _lib.quantize_dual(x, row, col, block_2d, *_seed_flags(row_sr_seed, col_sr_seed, rht_seed), int(col_pad),
-                              *_seed_tensors(row_sr_seed, col_sr_seed, rht_seed), amax_floor)
+                              *_seed_tensors(row_sr_seed, col_sr_seed, rht_seed), amax_floor, int(row_terms))
     return _pair(outs, row, col)
 
 
@@ -296,7 +329,7 @@ def _pair(outs, row, col):
 
 def layernorm_quantize_dual(x: torch.Tensor, weight: torch.Tensor, bias: torch.Tensor, eps: float, *, row: bool = True,
                             col: bool = True, row_sr_seed: Seed = None, col_sr_seed: Seed = None,
-                            rht_seed: Seed = None, col_pad: int = 16):
+                            rht_seed: Seed = None, col_pad: int = 16, row_terms: int = 1):
     """Quantize ``LayerNorm(x)`` [R, C] (fp32 weight / bias [C]) without writing it.
 
     Returns ``(mean, rstd, row, col)``: the per-row statistics ([R] fp32, what the LayerNorm backward
@@ -304,7 +337,7 @@ def layernorm_quantize_dual(x: torch.Tensor, weight: torch.Tensor, bias: torch.T
     """
     outs = _lib.layernorm_quantize_dual(x, weight, bias, float(eps), row, col,
                                         *_seed_flags(row_sr_seed, col_sr_seed, rht_seed), int(col_pad),
-                                        *_seed_tensors(row_sr_seed, col_sr_seed, rht_seed))
+                                        *_seed_tensors(row_sr_seed, col_sr_seed, rht_seed), int(row_terms))
     return (outs[0], outs[1], *_pair(outs[2:], row, col))
 
 
@@ -316,11 +349,12 @@ def _exact(approximate: str) -> bool:
 
 def gelu_quantize_dual(h: torch.Tensor, *, bias: torch.Tensor | None = None, approximate: str = "tanh",
                        row: bool = True, col: bool = True, row_sr_seed: Seed = None, col_sr_seed: Seed = None,
-                       rht_seed: Seed = None, col_pad: int = 16):
+                       rht_seed: Seed = None, col_pad: int = 16, row_terms: int = 1):
     """Quantize ``gelu(h + bias)`` (bf16 ``h``, optional per-column ``bias``; ``approximate`` as in
     ``torch.nn.functional.gelu``: "tanh" or "none" for the exact erf form) without writing it."""
     outs = _lib.gelu_quantize_dual(h, row, col, *_seed_flags(row_sr_seed, col_sr_seed, rht_seed), int(col_pad),
-                                   *_seed_tensors(row_sr_seed, col_sr_seed, rht_seed), bias, _exact(approximate))
+                                   *_seed_tensors(row_sr_seed, col_sr_seed, rht_seed), bias, _exact(approximate),
+                                   int(row_terms))
     return _pair(outs, row, col)
 
 
@@ -342,7 +376,7 @@ def gelu_backward_quantize_dual(dy: torch.Tensor, h: torch.Tensor, *, bias: torc
 
 def rmsnorm_quantize_dual(x: torch.Tensor, weight: torch.Tensor, eps: float, *, row: bool = True, col: bool = True,
                           row_sr_seed: Seed = None, col_sr_seed: Seed = None, rht_seed: Seed = None,
-                          col_pad: int = 16):
+                          col_pad: int = 16, row_terms: int = 1):
     """Quantize ``RMSNorm(x)`` [R, C] (fp32 weight [C]) without writing it.
 
     Returns ``(rstd, row, col)``: the per-row ``1 / sqrt(mean(x^2) + eps)`` ([R] fp32, what the RMSNorm
@@ -350,17 +384,19 @@ def rmsnorm_quantize_dual(x: torch.Tensor, weight: torch.Tensor, eps: float, *, 
     """
     outs = _lib.rmsnorm_quantize_dual(x, weight, float(eps), row, col,
                                       *_seed_flags(row_sr_seed, col_sr_seed, rht_seed), int(col_pad),
-                                      *_seed_tensors(row_sr_seed, col_sr_seed, rht_seed))
+                                      *_seed_tensors(row_sr_seed, col_sr_seed, rht_seed), int(row_terms))
     return (outs[0], *_pair(outs[1:], row, col))
 
 
 def swiglu_quantize_dual(g: torch.Tensor, u: torch.Tensor, *, bias_g: torch.Tensor | None = None,
                          bias_u: torch.Tensor | None = None, row: bool = True, col: bool = True,
-                         row_sr_seed: Seed = None, col_sr_seed: Seed = None, rht_seed: Seed = None, col_pad: int = 16):
+                         row_sr_seed: Seed = None, col_sr_seed: Seed = None, rht_seed: Seed = None, col_pad: int = 16,
+                         row_terms: int = 1):
     """Quantize ``silu(g + bias_g) * (u + bias_u)`` (bf16 gate / up projections, Llama's SwiGLU MLP; the
     optional per-column biases are added in fp32) without writing it."""
     outs = _lib.swiglu_quantize_dual(g, u, row, col, *_seed_flags(row_sr_seed, col_sr_seed, rht_seed), int(col_pad),
-                                     *_seed_tensors(row_sr_seed, col_sr_seed, rht_seed), bias_g, bias_u)
+                                     *_seed_tensors(row_sr_seed, col_sr_seed, rht_seed), bias_g, bias_u,
+                                     int(row_terms))
     return _pair(outs, row, col)
 
 

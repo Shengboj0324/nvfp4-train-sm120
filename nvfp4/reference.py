@@ -308,8 +308,12 @@ ROW_RHT_SALT = 0x1E3779B97F4A7C15  # csrc kRowRhtSalt
 
 def quantize_dual(x: torch.Tensor, *, row: bool = True, col: bool = True, block_2d: bool = False,
                   row_sr_seed: int | None = None, col_sr_seed: int | None = None, rht_seed: int | None = None,
-                  col_pad: int = 16, four_six: bool = False, ms_eden: bool = False, ms_eden_dgrad: bool = False):
+                  col_pad: int = 16, four_six: bool = False, ms_eden: bool = False, ms_eden_dgrad: bool = False,
+                  row_terms: int = 1):
     """Spec of the fused dual quantizer: (quantize(x), quantize(RHT(pad_rows(x, col_pad).T))).
+
+    ``row_terms=2`` (round-to-nearest row output, 1x16 blocks): the row output is [Q(x) | Q(x - deq Q(x))] along
+    the columns, the second term quantized with x's tensor scale (one gdec for both).
 
     Either output is None when disabled. A seed of None means round-to-nearest-even. ``ms_eden_dgrad``: a
     stochastically rounded row output is the 64-point RHT of x along its rows with seed row_sr_seed ^
@@ -324,6 +328,13 @@ def quantize_dual(x: torch.Tensor, *, row: bool = True, col: bool = True, block_
         else:
             r_out = quantize(xf, block_2d=block_2d, stochastic=row_sr_seed is not None, seed=row_sr_seed or 0,
                              four_six=four_six)
+        if row_terms == 2:
+            assert row_sr_seed is None and not block_2d, "row_terms = 2 needs round-to-nearest 1x16 rows"
+            res = xf - dequantize(*r_out)
+            q2 = quantize(res, amax=xf.abs().max(), four_six=four_six)
+            r_out = (torch.cat([r_out[0], q2[0]], 1), torch.cat([r_out[1], q2[1]], 1), r_out[2])
+        else:
+            assert row_terms == 1, row_terms
     if col:
         pad = (-xf.shape[0]) % col_pad
         y = torch.nn.functional.pad(xf, (0, 0, 0, pad)).T.contiguous()

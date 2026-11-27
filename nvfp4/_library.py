@@ -64,10 +64,11 @@ def aligned(t: Tensor) -> Tensor:
 def _quantize_dual_impl(x: Tensor, do_row: bool, do_col: bool, block_2d: bool, row_sr: bool, row_seed: int,
                         col_sr: bool, col_seed: int, col_rht: bool, rht_seed: int, col_pad: int,
                         row_seed_t: Optional[Tensor], col_seed_t: Optional[Tensor],
-                        rht_seed_t: Optional[Tensor], amax_floor: Optional[Tensor] = None) -> _DUAL:
+                        rht_seed_t: Optional[Tensor], amax_floor: Optional[Tensor] = None,
+                        row_terms: int = 1) -> _DUAL:
     require(x)
     return tuple(_C.quantize_dual(aligned(x), do_row, do_col, block_2d, row_sr, row_seed, col_sr, col_seed, col_rht,
-                                  rht_seed, col_pad, row_seed_t, col_seed_t, rht_seed_t, amax_floor))
+                                  rht_seed, col_pad, row_seed_t, col_seed_t, rht_seed_t, amax_floor, row_terms))
 
 
 def _quantize_dual_parts_impl(parts: List[Tensor], do_row: bool, do_col: bool, row_sr: bool, row_seed: int,
@@ -114,12 +115,12 @@ def _dequantize_impl(data: Tensor, scales: Tensor, gdec: Tensor, out_dtype: torc
 def _layernorm_quantize_dual_impl(x: Tensor, weight: Tensor, bias: Tensor, eps: float, do_row: bool, do_col: bool,
                                   row_sr: bool, row_seed: int, col_sr: bool, col_seed: int, col_rht: bool,
                                   rht_seed: int, col_pad: int, row_seed_t: Optional[Tensor],
-                                  col_seed_t: Optional[Tensor], rht_seed_t: Optional[Tensor]
+                                  col_seed_t: Optional[Tensor], rht_seed_t: Optional[Tensor], row_terms: int = 1
                                   ) -> Tuple[Tensor, Tensor, Tensor, Tensor, Tensor, Tensor, Tensor, Tensor]:
     require(x)
     return tuple(_C.layernorm_quantize_dual(aligned(x), weight.float().contiguous(), bias.float().contiguous(), eps,
                                             do_row, do_col, row_sr, row_seed, col_sr, col_seed, col_rht, rht_seed,
-                                            col_pad, row_seed_t, col_seed_t, rht_seed_t))
+                                            col_pad, row_seed_t, col_seed_t, rht_seed_t, row_terms))
 
 
 def _bias(b: Optional[Tensor]) -> Optional[Tensor]:
@@ -129,11 +130,12 @@ def _bias(b: Optional[Tensor]) -> Optional[Tensor]:
 def _gelu_quantize_dual_impl(h: Tensor, do_row: bool, do_col: bool, row_sr: bool, row_seed: int, col_sr: bool,
                              col_seed: int, col_rht: bool, rht_seed: int, col_pad: int,
                              row_seed_t: Optional[Tensor], col_seed_t: Optional[Tensor],
-                             rht_seed_t: Optional[Tensor], bias: Optional[Tensor], exact: bool) -> _DUAL:
+                             rht_seed_t: Optional[Tensor], bias: Optional[Tensor], exact: bool,
+                             row_terms: int = 1) -> _DUAL:
     require(h)
     return tuple(_C.gelu_quantize_dual(aligned(h.to(torch.bfloat16)), do_row, do_col, row_sr, row_seed, col_sr,
                                        col_seed, col_rht, rht_seed, col_pad, row_seed_t, col_seed_t, rht_seed_t,
-                                       _bias(bias), exact))
+                                       _bias(bias), exact, row_terms))
 
 
 def _gelu_backward_quantize_dual_impl(dy: Tensor, h: Tensor, do_row: bool, do_col: bool, row_sr: bool, row_seed: int,
@@ -151,23 +153,23 @@ def _gelu_backward_quantize_dual_impl(dy: Tensor, h: Tensor, do_row: bool, do_co
 def _rmsnorm_quantize_dual_impl(x: Tensor, weight: Tensor, eps: float, do_row: bool, do_col: bool, row_sr: bool,
                                 row_seed: int, col_sr: bool, col_seed: int, col_rht: bool, rht_seed: int, col_pad: int,
                                 row_seed_t: Optional[Tensor], col_seed_t: Optional[Tensor],
-                                rht_seed_t: Optional[Tensor]
+                                rht_seed_t: Optional[Tensor], row_terms: int = 1
                                 ) -> Tuple[Tensor, Tensor, Tensor, Tensor, Tensor, Tensor, Tensor]:
     require(x)
     return tuple(_C.rmsnorm_quantize_dual(aligned(x), weight.float().contiguous(), eps, do_row, do_col, row_sr,
                                           row_seed, col_sr, col_seed, col_rht, rht_seed, col_pad, row_seed_t,
-                                          col_seed_t, rht_seed_t))
+                                          col_seed_t, rht_seed_t, row_terms))
 
 
 def _swiglu_quantize_dual_impl(g: Tensor, u: Tensor, do_row: bool, do_col: bool, row_sr: bool, row_seed: int,
                                col_sr: bool, col_seed: int, col_rht: bool, rht_seed: int, col_pad: int,
                                row_seed_t: Optional[Tensor], col_seed_t: Optional[Tensor],
                                rht_seed_t: Optional[Tensor], bias_g: Optional[Tensor],
-                               bias_u: Optional[Tensor]) -> _DUAL:
+                               bias_u: Optional[Tensor], row_terms: int = 1) -> _DUAL:
     require(g)
     return tuple(_C.swiglu_quantize_dual(aligned(g.to(torch.bfloat16)), aligned(u.to(torch.bfloat16)), do_row, do_col,
                                          row_sr, row_seed, col_sr, col_seed, col_rht, rht_seed, col_pad, row_seed_t,
-                                         col_seed_t, rht_seed_t, _bias(bias_g), _bias(bias_u)))
+                                         col_seed_t, rht_seed_t, _bias(bias_g), _bias(bias_u), row_terms))
 
 
 def _swiglu_backward_quantize_dual_impl(dy: Tensor, g: Tensor, u: Tensor, gate: bool, do_row: bool, do_col: bool,
@@ -275,18 +277,20 @@ _attn_fwd_op = torch.library.custom_op("nvfp4::attn_fwd", _attn_fwd_impl, mutate
 _attn_bwd_op = torch.library.custom_op("nvfp4::attn_bwd", _attn_bwd_impl, mutates_args=())
 
 
-def _dual_fake(x: Tensor, do_row: bool, do_col: bool, col_pad: int) -> _DUAL:
+def _dual_fake(x: Tensor, do_row: bool, do_col: bool, col_pad: int, row_terms: int = 1) -> _DUAL:
     R, C = x.shape
     r_pad = (R + col_pad - 1) // col_pad * col_pad
     u8, f32 = torch.uint8, torch.float32
-    return (x.new_empty((R if do_row else 0, C // 2), dtype=u8), x.new_empty((R if do_row else 0, C // 16), dtype=u8),
+    Cr = C * row_terms
+    return (x.new_empty((R if do_row else 0, Cr // 2), dtype=u8), x.new_empty((R if do_row else 0, Cr // 16), dtype=u8),
             x.new_empty((1 if do_row else 0,), dtype=f32), x.new_empty((C if do_col else 0, r_pad // 2), dtype=u8),
             x.new_empty((C if do_col else 0, r_pad // 16), dtype=u8), x.new_empty((1 if do_col else 0,), dtype=f32))
 
 
 @_quantize_dual_op.register_fake
-def _(x, do_row, do_col, block_2d, row_sr, row_seed, col_sr, col_seed, col_rht, rht_seed, col_pad, *seed_tensors):
-    return _dual_fake(x, do_row, do_col, col_pad)
+def _(x, do_row, do_col, block_2d, row_sr, row_seed, col_sr, col_seed, col_rht, rht_seed, col_pad, row_seed_t,
+      col_seed_t, rht_seed_t, amax_floor=None, row_terms=1):
+    return _dual_fake(x, do_row, do_col, col_pad, row_terms)
 
 
 @_mxfp8_encode_op.register_fake
@@ -337,15 +341,15 @@ def _(parts, do_row, do_col, row_sr, row_seed, col_sr, col_seed, col_rht, rht_se
 
 @_layernorm_quantize_dual_op.register_fake
 def _(x, weight, bias, eps, do_row, do_col, row_sr, row_seed, col_sr, col_seed, col_rht, rht_seed, col_pad,
-      *seed_tensors):
+      row_seed_t, col_seed_t, rht_seed_t, row_terms=1):
     stats = x.new_empty((x.shape[0],), dtype=torch.float32)
-    return (stats, torch.empty_like(stats), *_dual_fake(x, do_row, do_col, col_pad))
+    return (stats, torch.empty_like(stats), *_dual_fake(x, do_row, do_col, col_pad, row_terms))
 
 
 @_gelu_quantize_dual_op.register_fake
 def _(h, do_row, do_col, row_sr, row_seed, col_sr, col_seed, col_rht, rht_seed, col_pad, row_seed_t, col_seed_t,
-      rht_seed_t, bias, exact):
-    return _dual_fake(h, do_row, do_col, col_pad)
+      rht_seed_t, bias, exact, row_terms=1):
+    return _dual_fake(h, do_row, do_col, col_pad, row_terms)
 
 
 @_gelu_backward_quantize_dual_op.register_fake
@@ -358,14 +362,15 @@ def _(dy, h, do_row, do_col, row_sr, row_seed, col_sr, col_seed, col_rht, rht_se
 
 
 @_rmsnorm_quantize_dual_op.register_fake
-def _(x, weight, eps, do_row, do_col, row_sr, row_seed, col_sr, col_seed, col_rht, rht_seed, col_pad, *seed_tensors):
-    return (x.new_empty((x.shape[0],), dtype=torch.float32), *_dual_fake(x, do_row, do_col, col_pad))
+def _(x, weight, eps, do_row, do_col, row_sr, row_seed, col_sr, col_seed, col_rht, rht_seed, col_pad, row_seed_t,
+      col_seed_t, rht_seed_t, row_terms=1):
+    return (x.new_empty((x.shape[0],), dtype=torch.float32), *_dual_fake(x, do_row, do_col, col_pad, row_terms))
 
 
 @_swiglu_quantize_dual_op.register_fake
 def _(g, u, do_row, do_col, row_sr, row_seed, col_sr, col_seed, col_rht, rht_seed, col_pad, row_seed_t, col_seed_t,
-      rht_seed_t, bias_g, bias_u):
-    return _dual_fake(g, do_row, do_col, col_pad)
+      rht_seed_t, bias_g, bias_u, row_terms=1):
+    return _dual_fake(g, do_row, do_col, col_pad, row_terms)
 
 
 @_swiglu_backward_quantize_dual_op.register_fake
