@@ -118,7 +118,7 @@ x = rmsnorm_swiglu_mlp(x, blk.norm2, blk.gate, blk.up, blk.down, residual=True)
 
 # 4. 8-bit flash attention: q [B, H, N, D], k / v [B, Hkv, N, D], D in {64, 128}; GQA, causal or full
 from nvfp4.attention import attention
-o = attention(q, k, v, causal=True)            # backward="bf16" (default, exact) | "8bit" (faster, +0.5% loss)
+o = attention(q, k, v, causal=True)            # backward="bf16" (default, exact) | "8bit" (FP16 MMAs, deterministic)
 
 # 5. Mixture of experts: dropless top-k; NVFP4 experts run as grouped GEMMs (one launch per projection)
 from nvfp4.moe import MoE
@@ -127,6 +127,7 @@ convert_linears(moe, fuse_wgrad_accumulation=True)
 y = moe(x); loss = loss + 0.01 * moe.aux_loss
 
 # 6. Recipe switches (process-wide, read at kernel launch)
+ops.set_fprop_terms(2)           # two-term forward activations Q(x) + Q(x - Q(x)): half the loss gap, -3% tokens/s
 ops.set_high_precision(True)     # BF16 tail: NVFP4 layers compute in BF16 from here on (flip back any time)
 ops.set_ms_eden(True)            # MS-EDEN wgrad operands (64-point RHT, unbiased scale-level SR)
 ops.set_ms_eden(True, dgrad=True)  # ... and dgrad operands (dY and W^T rotated along N)
@@ -182,14 +183,18 @@ the last 2 of 12 blocks in BF16. Losses are final validation loss, with gaps rel
 |---|---|---|
 | GPT-124M, default recipe, 3 seeds | +1.32% ± 0.16 (+0.019 nats), constant over training | +32% |
 | GPT-507M (d = 2048), default recipe | +1.0% | +62% |
+| GPT-124M + **two-term forward activations** (`ops.set_fprop_terms(2)`), 3 seeds | **+0.70% ± 0.09** | +25% |
 | GPT-124M + **BF16 tail** (last 10% of steps in BF16), 3 seeds | **+0.62%** | +27% |
+| GPT-124M + two-term activations + BF16 tail, 3 seeds | **+0.47% ± 0.14** | |
 | GPT-124M + MS-EDEN + Four Over Six, 3 seeds | +1.21% | +26% |
 | GPT-124M, 8-bit attention at 4096 tokens, 2 seeds | same as BF16 attention | |
 | MoE GPT (8 experts, 294M parameters), pooled over 4 BF16 / 6 NVFP4 runs | +1.12% | +23% |
 
 The 2026 recipe options (Four Over Six, MS-EDEN on wgrad and dgrad, 1×16 weights) each lower the loss by only
-0.03–0.13% (about 0.2% in the best combinations) at this scale. Switching to BF16 for the last tenth of training removes about half of the gap
-([DESIGN.md §2.1](docs/DESIGN.md), [RESULTS.md §4.2](docs/RESULTS.md)). Validate the recipe on your own
+0.03–0.13% (about 0.2% in the best combinations) at this scale. Three quarters of the gap is the forward GEMM's
+activations; quantizing them as two NVFP4 terms (the second the first's rounding error, one GEMM of twice the
+depth) removes half of it, and so does switching to BF16 for the last tenth of training
+([DESIGN.md §2.1–2.2](docs/DESIGN.md), [RESULTS.md §4.2–4.3](docs/RESULTS.md)). Validate the recipe on your own
 model before relying on it.
 
 ## Verification and development

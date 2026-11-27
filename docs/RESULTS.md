@@ -342,6 +342,59 @@ initialization, data order and rounding seeds, the difference to the baseline ru
 - Keeping fc2 in BF16 (TetraJet-v2's suggestion) recovers a fifth of the gap for 14% wall time: a worse
   trade than the tail.
 
+### 4.3 Where the gap comes from, and two-term activations (v0.19, `experiments/results/v0.19_gap/`, `…/v0.10_ablate/v019_*`)
+
+**Ablation** (`experiments/run_gap.sh`, `gap_ablate.py`; seed 0, the §4.2 setup with unfused `NVFP4Linear`s;
+BF16 1.4892). One GEMM, or one operand of the forward GEMM, in BF16; "eval BF16" is the same trained model
+evaluated with BF16 forwards:
+
+| in BF16 | val loss | vs the recipe | eval BF16 |
+|---|---|---|---|
+| nothing (the recipe; a rerun) | 1.5069 (1.5098) | | (1.5026) |
+| fprop | 1.4933 | −0.90% | |
+| dgrad | 1.5052 | −0.12% | |
+| wgrad | 1.5048 | −0.14% | |
+| round-to-nearest gradients (no SR) | 1.5067 | −0.02% | |
+| fprop activations | 1.4998 | −0.66% vs the rerun | 1.4998 |
+| fprop weights | 1.5079 | −0.13% | 1.5001 |
+| fprop of qkv only | 1.5047 | −0.34% | 1.4991 |
+| fprop of proj only | 1.5047 | −0.34% | 1.4984 |
+| fprop of fc1 only | 1.5042 | −0.37% | 1.4994 |
+| fprop of fc2 only | 1.5042 | −0.37% | 1.4991 |
+
+**Forward formats, emulated** (`experiments/run_gap_fwd.sh`, `gap_fwd.py`: the forward GEMM in BF16 on
+dequantized operands, the backward the recipe's; seeds 0 / 1):
+
+| activations in the forward | seed 0 | seed 1 | mean vs NVFP4 |
+|---|---|---|---|
+| NVFP4 (control) | 1.5090 | 1.5119 | |
+| NVFP4 after a 16-point random Hadamard transform along K | 1.5112 | | +0.15% |
+| NVFP4 after a 128-point random Hadamard transform | 1.5098 | 1.5154 | +0.14% |
+| MXFP8 | 1.4980 | 1.5034 | −0.65% |
+| two NVFP4 terms | 1.4962 | 1.5047 | −0.66% |
+
+**Two-term activations, three seeds** (`run_ablation.sh v019_terms2 --fprop-terms 2` and a baseline rerun
+with the same code, §4.2's fused setup; tokens/s at step 2900):
+
+| recipe | seed 0 | seed 1 | seed 2 | mean | vs BF16 | vs baseline, paired | tokens/s |
+|---|---|---|---|---|---|---|---|
+| BF16 (§4.1) | 1.4892 | 1.4922 | 1.4892 | 1.4902 | | | 63.1k |
+| baseline (v0.19 code) | 1.5063 | 1.5134 | 1.5107 | 1.5101 | +1.34% ± 0.16 | | 81.9k |
+| **two-term activations** | 1.4997 | 1.5040 | 1.4984 | **1.5007** | **+0.70% ± 0.09** | **−0.62% ± 0.19** | 79.2k |
+| two-term + BF16 tail (10%) | 1.4940 | 1.5012 | 1.4964 | 1.4972 | +0.47% ± 0.14 | −0.86% ± 0.08 | |
+
+- **Three quarters of the gap is the forward GEMM, and in it the activations** (the weights' 16×16 blocks
+  cost 0.13%), spread evenly over the four linears of a block. The backward GEMMs cost about 0.1% each,
+  stochastic rounding nothing measurable.
+- **A third of it is forward error at evaluation time:** the recipe's model evaluated with BF16 forwards
+  is 0.48% better; trained with BF16 activations it no longer matters how it is evaluated.
+- **Rotations do not help the activations** (E2M1's error is the grid's, not outliers'); 8 bits or a second
+  NVFP4 term remove half the gap.
+- **Two terms halve it in real training,** on every seed, for 3.3% of tokens/s and no measurable memory
+  (peak 9.55 GB both). With the BF16 tail on top (`--fprop-terms 2 --bf16-tail 0.1`) the gap is +0.47% ± 0.14 (paired −0.86% ± 0.08; the tail alone: +0.62%), and evaluated with its two-term NVFP4 layers instead of BF16 that model is still at +0.77%, where the tail alone leaves a model no better than the baseline.
+- Runs of the same seed differ by up to 0.2% (1.5069 vs 1.5098 above): the flash attention backward
+  accumulates with atomics. Paired differences of ±0.2% are noise.
+
 ## 5. End-to-end pretraining: GPT-507M, d=2048 (`experiments/results/v0.2_wide/`, `…/v0.3_wide/`)
 
 This run tests the claim from §3 that wider models gain more.
