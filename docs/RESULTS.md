@@ -501,6 +501,9 @@ block with NVFP4 linears (all blocks in the BF16 run):
 | 4096, 6 × 128 | NVFP4 | 8-bit (v0.9.0) | 1.6150 | 1.6035 | +0.72% | 70k |
 | 4096, 6 × 128 | NVFP4 | 8-bit, `backward="8bit"` (v0.9.1) | 1.6088 | 1.6033 | +0.52% | 67k |
 | 4096, 6 × 128 | NVFP4 | **8-bit, default backward (v0.10)** | **1.5979** | **1.5949** | **−0.09%** | 67k |
+| 4096, 6 × 128 | NVFP4 | BF16 (SDPA), v0.19 stack | 1.6060 | 1.5981 | | 65.5k |
+| 4096, 6 × 128 | NVFP4 | 8-bit, default backward, v0.19 stack | 1.6024 | 1.6020 | +0.01% | 66.0k |
+| 4096, 6 × 128 | NVFP4 | 8-bit, `backward="8bit"` (v0.19: FP16 dQ / dK / dV) | 1.6062 | 1.6029 | +0.15% | 65.7k |
 
 At 512 tokens 8-bit attention costs nothing measurable. At 4096 tokens the 8-bit backward cost 0.5% (both
 seeds above their BF16-attention runs; the BF16 baseline's seed-to-seed spread is 0.003), and the exact
@@ -509,6 +512,10 @@ on the activations of a model trained at 4096 tokens (`bench/attention_real_erro
 `bench/attention_qbwd_probe.py`, layers 0–9), default backward [`backward="8bit"`]: output 0.6–1.8%
 [0.7–2.3%], dQ 0.4–2.0% [0.3–0.6%; v0.9.0: 0.4–24%], dK 1.2–6.9% [2.8–7.1%], dV 0.2–2.1% [2.5–3.1%].
 GPT-124M (attention a small share of the step) trains at the same speed with either.
+v0.19's 8-bit backward (DESIGN.md §7.2: dQ, dK, dV on FP16 MMAs per tile row, consistent Delta; errors
+dQ 0.45 / 1.11%, dK 0.70 / 1.21%, dV 0.25 / 0.79% median / max over 12 layers, below the default backward's 0.51 /
+1.80%, 1.50 / 2.62%, 0.31 / 2.55%) cuts its training cost from +0.52% to +0.15%, within the seed spread
+(`experiments/results/v0.19_attn/`).
 
 ## 8. Mixture of experts (v0.11–v0.18, `bench/results/moe.json`, `experiments/results/v0.12_moe/`, `…/v0.13_moe/`, `…/v0.14_moe/`, `…/v0.16_ep_2x5090/`, `…/v0.17_*/`, `…/v0.18_*/`)
 
