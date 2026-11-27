@@ -1,5 +1,27 @@
 # Changelog
 
+## 0.19.0 — Two-term forward activations, an 8-bit attention backward on FP16 MMAs (2026-11-27)
+
+- **Where the GPT-124M gap comes from** (`experiments/gap_ablate.py`, `gap_fwd.py`, `run_gap*.sh`; RESULTS.md
+  §4.3): three quarters is the forward GEMM, and in it the activations of every layer (BF16 fprop −0.90%,
+  dgrad −0.12%, wgrad −0.14%, round-to-nearest gradients −0.02%). A third is error at evaluation time.
+  Random Hadamard rotations of the activations do not help (+0.15%); MXFP8 activations or two NVFP4 terms
+  remove half of it (emulated).
+- **Two-term forward activations** (`ops.set_fprop_terms(2)`, `train_gpt.py --fprop-terms 2`; off by
+  default): the activation is quantized as [Q(x) | Q(x − deq Q(x))] with one tensor scale, and the forward
+  GEMM runs once at twice the depth against [W | W] (cached, `WeightQuantCache.wq2`). In the dual
+  quantizer's row phase, so every producer path has it (`quantize_dual` / `layernorm_` / `rmsnorm_` /
+  `gelu_` / `swiglu_quantize_dual(row_terms=2)`, bit-exact against `reference.quantize_dual(row_terms=2)`,
+  Four Over Six included); `ops.two_term_weight`. Three seeds: −0.62% ± 0.19 paired, gap +1.34% → +0.70%,
+  −3.3% tokens/s; with the BF16 tail +0.47% ± 0.14. Not for the MoE experts.
+- **8-bit attention backward on FP16 MMAs** (`attention(..., backward="8bit")`): dQ, dK and dV from FP16
+  operands scaled per tile row with FP16 accumulation, a consistent Delta for dK / dV; smaller errors than
+  the exact backward on every layer, deterministic, as fast as flash's backward at D = 128; +0.15% loss vs
+  BF16 attention in training at 4096 tokens (was +0.52%). The default stays the exact backward.
+- Fixed: the dual quantizer's vectorized stores assumed an even block offset (misaligned with the second
+  term at C ≡ 16 mod 32).
+- `bench/bench_fprop_terms.py`; `tests/test_fprop_terms_cuda.py`.
+
 ## 0.18.0 — Expert parallelism: chunks with nodes, GEMMs beside NCCL, MXFP8 return messages (2026-11-26)
 
 - **Chunks with nodes fixed** (`moe.ep_serial`, "auto": on with `ep_node_size` > 1 and `ep_chunks` > 1):

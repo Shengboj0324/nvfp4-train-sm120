@@ -70,6 +70,10 @@ struct Params {
   // contiguous [R, part_cols] tensor (ProArgs::part), e.g. the q / k / v gradients of a fused qkv
   // projection, quantized without first being concatenated. 0: X is one contiguous tensor.
   int part_cols;
+  // Two-term row output (round-to-nearest rows only): the row output is [Q(X) | Q(X - deq Q(X))] along C, both
+  // terms with X's tensor scale, so one NVFP4 GEMM of twice the depth against [W | W] computes X W^T with the
+  // second term correcting the first's rounding (nvfp4.ops.quantize_dual(row_terms=2)). 1: the plain row output.
+  int row_terms;
 };
 
 // Device seeds: thread i < 3 of a CTA loads seed i at kernel entry, parks it in shared memory after its
@@ -427,7 +431,7 @@ __device__ __forceinline__ void store_stage(const Stage& st, uint8_t* __restrict
     const int r = t >> 1, j = 2 * (t & 1);
     if (r < nrows && j < nblk) {
       uint8_t* dst = data + static_cast<int64_t>(row0 + r) * row_bytes + (blk0 + j) * (kBlock / 2);
-      if (j + 1 < nblk && (row_bytes % 16) == 0) {
+      if (j + 1 < nblk && (row_bytes % 16) == 0 && (blk0 & 1) == 0) {  // (blk0: odd for a second term)
         const uint2 a = st.codes[r][j], b = st.codes[r][j + 1];
         *reinterpret_cast<uint4*>(dst) = make_uint4(a.x, a.y, b.x, b.y);
       } else {
@@ -439,7 +443,7 @@ __device__ __forceinline__ void store_stage(const Stage& st, uint8_t* __restrict
     const int r = t - 2 * TILE;
     if (r < nrows) {
       uint8_t* dst = scales + static_cast<int64_t>(row0 + r) * sc_row + blk0;
-      if (nblk == 4 && (sc_row % 4) == 0) {
+      if (nblk == 4 && (sc_row % 4) == 0 && (blk0 % 4) == 0) {
         *reinterpret_cast<uint32_t*>(dst) = *reinterpret_cast<const uint32_t*>(st.scales[r]);
       } else {
         for (int j = 0; j < nblk; ++j) dst[j] = st.scales[r][j];
@@ -499,9 +503,21 @@ __global__ void __launch_bounds__(THREADS) dual_quantize_kernel(const T* __restr
                       : p.row_sr ? quantize16<true>(v, bmax, genc, seeds.row, lin0, st.codes[k][b])
                       : p.row_46 ? quantize16_four_six(v, bmax, genc, st.codes[k][b])
                                  : quantize16<false>(v, bmax, genc, 0, lin0, st.codes[k][b]);
+    float res[kBlock];
+    float rmax = 0.0f;
+    if (!RR && p.row_terms == 2) rmax = residual16(v, st.scales[k][b], st.codes[k][b], __fdiv_rn(1.0f, genc), res);
     __syncthreads();
-    store_stage(st, o.row_data, o.row_scales, p.C / 2, r0, min(TILE, p.R - r0), c0 / kBlock,
+    const int64_t row_bytes = static_cast<int64_t>(p.C) * p.row_terms / 2;
+    store_stage(st, o.row_data, o.row_scales, row_bytes, r0, min(TILE, p.R - r0), c0 / kBlock,
                 min(4, (p.C - c0) / kBlock));
+    if (!RR && p.row_terms == 2) {
+      __syncthreads();  // st is reused for the second term
+      st.scales[k][b] = p.row_46 ? quantize16_four_six(res, rmax, genc, st.codes[k][b])
+                                 : quantize16<false>(res, rmax, genc, 0, 0, st.codes[k][b]);
+      __syncthreads();
+      store_stage(st, o.row_data, o.row_scales, row_bytes, r0, min(TILE, p.R - r0), (p.C + c0) / kBlock,
+                  min(4, (p.C - c0) / kBlock));
+    }
     if (p.do_col) __syncthreads();  // st is reused below
   }
 
@@ -602,7 +618,7 @@ std::vector<torch::Tensor> run_dual(const torch::Tensor& x, int pro, const torch
                                     bool block_2d, bool row_sr, int64_t row_seed, bool col_sr, int64_t col_seed,
                                     bool col_rht, int64_t rht_seed, int64_t col_pad, const SeedTensors& seeds,
                                     bool col_sums = false, const std::vector<torch::Tensor>* parts = nullptr,
-                                    const OptTensor& amax_floor = c10::nullopt) {
+                                    const OptTensor& amax_floor = c10::nullopt, int64_t row_terms = 1) {
   TORCH_CHECK(x.is_cuda() && x.dim() == 2 && x.is_contiguous(), "x must be a contiguous 2D CUDA tensor");
   TORCH_CHECK(x.scalar_type() == at::kBFloat16 || x.scalar_type() == at::kFloat, "x must be bf16 or fp32");
   TORCH_CHECK(reinterpret_cast<uintptr_t>(x.data_ptr()) % 16 == 0, "x must be 16-byte aligned");
@@ -650,12 +666,16 @@ std::vector<torch::Tensor> run_dual(const torch::Tensor& x, int pro, const torch
   p.row_rht = ms_eden_dgrad_enabled() && do_row && row_sr && !block_2d;
   TORCH_CHECK(!p.row_rht || p.C % 64 == 0, "MS-EDEN on the dgrad operand needs x.shape[1] % 64 == 0");
   p.row_rht_mask = rht_sign_mask64(static_cast<uint64_t>(row_seed) ^ kRowRhtSalt);
+  TORCH_CHECK(row_terms == 1 || row_terms == 2, "row_terms must be 1 or 2");
+  TORCH_CHECK(row_terms == 1 || (do_row && !row_sr && !block_2d),
+              "row_terms = 2 needs a round-to-nearest row output with 1x16 blocks");
+  p.row_terms = static_cast<int>(row_terms);
 
   auto u8 = x.options().dtype(at::kByte);
   auto f32 = x.options().dtype(at::kFloat);
   torch::Tensor rd, rs, rg, cd, cs, cg;
-  rd = torch::empty({do_row ? p.R : 0, p.C / 2}, u8);
-  rs = torch::empty({do_row ? p.R : 0, p.C / kBlock}, u8);
+  rd = torch::empty({do_row ? p.R : 0, p.C * p.row_terms / 2}, u8);
+  rs = torch::empty({do_row ? p.R : 0, p.C * p.row_terms / kBlock}, u8);
   rg = torch::empty({do_row ? 1 : 0}, f32);
   cd = torch::empty({do_col ? p.C : 0, p.R_pad / 2}, u8);
   cs = torch::empty({do_col ? p.C : 0, p.R_pad / kBlock}, u8);
@@ -790,10 +810,11 @@ std::vector<torch::Tensor> nvfp4_quantize_dual(torch::Tensor x, bool do_row, boo
                                                bool row_sr, int64_t row_seed, bool col_sr, int64_t col_seed,
                                                bool col_rht, int64_t rht_seed, int64_t col_pad,
                                                const OptTensor& row_seed_t, const OptTensor& col_seed_t,
-                                               const OptTensor& rht_seed_t, const OptTensor& amax_floor) {
+                                               const OptTensor& rht_seed_t, const OptTensor& amax_floor,
+                                               int64_t row_terms) {
   return run_dual(x, kNone, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, do_row, do_col, block_2d, row_sr,
                   row_seed, col_sr, col_seed, col_rht, rht_seed, col_pad, {row_seed_t, col_seed_t, rht_seed_t}, false,
-                  nullptr, amax_floor);
+                  nullptr, amax_floor, row_terms);
 }
 
 // quantize_dual of the concatenation of 1-3 same-shaped tensors along dim 1 (e.g. the q, k, v gradients of a
@@ -819,7 +840,7 @@ std::vector<torch::Tensor> nvfp4_layernorm_quantize_dual(torch::Tensor x, torch:
                                                          int64_t row_seed, bool col_sr, int64_t col_seed, bool col_rht,
                                                          int64_t rht_seed, int64_t col_pad, const OptTensor& row_seed_t,
                                                          const OptTensor& col_seed_t,
-                                                         const OptTensor& rht_seed_t) {
+                                                         const OptTensor& rht_seed_t, int64_t row_terms) {
   TORCH_CHECK(x.is_cuda() && x.dim() == 2 && x.is_contiguous(), "x must be a contiguous 2D CUDA tensor");
   TORCH_CHECK(x.scalar_type() == at::kBFloat16 || x.scalar_type() == at::kFloat, "x must be bf16 or fp32");
   const int64_t R = x.size(0), C = x.size(1);
@@ -848,7 +869,7 @@ std::vector<torch::Tensor> nvfp4_layernorm_quantize_dual(torch::Tensor x, torch:
   auto q = run_dual(x, kLayerNorm, nullptr, nullptr, mean.data_ptr<float>(), rstd.data_ptr<float>(),
                     gamma.data_ptr<float>(),
                     beta.data_ptr<float>(), do_row, do_col, false, row_sr, row_seed, col_sr, col_seed, col_rht,
-                    rht_seed, col_pad, {row_seed_t, col_seed_t, rht_seed_t});
+                    rht_seed, col_pad, {row_seed_t, col_seed_t, rht_seed_t}, false, nullptr, c10::nullopt, row_terms);
   q.insert(q.begin(), {mean, rstd});
   return q;
 }
@@ -859,10 +880,11 @@ std::vector<torch::Tensor> nvfp4_gelu_quantize_dual(torch::Tensor h, bool do_row
                                                     int64_t row_seed, bool col_sr, int64_t col_seed, bool col_rht,
                                                     int64_t rht_seed, int64_t col_pad, const OptTensor& row_seed_t,
                                                     const OptTensor& col_seed_t, const OptTensor& rht_seed_t,
-                                                    const OptTensor& bias, bool exact) {
+                                                    const OptTensor& bias, bool exact, int64_t row_terms) {
   return run_dual(h, exact ? kGeluErf : kGelu, nullptr, nullptr, nullptr, nullptr, nullptr, bias_ptr(bias, h), do_row,
                   do_col, false, row_sr, row_seed,
-                  col_sr, col_seed, col_rht, rht_seed, col_pad, {row_seed_t, col_seed_t, rht_seed_t});
+                  col_sr, col_seed, col_rht, rht_seed, col_pad, {row_seed_t, col_seed_t, rht_seed_t}, false, nullptr,
+                  c10::nullopt, row_terms);
 }
 
 // GELU backward fused into the dual quantizer: quantizes dh = dy * gelu'(h + bias) (bf16 dy and h) without
@@ -900,7 +922,7 @@ std::vector<torch::Tensor> nvfp4_rmsnorm_quantize_dual(torch::Tensor x, torch::T
                                                        bool do_col, bool row_sr, int64_t row_seed, bool col_sr,
                                                        int64_t col_seed, bool col_rht, int64_t rht_seed, int64_t col_pad,
                                                        const OptTensor& row_seed_t, const OptTensor& col_seed_t,
-                                                       const OptTensor& rht_seed_t) {
+                                                       const OptTensor& rht_seed_t, int64_t row_terms) {
   TORCH_CHECK(x.is_cuda() && x.dim() == 2 && x.is_contiguous(), "x must be a contiguous 2D CUDA tensor");
   TORCH_CHECK(x.scalar_type() == at::kBFloat16 || x.scalar_type() == at::kFloat, "x must be bf16 or fp32");
   const int64_t R = x.size(0), C = x.size(1);
@@ -926,7 +948,7 @@ std::vector<torch::Tensor> nvfp4_rmsnorm_quantize_dual(torch::Tensor x, torch::T
   }
   auto q = run_dual(x, kRmsNorm, nullptr, nullptr, nullptr, rstd.data_ptr<float>(), gamma.data_ptr<float>(), nullptr,
                     do_row, do_col, false, row_sr, row_seed, col_sr, col_seed, col_rht, rht_seed, col_pad,
-                    {row_seed_t, col_seed_t, rht_seed_t});
+                    {row_seed_t, col_seed_t, rht_seed_t}, false, nullptr, c10::nullopt, row_terms);
   q.insert(q.begin(), rstd);
   return q;
 }
@@ -938,11 +960,11 @@ std::vector<torch::Tensor> nvfp4_swiglu_quantize_dual(torch::Tensor g, torch::Te
                                                       bool col_rht, int64_t rht_seed, int64_t col_pad,
                                                       const OptTensor& row_seed_t, const OptTensor& col_seed_t,
                                                       const OptTensor& rht_seed_t, const OptTensor& bias_g,
-                                                      const OptTensor& bias_u) {
+                                                      const OptTensor& bias_u, int64_t row_terms) {
   check_like(u, g, "u");
   return run_dual(g, kSwiglu, &u, nullptr, nullptr, nullptr, bias_ptr(bias_u, g), bias_ptr(bias_g, g), do_row, do_col,
                   false, row_sr, row_seed, col_sr, col_seed, col_rht, rht_seed, col_pad,
-                  {row_seed_t, col_seed_t, rht_seed_t});
+                  {row_seed_t, col_seed_t, rht_seed_t}, false, nullptr, c10::nullopt, row_terms);
 }
 
 // SwiGLU backward fused into the dual quantizer: quantizes the gradient w.r.t. the gate projection,

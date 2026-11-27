@@ -53,14 +53,17 @@ def _sr(seeds, row: bool, col: bool, rht: bool):
 
 # --- the norm stage: "ln" (LayerNorm), "rms" (RMSNorm) or "none" ----------------------------------------
 
-def _norm_quantize(kind, x2d, w, b, eps, col: bool, rht_seed):
-    """(mean, rstd, Q(norm(x)), Q(norm(x)^T)) with the norm fused into the quantizer."""
+def _norm_quantize(kind, x2d, w, b, eps, col: bool, rht_seed, terms: int = 1):
+    """(mean, rstd, Q(norm(x)), Q(norm(x)^T)) with the norm fused into the quantizer (the row output in ``terms``
+    NVFP4 terms, see ops.set_fprop_terms)."""
     if kind == "ln":
-        return ops.layernorm_quantize_dual(x2d, w, b, eps, col=col, rht_seed=rht_seed, col_pad=ALIGN)
+        return ops.layernorm_quantize_dual(x2d, w, b, eps, col=col, rht_seed=rht_seed, col_pad=ALIGN, row_terms=terms)
     if kind == "rms":
-        rstd, xq, xtq = ops.rmsnorm_quantize_dual(x2d, w, eps, col=col, rht_seed=rht_seed, col_pad=ALIGN)
+        rstd, xq, xtq = ops.rmsnorm_quantize_dual(x2d, w, eps, col=col, rht_seed=rht_seed, col_pad=ALIGN,
+                                                  row_terms=terms)
         return None, rstd, xq, xtq
-    xq, xtq = ops.quantize_dual(x2d.to(BF16), col=col, rht_seed=rht_seed, col_pad=ALIGN)  # as NVFP4Linear
+    xq, xtq = ops.quantize_dual(x2d.to(BF16), col=col, rht_seed=rht_seed, col_pad=ALIGN,
+                                row_terms=terms)  # as NVFP4Linear
     return None, None, xq, xtq
 
 
@@ -117,8 +120,9 @@ class _NormLinearFn(torch.autograd.Function):
         kind, eps, rht_on, need_dn, need_w, need_b, fuse, chunks, dt, ret_res = cfg
         seeds = draw_seeds(3, x2d.device) if need_dn or need_w or need_b else None  # [dY row SR, dY^T SR, RHT]
         use_rht = need_w and rht_on
-        mean, rstd, xq, xtq = _norm_quantize(kind, x2d, norm_w, norm_b, eps, need_w, seeds[2] if use_rht else None)
-        wq, wtq = dgrad_weight_operand("cuda", weight, need_dn, wcache, seeds[0] if need_dn else None)
+        T = ops.fprop_terms()
+        mean, rstd, xq, xtq = _norm_quantize(kind, x2d, norm_w, norm_b, eps, need_w, seeds[2] if use_rht else None, T)
+        wq, wtq = dgrad_weight_operand("cuda", weight, need_dn, wcache, seeds[0] if need_dn else None, terms=T)
         y = _out_gemm(xq, wq, dt, bias, None)
         ctx.save_for_backward(x2d if kind != "none" else None, norm_w, mean, rstd, seeds,
                               *(xtq.as_storage() if need_w else ()), *(wtq.as_storage() if need_dn else ()))
@@ -167,12 +171,13 @@ class _GeluMLPFn(torch.autograd.Function):
         need_dh = need_dn or need_w1 or need_b1  # the gradient has to flow back through fc2 and the GELU
         seeds = draw_seeds(6, x2d.device) if need_dh or need_w2 or need_b2 else None
         rht1, rht2 = need_w1 and rht_on, need_w2 and rht_on
-        mean, rstd, xq, xtq = _norm_quantize(kind, x2d, norm_w, norm_b, eps, need_w1, seeds[2] if rht1 else None)
-        w1q, w1tq = dgrad_weight_operand("cuda", w1, need_dn, wc1, seeds[0] if need_dn else None)
+        T = ops.fprop_terms()
+        mean, rstd, xq, xtq = _norm_quantize(kind, x2d, norm_w, norm_b, eps, need_w1, seeds[2] if rht1 else None, T)
+        w1q, w1tq = dgrad_weight_operand("cuda", w1, need_dn, wc1, seeds[0] if need_dn else None, terms=T)
         h = ops.gemm(xq, w1q, BF16)                                       # fc1 output (GELU input, without bias)
         gq, gtq = ops.gelu_quantize_dual(h, bias=b1, approximate=approximate, col=need_w2,
-                                         rht_seed=seeds[5] if rht2 else None, col_pad=ALIGN)
-        w2q, w2tq = dgrad_weight_operand("cuda", w2, need_dh, wc2, seeds[3] if need_dh else None)
+                                         rht_seed=seeds[5] if rht2 else None, col_pad=ALIGN, row_terms=T)
+        w2q, w2tq = dgrad_weight_operand("cuda", w2, need_dh, wc2, seeds[3] if need_dh else None, terms=T)
         out = _out_gemm(gq, w2q, dt, b2, x2d if residual else None)
         saved = [x2d if kind != "none" else None, norm_w, mean, rstd, h, seeds, b1]
         for flag, q in ((need_w1, xtq), (need_dn, w1tq), (need_w2, gtq), (need_dh, w2tq)):
@@ -246,14 +251,15 @@ class _SwiGLUMLPFn(torch.autograd.Function):
         need_da = need_dn or need_xt or need_bg or need_bu  # the gradient flows back through down and SwiGLU
         seeds = draw_seeds(8, x2d.device) if need_da or need_wd or need_bd else None
         rht_x, rht_a = need_xt and rht_on, need_wd and rht_on
-        mean, rstd, xq, xtq = _norm_quantize(kind, x2d, norm_w, norm_b, eps, need_xt, seeds[2] if rht_x else None)
-        wgq, wgtq = dgrad_weight_operand("cuda", wg, need_dn, wcg, seeds[0] if need_dn else None)
-        wuq, wutq = dgrad_weight_operand("cuda", wu, need_dn, wcu, seeds[6] if need_dn else None)
+        T = ops.fprop_terms()
+        mean, rstd, xq, xtq = _norm_quantize(kind, x2d, norm_w, norm_b, eps, need_xt, seeds[2] if rht_x else None, T)
+        wgq, wgtq = dgrad_weight_operand("cuda", wg, need_dn, wcg, seeds[0] if need_dn else None, terms=T)
+        wuq, wutq = dgrad_weight_operand("cuda", wu, need_dn, wcu, seeds[6] if need_dn else None, terms=T)
         g = ops.gemm(xq, wgq, BF16)                                    # gate projection (without bias)
         u = ops.gemm(xq, wuq, BF16)                                    # up projection (without bias)
         aq, atq = ops.swiglu_quantize_dual(g, u, bias_g=bg, bias_u=bu, col=need_wd,
-                                           rht_seed=seeds[5] if rht_a else None, col_pad=ALIGN)
-        wdq, wdtq = dgrad_weight_operand("cuda", wd, need_da, wcd, seeds[3] if need_da else None)
+                                           rht_seed=seeds[5] if rht_a else None, col_pad=ALIGN, row_terms=T)
+        wdq, wdtq = dgrad_weight_operand("cuda", wd, need_da, wcd, seeds[3] if need_da else None, terms=T)
         out = _out_gemm(aq, wdq, dt, bd, x2d if residual else None)
         saved = [x2d if kind != "none" else None, norm_w, mean, rstd, g, u, seeds, bg, bu]
         for flag, q in ((need_xt, xtq), (need_dn, wgtq), (need_dn, wutq), (need_wd, atq), (need_da, wdtq)):

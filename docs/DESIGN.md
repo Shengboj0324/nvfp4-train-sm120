@@ -147,6 +147,64 @@ NVFP4 layers it is no better than the baseline (RESULTS.md §4.2). Not implement
 weight subspace of Full-Stack FP4 (+4% parameters) and oscillation damping (ALTO; aimed at gaps that grow
 with training, which ours does not).
 
+### 2.2 Where the gap comes from, and two-term forward activations (v0.19)
+
+The options of §2.1 leave most of the +1.3%. To find where it comes from, `experiments/gap_ablate.py` runs one
+part of the recipe at a time in BF16 (GPT-124M, seed 0, 3000 steps, unfused `NVFP4Linear`s; BF16: 1.4892;
+RESULTS.md §4.3):
+
+| in BF16 | val loss | vs all-NVFP4 |
+|---|---|---|
+| nothing (the recipe) | 1.5069 | |
+| fprop GEMM | 1.4933 | −0.90% |
+| dgrad GEMM | 1.5052 | −0.12% |
+| wgrad GEMM | 1.5048 | −0.14% |
+| round-to-nearest instead of stochastic rounding on gradients | 1.5067 | −0.02% |
+
+Three quarters of the gap is the forward GEMM. Within it (a second run of the recipe gave 1.5098 for the
+same seed: the flash attention backward's atomics make runs nondeterministic by about ±0.2%), the
+activations are the problem, not the weights, and they are a problem in every layer:
+
+| in BF16 in the forward | val loss | with the trained model evaluated in BF16 |
+|---|---|---|
+| nothing | 1.5098 | 1.5026 |
+| activations (every layer) | 1.4998 | 1.4998 |
+| weights (every layer) | 1.5079 | 1.5001 |
+| activations and weights of qkv / proj / fc1 / fc2 only | 1.5047 / 1.5047 / 1.5042 / 1.5042 | 1.4991 / 1.4984 / 1.4994 / 1.4991 |
+
+A third of the gap is error at evaluation time (the NVFP4-trained model evaluated with BF16 forwards loses
+0.48% less); the rest is a worse model. E2M1 has a relative error of about 9.5% per element on these
+activations whatever their distribution, so rotations do not help: emulated (`experiments/gap_fwd.py`, the
+forward GEMM on dequantized operands, the backward unchanged; seeds 0 and 1) a 16- or 128-point random Hadamard
+transform along K is +0.15% *worse*, while 8-bit activations (MXFP8) are −0.65% and two NVFP4 terms −0.66%.
+
+**Two terms.** `ops.set_fprop_terms(2)` quantizes each forward activation as x ≈ Q(x) + Q(x − deq Q(x)), the
+second term quantizing the first's rounding error (relative error 9.5% → about 1%):
+
+- **One tensor scale.** Both terms use x's tensor scale (genc = 2688 / amax(x), or the Four Over Six
+  variant); the residual's 16-blocks get their own E4M3 scales, about ten times smaller. The row output is
+  laid out [Q(x) | Q(r)] along C: one NVFP4 tensor of twice the width with one decode scale.
+- **One GEMM.** Against the weight placed twice along K, [W | W] (16×16 blocks stay aligned), the existing
+  kernel computes Q(x) Wᵀ + Q(r) Wᵀ in one call at twice the depth. On sm_120 that is the cost of an MXFP8
+  GEMM (half the NVFP4 rate), without a mixed-format kernel (e4m3 × e2m1 operands with 32-element UE8M0
+  scales) or a second quantizer format. `[W | W]` is cached beside the weight (`WeightQuantCache.wq2`).
+- **In the dual quantizer's row phase**, so every producer path has it (LayerNorm, RMSNorm, GELU, SwiGLU,
+  plain): after the first term's codes and scales are staged in shared memory, the residual is computed
+  from them in fp32 exactly as `reference.quantize_dual(row_terms=2)` does (bit-exact), stored, and the
+  second term quantized into the same stage and stored at column offset C. The column output (the wgrad
+  operand) is unchanged: only the forward has two terms; dgrad and wgrad are as before.
+
+Cost on the RTX 5090 Laptop at 8192 tokens (`bench/bench_fprop_terms.py`): the quantizer +11% (C = 768) to
++20% (C = 3072), the forward GEMM 1.5–1.8× (not 2×: fixed prologue and epilogue), an `NVFP4Linear` forward +
+backward +8–14%, GPT-124M training 81.9k → 79.2k tokens/s (−3.3%: attention, embeddings, the LM head and the
+BF16 blocks do not change). Over three seeds (fused stack) it lowers the loss on every seed, −0.62% ± 0.19
+paired (−0.44, −0.62, −0.81), the gap +1.34% → **+0.70%**: the largest gain of any option at the cost of
+one of the cheapest. With the BF16 tail on top (`--fprop-terms 2 --bf16-tail 0.1`) the gap is +0.47% ± 0.14 (paired −0.86% ± 0.08; the tail alone: +0.62%), and evaluated with its two-term NVFP4 layers instead of BF16 that model is still at +0.77%, where the tail alone leaves a model no better than the baseline.
+
+It stays off by default: it changes the forward numerics of every model trained with earlier versions and
+costs 3% of the step, so it is a switch, like the tail. Not covered: the MoE experts' grouped GEMMs,
+stochastically rounded or 2D-block row outputs, and multi-part inputs (`ValueError`).
+
 ## 3. Quantizers (`csrc/quantize_dual.cu`, `csrc/quantize.cu`)
 
 Every NVFP4 quantization makes two passes: an amax reduction, then the quantization itself. Global
@@ -823,6 +881,9 @@ Every benchmark checks correctness against the reference before it times anythin
 
 ## 6. Known limitations and next steps
 
+Done in v0.19: where the GPT-124M gap comes from (three quarters the forward GEMM's activations,
+§2.2) and two-term forward activations that halve it (+1.34% → +0.70%, −3.3% tokens/s); an 8-bit
+attention backward on FP16 MMAs, more accurate than the exact backward (§7.2).
 Done in v0.18: the three open items of v0.17's expert parallelism. Chunks with nodes were slower because
 the rail and node collectives of different chunks ran concurrently: exchanges are now issued from one
 stream, one after another (`ep_serial`; chunks then 14–16% faster with nodes). The GEMMs' 1.7x slowdown
@@ -878,7 +939,8 @@ accumulation.
    it now matches BF16 attention's loss at 4096 tokens, but gains only 1.07–1.12× per attention call at
    D = 128 (1.04–1.07× at D = 64): the backward runs at BF16 speed, and the two-term P V the exact
    backward needs costs the forward a quarter of its speedup (1.2–1.6× instead of 1.5–2.1×). The
-   0.9 8-bit backward (`backward="8bit"`) is 1.12–1.18× but +0.5% loss at 4096 tokens. Tried and
+   8-bit backward (`backward="8bit"`; v0.19: dQ / dK / dV on FP16 MMAs, §7.2) is more accurate per layer
+   than the exact one and as fast at D = 128 (+0.15% loss at 4096 tokens, not resolved). Tried and
    rejected: skipping the residual P V product on (16-row, 32-key) MMA tiles whose probabilities are all
    negligible. On a GPT-124M's activations at 4096 tokens (`bench/attention_skip_probe.py`) no tile
    qualifies even at a threshold of 2^-5 of the running row maximum (where in most layers under 1% of the
@@ -1065,3 +1127,52 @@ replaced by the main term runs as slow) takes the forward from 1.5–2.1× flash
 of PyTorch's flash backward: bitwise reproducible under `torch.use_deterministic_algorithms`, else not
 (dQ accumulated with atomics); `backward="8bit"` keeps the deterministic kernels and the one-term
 forward. Memory: the dequantized q, k, v (input dtype) plus O and lse, as SDPA saves.
+
+### 7.2 An 8-bit backward more accurate than the exact one (v0.19)
+
+Where the 8-bit backward's error came from, emulated per product on a trained GPT-124M's activations at 4096
+tokens (`bench/attention_bwd_probe.py`, every backward recipe in fp32 on the forward's quantized operands,
+against exact fp32 attention; median / max over 12 layers):
+
+| backward | dQ | dK | dV |
+|---|---|---|---|
+| exact flash backward of the 8-bit forward (§7.1) | 0.49 / 1.21% | 1.47 / 4.93% | 0.27 / 1.51% |
+| v0.10 8-bit kernels (INT8 dP, MXFP8 dV / dK, BF16 dQ − r B) | 0.38 / 0.63% | 2.82 / 4.69% | 2.49 / 2.92% |
+| … dP = dO V^T in BF16 instead | 0.42 / 1.06% | 3.13 / 4.71% | 2.42 / 3.12% |
+| … dV with P in two e4m3 terms | | | 1.72 / 2.71% |
+| … dK with dS in two e4m3 terms | | 2.09 / 4.32% | |
+| … dV / dK with FP16 operands per tile row (below) | 0.38 / 0.63% | 0.78 / 3.27% | 0.18 / 1.17% |
+
+dQ was fine (BF16 dS K and the r B correction, §7) and INT8 dP was not the problem (BF16 dP is no better).
+dV and dK were 2–10x off because of their *other* operand: dO and Q in MXFP8 (a 3-bit mantissa per element,
+2^-4), not P or dS (two-term P / dS recovers a third at most). So v0.19 computes dV, dK and dQ on FP16 MMAs
+with FP16 accumulation (m16n8k16, 240 TFLOPS: twice BF16 with FP32 accumulation, half the MXFP8 rate):
+
+- **A operand**: P or dS, times the per-token scale of the B operand's INT8 row layout (that scale runs along
+  the reduction, so it cannot be factored out), divided by its maximum over the tile row: the 32 queries of a
+  dK / dV tile, the 64 keys of a dQ tile. |A| ≤ 1 and FP16's 11 bits are relative to the row's maximum.
+- **B operand**: the row layout's INT8 codes for Q and K (exact in FP16: the forward's quantized operands
+  exactly), and for dO the unrounded x · 127 / amax (|x| ≤ 127, `attn_quant(..., want_f16=2)`), loaded from a
+  row-major FP16 tile with `ldmatrix.trans`.
+- **Accumulation**: one tile's FP16 accumulator stays below 64 · 127 = 8128, so it cannot overflow; it is added
+  into the FP32 result times the row's scale. Rows whose maximum is below 2^-125 (P times a dO scale of 1e-11
+  on a peaked head: 1 / max would overflow, and the first version returned NaN there) are dropped.
+- **Consistent Delta for dK / dV.** dP uses INT8 V per token while the forward's O used MXFP8 V, so the rows of
+  dS = P (dP − Delta) sum to r_i ≠ 0: harmless for dQ (corrected by − r B) but it cost dK 1.5–4x on the
+  layers with attention sinks (4.3% on layer 0, 12% on the most peaked layer). The dQ kernel runs first and
+  writes Delta' = Delta + r_i, the row sums of P dP as the backward computes them; the dK / dV kernel uses it.
+
+The kernels' errors on those activations (12 layers, median / max): dQ 0.45 / 1.11%, dK 0.70 / 1.21%, dV 0.25 /
+0.79%, against the exact backward's 0.51 / 1.80%, 1.50 / 2.62%, 0.31 / 2.55% on the same activations: smaller
+on every layer and every gradient, bitwise deterministic (no atomics). Speed at D = 128, 4096 tokens: dQ
+kernel 4.9 → 3.7 ms (FP16 dQ instead of BF16), dK / dV kernel 3.6 → 4.7 ms (FP16 instead of MXFP8), the
+backward as a whole as fast as flash attention's (11.8 ms per attention forward + backward vs 11.8 for the
+exact backward, 12.4 for SDPA); at D = 64 it is slower (6.6 vs 6.0 ms). Both D = 128 kernels sit at 255
+registers, and their tensor pipes are busy about half the time (the top stall is fixed-latency dependencies
+with two warps per scheduler).
+
+In training (GPT-124M, 4096 tokens, 6 heads of 128, NVFP4 linears, 3000 steps, two seeds, `experiments/
+run_attn8_v019.sh`) the v0.19 backward costs +0.15% val loss against BF16 attention (v0.9.1's 8-bit backward:
++0.52%), the default exact backward +0.01%; SDPA's two seeds are themselves 0.5% apart, so neither difference
+is resolved, and all three train at 65.5–66.0k tokens/s. The default stays the exact backward: the 8-bit one
+is not faster at this size, and its gain (deterministic, smaller per-layer errors) does not show in the loss.

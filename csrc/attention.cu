@@ -15,10 +15,15 @@
 //   - the products with probabilities / score gradients, P V, P^T dO, dS^T Q, in MXFP8 (E4M3 with one
 //     power-of-two UE8M0 scale per 32 elements of the reduction dim; P and dS span many binades):
 //       mma.sync.aligned.kind::mxf8f6f4.block_scale.scale_vec::1X.m16n8k32.row.col.f32.e4m3.e4m3.f32.ue8m0
-//   - dQ = dS K in BF16 (m16n8k16, FP32 accumulation), against a mean-centred BF16 copy of K: every row of dS
-//     sums to zero, so dQ is a small difference of large terms and the 8-bit errors of dS and K survived the
-//     cancellation (12-24% relative error in dQ on trained-model activations at 4096 tokens, 0.5-1.4% in BF16;
-//     docs/DESIGN.md §7). dK = dS^T Q sums over queries, where no such constraint holds, and stays 8-bit.
+//   - dQ = dS K, dK = dS^T Q and dV = P^T dO in FP16 (m16n8k16 with FP16 accumulation, twice the BF16 rate):
+//     every row of dS sums to zero, so dQ is a small difference of large terms and the 8-bit errors of dS and K
+//     survived the cancellation (12-24% relative error in dQ on trained-model activations at 4096 tokens); dK and
+//     dV with MXFP8 operands (Q, dO in e4m3) were 2-10x further from the exact gradient than the exact backward
+//     (v0.19, bench/attention_bwd_probe.py). The A operand (dS or P, times the per-token scale of the other
+//     operand's 8-bit row layout, which runs along the reduction) is divided by its maximum over the row's keys
+//     (dQ) or queries (dK, dV) of the tile, so |A| <= 1; B is the INT8 code (K, Q: exact in FP16) or the
+//     unrounded scaled value (dO, |x| <= 127) of the row layout, so the FP16 accumulator of one tile stays below
+//     64 * 127 and is added to the FP32 result times the row scale (docs/DESIGN.md §7.1).
 //
 // Operands are quantized once by attn_quant_kernel, in two layouts per tensor:
 //   row   X8 [BH, Np, D] int8, scales [BH, Np] fp32          per token (QK^T, dO V^T operands)
@@ -241,10 +246,76 @@ __device__ __forceinline__ void mma_bf16(float (&d)[4], const uint32_t (&a)[4], 
       : "+f"(d[0]), "+f"(d[1]), "+f"(d[2]), "+f"(d[3])
       : "r"(a[0]), "r"(a[1]), "r"(a[2]), "r"(a[3]), "r"(b0), "r"(b1));
 }
+// D (FP16) += A(16x16 f16) B(16x8 f16), FP16 accumulation; D rows g / g + 8, columns 2t, 2t + 1 as half2.
+__device__ __forceinline__ void mma_f16(uint32_t (&d)[2], const uint32_t (&a)[4], uint32_t b0, uint32_t b1) {
+  asm volatile(
+      "mma.sync.aligned.m16n8k16.row.col.f16.f16.f16.f16 {%0,%1}, {%2,%3,%4,%5}, {%6,%7}, {%0,%1};\n"
+      : "+r"(d[0]), "+r"(d[1])
+      : "r"(a[0]), "r"(a[1]), "r"(a[2]), "r"(a[3]), "r"(b0), "r"(b1));
+}
+__device__ __forceinline__ uint32_t pack_h2(float lo, float hi) {
+  const __half2 v = __floats2half2_rn(lo, hi);
+  return *reinterpret_cast<const uint32_t*>(&v);
+}
+// acc[j][0..1] += float2(d0) * m0, acc[j][2..3] += float2(d1) * m1 (an FP16 tile result into FP32).
+__device__ __forceinline__ void add_h2(float (&acc)[4], const uint32_t (&d)[2], float m0, float m1) {
+  const float2 x = __half22float2(*reinterpret_cast<const __half2*>(&d[0]));
+  const float2 y = __half22float2(*reinterpret_cast<const __half2*>(&d[1]));
+  acc[0] = fmaf(x.x, m0, acc[0]), acc[1] = fmaf(x.y, m0, acc[1]);
+  acc[2] = fmaf(y.x, m1, acc[2]), acc[3] = fmaf(y.y, m1, acc[3]);
+}
+// The f16 A fragments (16 rows x 16 k, k-step kk) of the C fragments x[NT][4] of the same rows (columns 8j + 2t,
+// 8j + 2t + 1: n-tiles 2 kk, 2 kk + 1 are exactly k-step kk), times m0 (row g) / m1 (row g + 8).
+template <int NT>
+__device__ __forceinline__ void acc_to_h(uint32_t (&a)[4], const float (&x)[NT][4], int kk, float m0, float m1) {
+  a[0] = pack_h2(x[2 * kk][0] * m0, x[2 * kk][1] * m0);
+  a[1] = pack_h2(x[2 * kk][2] * m1, x[2 * kk][3] * m1);
+  a[2] = pack_h2(x[2 * kk + 1][0] * m0, x[2 * kk + 1][1] * m0);
+  a[3] = pack_h2(x[2 * kk + 1][2] * m1, x[2 * kk + 1][3] * m1);
+}
+// Row maxima of |x| (rows g, g + 8) over the quad; the scale s and 1 / s. Rows whose maximum is below 2^-125 (1 / s
+// would overflow, e.g. P times a dO scale of 1e-11 on a peaked head) are dropped: s = 0, as for an all-zero row.
+template <int NT>
+__device__ __forceinline__ void row_scales(const float (&x)[NT][4], float (&sc)[2], float (&inv)[2]) {
+  float a0 = 0.0f, a1 = 0.0f;
+#pragma unroll
+  for (int j = 0; j < NT; ++j) {
+    a0 = fmaxf(a0, fmaxf(fabsf(x[j][0]), fabsf(x[j][1])));
+    a1 = fmaxf(a1, fmaxf(fabsf(x[j][2]), fabsf(x[j][3])));
+  }
+  constexpr float kMin = 2.3509887e-38f;  // 2^-125
+  sc[0] = quad_max(a0), sc[1] = quad_max(a1);
+  sc[0] = sc[0] >= kMin ? sc[0] : 0.0f;
+  sc[1] = sc[1] >= kMin ? sc[1] : 0.0f;
+  inv[0] = sc[0] > 0.0f ? 1.0f / sc[0] : 0.0f;
+  inv[1] = sc[1] > 0.0f ? 1.0f / sc[1] : 0.0f;
+}
+// acc[D/8][4] += A B for the f16 A fragments a[KK] (k-steps of 16) and a row-major f16 tile B (16 KK rows of 2D
+// bytes, ldmatrix.trans), through FP16 accumulators of the tile, added times the row scales sc.
+template <int D, int KK>
+__device__ __forceinline__ void f16_product(float (&acc)[D / 8][4], const uint32_t (&a)[KK][4], uint32_t btile,
+                                            const float (&sc)[2], int lane);
 __device__ __forceinline__ void ldsm4t(uint32_t addr, uint32_t& r0, uint32_t& r1, uint32_t& r2, uint32_t& r3) {
   asm volatile("ldmatrix.sync.aligned.m8n8.x4.trans.shared.b16 {%0,%1,%2,%3}, [%4];\n"
                : "=r"(r0), "=r"(r1), "=r"(r2), "=r"(r3)
                : "r"(addr));
+}
+template <int D, int KK>
+__device__ __forceinline__ void f16_product(float (&acc)[D / 8][4], const uint32_t (&a)[KK][4], uint32_t btile,
+                                            const float (&sc)[2], int lane) {
+#pragma unroll
+  for (int n = 0; n < D / 8; n += 2) {
+    uint32_t d0[2] = {0u, 0u}, d1[2] = {0u, 0u};
+#pragma unroll
+    for (int kk = 0; kk < KK; ++kk) {
+      uint32_t b0, b1, b2, b3;
+      ldsm4t(btile + swz<2 * D>(16 * kk + (lane & 7) + ((lane >> 3) & 1) * 8, n + (lane >> 4)), b0, b1, b2, b3);
+      mma_f16(d0, a[kk], b0, b1);
+      mma_f16(d1, a[kk], b2, b3);
+    }
+    add_h2(acc[n], d0, sc[0], sc[1]);
+    add_h2(acc[n + 1], d1, sc[0], sc[1]);
+  }
 }
 __device__ __forceinline__ uint32_t pack_bf16(float lo, float hi) {
   const __nv_bfloat162 v = __floats2bfloat162_rn(lo, hi);
@@ -437,6 +508,10 @@ struct QuantArgs {
   // optional [B * Hx, Np, D] in the input dtype: the quantized values (of the row layout if requested, else of
   // the col layout), i.e. the inputs the 8-bit GEMMs actually see, for an exact backward of the 8-bit forward
   void* deq;
+  // optional [B * Hx, Np, D] FP16 copy of the row layout: f16_mode 1 the INT8 codes (exact), 2 the unrounded
+  // x * 127 / amax (|x| <= 127); value = f16 * row_s either way
+  __half* f16;
+  int f16_mode;
   int Hx, N, Np;
 };
 
@@ -531,6 +606,13 @@ __global__ void __launch_bounds__(THREADS) attn_quant_kernel(QuantArgs a) {
         dq[k] = static_cast<float>(qv) * sc;
       }
       const int64_t row = static_cast<int64_t>(bh) * a.Np + t0 + r;
+      if (a.f16 != nullptr) {
+        float h[8];
+#pragma unroll
+        for (int k = 0; k < 8; ++k) h[k] = a.f16_mode == 1 ? static_cast<float>(min(127, max(-127, __float2int_rn(v[k] * inv)))) : v[k] * inv;
+        *reinterpret_cast<uint4*>(a.f16 + row * D + c) =
+            make_uint4(pack_h2(h[0], h[1]), pack_h2(h[2], h[3]), pack_h2(h[4], h[5]), pack_h2(h[6], h[7]));
+      }
       *reinterpret_cast<uint2*>(a.row + row * D + c) = make_uint2(w[0], w[1]);
       if (i % V == 0) a.row_s[row] = sc;
       if (a.deq != nullptr)
@@ -814,14 +896,19 @@ __global__ void __launch_bounds__(32 * WARPS, 8 / WARPS) attn_fwd_kernel(FwdArgs
 // --- backward ---------------------------------------------------------------------------------------------
 
 struct BwdArgs {
-  const u8 *q, *qt, *qts;           // Q, row + col layouts [B * H]
+  const u8* q;                      // Q, int8 row layout [B * H]
+  const __half* q16;                // its INT8 codes in FP16 [B * H, Np, D] (dK = dS^T Q)
   const u8* k;                      // K (mean-subtracted) [B * Hk], int8 row layout
-  const __nv_bfloat16* k16;         // the same in BF16 [B * Hk, Np, D] (dQ = dS K)
+  const __half* k16;                // its INT8 codes in FP16 [B * Hk, Np, D] (dQ = dS K)
   const u8* v;                      // V row layout [B * Hk]
-  const u8 *g, *gt, *gts;           // dO, row + col layouts [B * H]
+  const u8* g;                      // dO, int8 row layout [B * H]
+  const __half* g16;                // dO * 127 / amax (unrounded) in FP16 [B * H, Np, D] (dV = P^T dO)
   const float *qs, *ks, *vs, *gs;   // per-token scales of the row layouts
   const u8 *kt, *kts;               // K, col layout (B = P K in the dQ kernel)
   const float *lse, *delta;         // [B * H, Np]
+  // [B * H, Np]: Delta' = Delta + r, the row sums of P dP as the backward computes them (written by the dQ
+  // kernel, read by the dK / dV kernel, so that the rows of its dS sum to zero as well)
+  float* delta2;
   void *dq, *dk, *dv;               // [B, H(k), N, D] with element strides below
   int64_t dq_sb, dq_sh, dq_sn, dk_sb, dk_sh, dk_sn;  // dv has dk's strides
   int H, Hk, N, Np, causal;
@@ -834,15 +921,13 @@ struct BwdArgs {
 template <int D, int W>
 struct DqCfg {
   static constexpr int NTH = 32 * W, BQ = 16 * W;  // queries per CTA
-  // (the value scales are read from global memory / L1: with them in shared memory the W = 4 kernel would need
-  // 512 bytes more than two CTAs per SM can have)
   static constexpr int K = 0, KSC = K + 64 * D, V = KSC + 256, K16 = V + 64 * D, KT = K16 + 64 * D * 2,
-                       KTS = KT + D * 64, STAGE = KTS + 2 * D;
+                       KTS = KT + D * 64, VSC = KTS + 2 * D, STAGE = VSC + 256;
   static constexpr bool kStaged = 2 * BQ * D <= STAGE;
   static constexpr int STAGE0 = kStaged ? 0 : 2 * BQ * D;
   static constexpr int QOFF = kStaged ? STAGE : 0;  // query tile, then dO tile
   static constexpr int BYTES = STAGE0 + 2 * STAGE;
-  static_assert(W != 4 || BYTES <= kSmem2, "two CTAs per SM");
+  static_assert(W == 8 && BYTES <= 101376, "one CTA of 8 warps per SM");
 };
 
 template <typename T, int D, int W>
@@ -858,7 +943,7 @@ __global__ void __launch_bounds__(32 * W, 8 / W) attn_dq_kernel(BwdArgs p) {
   const float* ksg = p.ks + static_cast<int64_t>(bhk) * p.Np;
   const u8* vg = p.v + static_cast<int64_t>(bhk) * p.Np * D;
   const float* vsg = p.vs + static_cast<int64_t>(bhk) * p.Np;
-  const u8* k16g = reinterpret_cast<const u8*>(p.k16 + static_cast<int64_t>(bhk) * p.Np * D);
+  const u8* k16g = reinterpret_cast<const u8*>(p.k16 + static_cast<int64_t>(bhk) * p.Np * D);  // FP16 codes
   const u8* ktg = p.kt + static_cast<int64_t>(bhk) * D * p.Np;
   const u8* ktsg = p.kts + static_cast<int64_t>(bhk) * (p.Np / 64) * (2 * D);
   const int nkeys = p.causal ? min(p.N, q0 + C::BQ) : p.N;
@@ -872,6 +957,7 @@ __global__ void __launch_bounds__(32 * W, 8 / W) attn_dq_kernel(BwdArgs p) {
     load_tile<2 * D, 64, NTH>(st + C::K16, k16g + static_cast<int64_t>(j) * 64 * D * 2, 2 * D);
     load_tile<64, D, NTH>(st + C::KT, ktg + j * 64, p.Np);
     load_raw<2 * D, NTH>(st + C::KTS, ktsg + static_cast<int64_t>(j) * 2 * D);
+    load_raw<256, NTH>(st + C::VSC, reinterpret_cast<const u8*>(vsg + j * 64));
   };
   const int64_t rbase = static_cast<int64_t>(bh) * p.Np;
   load_tile<D, C::BQ, NTH>(sbase + C::QOFF, p.q + (rbase + q0) * D, D);
@@ -911,9 +997,7 @@ __global__ void __launch_bounds__(32 * W, 8 / W) attn_dq_kernel(BwdArgs p) {
     const uint32_t st = stage(j & 1);
     float s[NT][4], dp[NT][4];
     qk_product<D, NT>(s, qa, st + C::K, st + C::KSC, lane);
-    qk_product_rb<D, NT>(
-        dp, ga, st + C::V,
-        [&](int col) { return __ldg(reinterpret_cast<const float2*>(vsg + key0 + col)); }, lane);
+    qk_product<D, NT>(dp, ga, st + C::V, st + C::VSC, lane);
     const bool mask = (p.causal && key0 + 63 > wrow) || key0 + 64 > p.N;
 #pragma unroll
     for (int n = 0; n < NT; ++n)
@@ -940,26 +1024,28 @@ __global__ void __launch_bounds__(32 * W, 8 / W) attn_dq_kernel(BwdArgs p) {
         pv_product<D, 64>(bq, a, 0x77777777u, st + C::KT, ksc, kk, kk, lane);
       }
     }
-    // dQ += dS K in BF16: the C fragments of n-tiles 2 kk, 2 kk + 1 are the A fragment of k16-step kk (no
-    // reordering); K's B fragments come from the row-major BF16 tile through ldmatrix.trans
+    // dQ += dS K in FP16: A = dS_ij ks_j / (its row maximum over the tile), B = K's INT8 codes (row-major FP16
+    // tile through ldmatrix.trans); the C fragments of n-tiles 2 kk, 2 kk + 1 are the A fragment of k16-step kk
+    {
 #pragma unroll
-    for (int kk = 0; kk < 4; ++kk) {
-      uint32_t a[4];
-      a[0] = pack_bf16(s[2 * kk][0], s[2 * kk][1]);
-      a[1] = pack_bf16(s[2 * kk][2], s[2 * kk][3]);
-      a[2] = pack_bf16(s[2 * kk + 1][0], s[2 * kk + 1][1]);
-      a[3] = pack_bf16(s[2 * kk + 1][2], s[2 * kk + 1][3]);
-#pragma unroll
-      for (int n = 0; n < ND; n += 2) {
-        uint32_t b0, b1, b2, b3;
-        ldsm4t(st + C::K16 + swz<2 * D>(16 * kk + (lane & 7) + ((lane >> 3) & 1) * 8, n + (lane >> 4)), b0, b1, b2, b3);
-        mma_bf16(dq[n], a, b0, b1);
-        mma_bf16(dq[n + 1], a, b2, b3);
+      for (int n = 0; n < NT; ++n) {
+        const float2 kb = lds_f32x2(st + C::KSC + 4 * (8 * n + 2 * t));
+        s[n][0] *= kb.x, s[n][1] *= kb.y, s[n][2] *= kb.x, s[n][3] *= kb.y;
       }
+      float sc[2], inv[2];
+      row_scales<NT>(s, sc, inv);
+      uint32_t a[4][4];
+#pragma unroll
+      for (int kk = 0; kk < 4; ++kk) acc_to_h<NT>(a[kk], s, kk, inv[0], inv[1]);
+      f16_product<D, 4>(dq, a, st + C::K16, sc, lane);
     }
   }
   cp_wait<0>();
   const float r0 = quad_sum(rsum[0]), r1 = quad_sum(rsum[1]);
+  if (t == 0) {
+    if (row0 < p.N) p.delta2[rbase + row0] = r0 - nd[0];
+    if (row1 < p.N) p.delta2[rbase + row1] = r1 - nd[1];
+  }
 #pragma unroll
   for (int j = 0; j < ND; ++j) {  // dQ - r B: the dQ of the consistent Delta' = Delta + r
     dq[j][0] = fmaf(-r0, bq[j][0], dq[j][0]), dq[j][1] = fmaf(-r0, bq[j][1], dq[j][1]);
@@ -973,14 +1059,13 @@ template <int D, int W>
 struct DkvCfg {
   static constexpr int NTH = 32 * W, BK = 16 * W;  // keys per CTA
   // per stage: 32 queries
-  static constexpr int Q = 0, QSC = Q + 32 * D, G = QSC + 128, GSC = G + 32 * D, QT = GSC + 128,
-                       QTS = QT + D * 32, GT = QTS + 2 * D, GTS = GT + D * 32, LSE = GTS + 2 * D, DEL = LSE + 128,
-                       STAGE = DEL + 128;
+  static constexpr int Q = 0, QSC = Q + 32 * D, G = QSC + 128, GSC = G + 32 * D, Q16 = GSC + 128,
+                       G16 = Q16 + 32 * D * 2, LSE = G16 + 32 * D * 2, DEL = LSE + 128, STAGE = DEL + 128;
   static constexpr bool kStaged = 2 * BK * D <= STAGE;
   static constexpr int STAGE0 = kStaged ? 0 : 2 * BK * D;
   static constexpr int KOFF = kStaged ? STAGE : 0;  // key tile, then value tile
   static constexpr int BYTES = STAGE0 + 2 * STAGE;
-  static_assert(W != 4 || BYTES <= kSmem2, "two CTAs per SM");
+  static_assert(W == 8 && BYTES <= 101376, "one CTA of 8 warps per SM");
 };
 
 template <typename T, int D, int W>
@@ -1003,12 +1088,10 @@ __global__ void __launch_bounds__(32 * W, 8 / W) attn_dkdv_kernel(BwdArgs p) {
     load_raw<128, NTH>(st + C::QSC, reinterpret_cast<const u8*>(p.qs + rowoff));
     load_tile<D, 32, NTH>(st + C::G, p.g + rowoff * D, D);
     load_raw<128, NTH>(st + C::GSC, reinterpret_cast<const u8*>(p.gs + rowoff));
-    load_tile<32, D, NTH>(st + C::QT, p.qt + static_cast<int64_t>(hq) * D * p.Np + qq, p.Np);
-    load_raw<2 * D, NTH>(st + C::QTS, p.qts + (static_cast<int64_t>(hq) * (p.Np / 64) + qq / 64) * (2 * D));
-    load_tile<32, D, NTH>(st + C::GT, p.gt + static_cast<int64_t>(hq) * D * p.Np + qq, p.Np);
-    load_raw<2 * D, NTH>(st + C::GTS, p.gts + (static_cast<int64_t>(hq) * (p.Np / 64) + qq / 64) * (2 * D));
+    load_tile<2 * D, 32, NTH>(st + C::Q16, reinterpret_cast<const u8*>(p.q16 + rowoff * D), 2 * D);
+    load_tile<2 * D, 32, NTH>(st + C::G16, reinterpret_cast<const u8*>(p.g16 + rowoff * D), 2 * D);
     load_raw<128, NTH>(st + C::LSE, reinterpret_cast<const u8*>(p.lse + rowoff));
-    load_raw<128, NTH>(st + C::DEL, reinterpret_cast<const u8*>(p.delta + rowoff));
+    load_raw<128, NTH>(st + C::DEL, reinterpret_cast<const u8*>(p.delta2 + rowoff));
   };
   const int64_t kbase = static_cast<int64_t>(bhk) * p.Np;
   load_tile<D, C::BK, NTH>(sbase + C::KOFF, p.k + (kbase + k0) * D, D);
@@ -1026,7 +1109,7 @@ __global__ void __launch_bounds__(32 * W, 8 / W) attn_dkdv_kernel(BwdArgs p) {
 
   const int wkey = k0 + warp * 16, key0r = wkey + g, key1r = key0r + 8;
   const float kc[2] = {p.ks[kbase + key0r] * p.scale_log2, p.ks[kbase + key1r] * p.scale_log2};
-  const float vc[2] = {p.vs[kbase + key0r] * (1.0f / 256.0f), p.vs[kbase + key1r] * (1.0f / 256.0f)};
+  const float vc[2] = {p.vs[kbase + key0r], p.vs[kbase + key1r]};
   float dk[ND][4], dv[ND][4];
 #pragma unroll
   for (int j = 0; j < ND; ++j)
@@ -1052,30 +1135,28 @@ __global__ void __launch_bounds__(32 * W, 8 / W) attn_dkdv_kernel(BwdArgs p) {
 #pragma unroll
       for (int e = 0; e < 2; ++e) {
         const int col = 8 * n + 2 * t + e;  // query within the tile
-        const float lq = 8.0f - lds_f32(st + C::LSE + 4 * col), ndq = -lds_f32(st + C::DEL + 4 * col) * (1.0f / 256.0f);
+        const float lq = -lds_f32(st + C::LSE + 4 * col), ndq = -lds_f32(st + C::DEL + 4 * col);
+        const float gq = lds_f32(st + C::GSC + 4 * col), qsq = lds_f32(st + C::QSC + 4 * col);
 #pragma unroll
         for (int hh = 0; hh < 2; ++hh) {
           const int idx = 2 * hh + e, key = hh ? key1r : key0r;
-          // p * 256 (P's fixed e4m3 factor; its A scale is 2^-8)
           float pr = ex2(fmaf(s[n][idx], kc[hh], lq));
           if (mask && qq + col < key) pr = 0.0f;
-          s[n][idx] = pr;
-          dp[n][idx] = pr * fmaf(dp[n][idx], vc[hh], ndq);  // dS^T = P (dP - Delta)
+          s[n][idx] = pr * gq;                                     // P dO-scale: A of dV
+          dp[n][idx] = pr * fmaf(dp[n][idx], vc[hh], ndq) * qsq;  // dS^T = P (dP - Delta), times the Q scale: A of dK
         }
       }
-    const int kk = (qq >> 5) & 1;  // block of the 32-query tile within its 64-token scale tile
-    uint32_t a[4];
-    acc_to_a<NT>(a, s, 0, 1.0f, 1.0f);
-    {
-      ColScales<D> gsc;
-      load_col_scales<D>(gsc, st + C::GTS, lane);
-      pv_product<D, 32>(dv, a, 0x77777777u, st + C::GT, gsc, 0, kk, lane);
-    }
-    const uint32_t sfa = acc_to_a_scaled<NT>(a, dp, 0, lane);
-    {
-      ColScales<D> qsc;
-      load_col_scales<D>(qsc, st + C::QTS, lane);
-      pv_product<D, 32>(dk, a, sfa, st + C::QT, qsc, 0, kk, lane);
+    {  // dV += P^T dO, dK += dS^T Q in FP16 (A divided by its row maximum over the 32 queries)
+      float sc[2], inv[2];
+      uint32_t a[2][4];
+      row_scales<NT>(s, sc, inv);
+      acc_to_h<NT>(a[0], s, 0, inv[0], inv[1]);
+      acc_to_h<NT>(a[1], s, 1, inv[0], inv[1]);
+      f16_product<D, 2>(dv, a, st + C::G16, sc, lane);
+      row_scales<NT>(dp, sc, inv);
+      acc_to_h<NT>(a[0], dp, 0, inv[0], inv[1]);
+      acc_to_h<NT>(a[1], dp, 1, inv[0], inv[1]);
+      f16_product<D, 2>(dk, a, st + C::Q16, sc, lane);
     }
   }
   cp_wait<0>();
@@ -1142,7 +1223,7 @@ using namespace nvfp4::attn;
 // x [B, Hx, N, D] -> {row, row_scales, col, col_scales, delta, raw (bf16), deq (x's dtype)} (unused outputs are
 // empty tensors).
 std::vector<torch::Tensor> nvfp4_attn_quant(torch::Tensor x, const OptTensor& mean, const OptTensor& o, bool want_row,
-                                            bool want_col, bool want_bf16, bool want_deq) {
+                                            bool want_col, bool want_bf16, bool want_deq, int64_t want_f16) {
   TORCH_CHECK(x.is_cuda() && x.dim() == 4, "x must be a 4-D [B, H, N, D] CUDA tensor");
   const c10::cuda::CUDAGuard guard(x.device());
   const int64_t B = x.size(0), Hx = x.size(1), N = x.size(2), D = x.size(3), Np = padded(N);
@@ -1171,7 +1252,10 @@ std::vector<torch::Tensor> nvfp4_attn_quant(torch::Tensor x, const OptTensor& me
                                 : torch::empty({0}, x.options().dtype(at::kBFloat16));
   TORCH_CHECK(!want_deq || want_row || want_col, "want_deq needs the row or the col layout");
   torch::Tensor deq = want_deq ? torch::empty({B, Hx, Np, D}, x.options()) : torch::empty({0}, x.options());
-  if (B * Hx == 0) return {row, row_s, col, col_s, delta, raw, deq};
+  TORCH_CHECK(want_f16 >= 0 && want_f16 <= 2 && (want_f16 == 0 || want_row), "want_f16 (1 codes, 2 unrounded) needs the row layout");
+  auto h16o = x.options().dtype(at::kHalf);
+  torch::Tensor f16 = want_f16 ? torch::empty({B, Hx, Np, D}, h16o) : torch::empty({0}, h16o);
+  if (B * Hx == 0) return {row, row_s, col, col_s, delta, raw, deq, f16};
   TORCH_CHECK(B * Hx < 65536, "batch * heads must be < 65536");
   QuantArgs a{};
   a.x = x.data_ptr();
@@ -1188,6 +1272,8 @@ std::vector<torch::Tensor> nvfp4_attn_quant(torch::Tensor x, const OptTensor& me
   a.col_s = want_col ? col_s.data_ptr<uint8_t>() : nullptr;
   a.raw = want_bf16 ? reinterpret_cast<__nv_bfloat16*>(raw.data_ptr()) : nullptr;
   a.deq = want_deq ? deq.data_ptr() : nullptr;
+  a.f16 = want_f16 ? reinterpret_cast<__half*>(f16.data_ptr()) : nullptr;
+  a.f16_mode = static_cast<int>(want_f16);
   a.Hx = static_cast<int>(Hx), a.N = static_cast<int>(N), a.Np = static_cast<int>(Np);
   auto stream = at::cuda::getCurrentCUDAStream();
   switch (variant(x.scalar_type(), D)) {
@@ -1197,7 +1283,7 @@ std::vector<torch::Tensor> nvfp4_attn_quant(torch::Tensor x, const OptTensor& me
     default: launch_quant<__half, 128>(a, Np, B * Hx, stream); break;
   }
   C10_CUDA_KERNEL_LAUNCH_CHECK();
-  return {row, row_s, col, col_s, delta, raw, deq};
+  return {row, row_s, col, col_s, delta, raw, deq, f16};
 }
 
 static void check_s32(const torch::Tensor& t, int64_t B, int64_t H, int64_t Np, const char* name) {
@@ -1254,10 +1340,10 @@ std::vector<torch::Tensor> nvfp4_attn_fwd(torch::Tensor q, torch::Tensor qs, tor
 }
 
 // Returns {dq [B, N, H, D], dk [B, N, Hk, D], dv [B, N, Hk, D]} (dtype).
-std::vector<torch::Tensor> nvfp4_attn_bwd(torch::Tensor q, torch::Tensor qs, torch::Tensor qt, torch::Tensor qts,
+std::vector<torch::Tensor> nvfp4_attn_bwd(torch::Tensor q, torch::Tensor qs, torch::Tensor q16,
                                           torch::Tensor k, torch::Tensor ks, torch::Tensor kt, torch::Tensor kts,
                                           torch::Tensor k16, torch::Tensor v, torch::Tensor vs, torch::Tensor g,
-                                          torch::Tensor gs, torch::Tensor gt, torch::Tensor gts, torch::Tensor lse,
+                                          torch::Tensor gs, torch::Tensor g16, torch::Tensor lse,
                                           torch::Tensor delta, int64_t N, bool causal, double scale,
                                           c10::ScalarType dtype, const std::vector<int64_t>& dq_stride,
                                           const std::vector<int64_t>& dk_stride) {
@@ -1267,19 +1353,22 @@ std::vector<torch::Tensor> nvfp4_attn_bwd(torch::Tensor q, torch::Tensor qs, tor
   TORCH_CHECK(Hk > 0 && H % Hk == 0, "query heads must be a multiple of key/value heads");
   check_q8(q, B, H, Np, D, "q");
   check_s32(qs, B, H, Np, "q scales");
-  check_q8(qt, B, H, D, Np, "q (col)");
-  check_q8(qts, B, H, Np / 64, 2 * D, "q (col) scales");
+
   check_q8(k, B, Hk, Np, D, "k");
   check_s32(ks, B, Hk, Np, "k scales");
-  TORCH_CHECK(k16.is_cuda() && k16.scalar_type() == at::kBFloat16 && k16.is_contiguous() && k16.dim() == 4 &&
-                  k16.size(0) == B && k16.size(1) == Hk && k16.size(2) == Np && k16.size(3) == D,
-              "k (bf16): expected a contiguous bf16 [B, Hk, Np, D] tensor");
+  auto check_h = [&](const torch::Tensor& t, int64_t heads, const char* name) {
+    TORCH_CHECK(t.is_cuda() && t.scalar_type() == at::kHalf && t.is_contiguous() && t.dim() == 4 && t.size(0) == B &&
+                    t.size(1) == heads && t.size(2) == Np && t.size(3) == D,
+                name, ": expected a contiguous fp16 [B, H, Np, D] tensor");
+  };
+  check_h(q16, H, "q (fp16 codes)");
+  check_h(k16, Hk, "k (fp16 codes)");
+  check_h(g16, H, "dO (fp16)");
   check_q8(v, B, Hk, Np, D, "v");
   check_s32(vs, B, Hk, Np, "v scales");
   check_q8(g, B, H, Np, D, "dO");
   check_s32(gs, B, H, Np, "dO scales");
-  check_q8(gt, B, H, D, Np, "dO (col)");
-  check_q8(gts, B, H, Np / 64, 2 * D, "dO (col) scales");
+
   for (auto* t : {&lse, &delta})
     TORCH_CHECK(t->scalar_type() == at::kFloat && t->is_contiguous() && t->numel() == B * H * Np,
                 "lse / delta must be contiguous fp32 [B, H, Np]");
@@ -1301,14 +1390,16 @@ std::vector<torch::Tensor> nvfp4_attn_bwd(torch::Tensor q, torch::Tensor qs, tor
     TORCH_CHECK(t->stride(3) == 1 && t->stride(0) % 2 == 0 && t->stride(1) % 2 == 0 && t->stride(2) % 2 == 0,
                 "gradient layout");
   BwdArgs p{};
-  p.q = q.data_ptr<uint8_t>(), p.qs = qs.data_ptr<float>(), p.qt = qt.data_ptr<uint8_t>(),
-  p.qts = qts.data_ptr<uint8_t>();
+  p.q = q.data_ptr<uint8_t>(), p.qs = qs.data_ptr<float>();
+  p.q16 = reinterpret_cast<const __half*>(q16.data_ptr());
   p.k = k.data_ptr<uint8_t>(), p.ks = ks.data_ptr<float>();
-  p.k16 = reinterpret_cast<const __nv_bfloat16*>(k16.data_ptr());
+  p.k16 = reinterpret_cast<const __half*>(k16.data_ptr());
   p.v = v.data_ptr<uint8_t>(), p.vs = vs.data_ptr<float>();
-  p.g = g.data_ptr<uint8_t>(), p.gs = gs.data_ptr<float>(), p.gt = gt.data_ptr<uint8_t>(),
-  p.gts = gts.data_ptr<uint8_t>();
+  p.g = g.data_ptr<uint8_t>(), p.gs = gs.data_ptr<float>();
+  p.g16 = reinterpret_cast<const __half*>(g16.data_ptr());
   p.lse = lse.data_ptr<float>(), p.delta = delta.data_ptr<float>();
+  auto delta2 = torch::zeros_like(delta);  // padding rows stay 0 (their lse is +inf: P = 0)
+  p.delta2 = delta2.data_ptr<float>();
   p.kt = kt.data_ptr<uint8_t>(), p.kts = kts.data_ptr<uint8_t>();
   p.dq = dq.data_ptr(), p.dk = dk.data_ptr(), p.dv = dv.data_ptr();
   p.dq_sb = dq.stride(0), p.dq_sh = dq.stride(1), p.dq_sn = dq.stride(2);

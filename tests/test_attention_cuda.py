@@ -7,6 +7,7 @@ exact attention of the quantized inputs; the gradients of both backwards against
 error levels 8-bit operands imply, and those of backward="bf16" against the exact gradient of the quantized
 forward; plus determinism, gradient layouts, GQA, ragged lengths, fallback and compile."""
 import math
+import sys
 
 import pytest
 import torch
@@ -44,7 +45,7 @@ def _exact(q, k, v, causal, scale):
 def test_quantizer_is_exact(D, N, with_mean):
     x = torch.randn(2, 3, N, D, device=DEV, dtype=torch.bfloat16) * 3
     mean = x.mean(dim=2, dtype=torch.float32) if with_mean else None
-    row, rs, col, cs, _, raw, _ = lib.attn_quant(x, mean, None, True, True, True)
+    row, rs, col, cs, _, raw, _, _ = lib.attn_quant(x, mean, None, True, True, True)
     xs = x.float() - mean.unsqueeze(2) if with_mean else x.float()
     codes, sc = ref.int8_token_quantize(xs)
     Np = row.shape[2]
@@ -70,8 +71,8 @@ def test_quantizer_delta_and_strides():
     # dO as a transposed view (the layout autograd hands over), delta = rowsum(dO * O)
     g = torch.randn(2, 300, 4, 64, device=DEV, dtype=torch.bfloat16).transpose(1, 2)
     o = torch.randn(2, 300, 4, 64, device=DEV, dtype=torch.bfloat16).transpose(1, 2)
-    row, rs, col, cs, delta, _, _ = lib.attn_quant(g, None, o, True, True, False)
-    row2, rs2, col2, cs2, _, _, _ = lib.attn_quant(g.contiguous(), None, None, True, True, False)
+    row, rs, col, cs, delta, _, _, _ = lib.attn_quant(g, None, o, True, True, False)
+    row2, rs2, col2, cs2, _, _, _, _ = lib.attn_quant(g.contiguous(), None, None, True, True, False)
     assert torch.equal(row, row2) and torch.equal(rs, rs2) and torch.equal(col, col2) and torch.equal(cs, cs2)
     want = (g.float() * o.float()).sum(-1)
     torch.testing.assert_close(delta[:, :, :300], want, rtol=1e-5, atol=1e-4)
@@ -117,14 +118,17 @@ def _quantized_inputs(q, k, v):
 
 
 @pytest.mark.parametrize("B,H,Hk,N,D,causal", CASES)
-def test_two_term_forward_is_exact_attention_of_quantized_inputs(B, H, Hk, N, D, causal):
+def test_two_term_forward_is_exact_attention_of_quantized_inputs(B, H, Hk, N, D, causal, monkeypatch):
     # backward="bf16" runs the forward with P V = e4m3(P) V + e4m3(residual) V: the output is then exact
     # attention of the quantized operands up to ~2^-8 in P (BF16 flash attention's own level), which keeps
     # Delta = rowsum(dO O) consistent with the exact backward
+    A = sys.modules["nvfp4.attention"]  # (nvfp4.attention the attribute is the function)
+
     q, k, v = _qkv(B, H, Hk, N, D)
     want = _exact(*(t.to(q.dtype) for t in _quantized_inputs(q, k, v)), causal, None)
     with torch.no_grad():
         o2 = attention(q, k, v, causal=causal, backward="bf16")
+        monkeypatch.setattr(A, "_FWD_P2_8BIT", False)  # the one-term forward
         o1 = attention(q, k, v, causal=causal, backward="8bit")
     assert _rel(o2, want) < 0.006
     if N > 1:

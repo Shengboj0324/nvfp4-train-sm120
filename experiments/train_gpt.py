@@ -191,6 +191,8 @@ def main():
                     help="with --ms-eden: MS-EDEN on the dgrad operands too (ops.set_ms_eden(True, dgrad=True))")
     ap.add_argument("--ms-eden", action="store_true",
                     help="MS-EDEN on the wgrad operands: 64-point RHT, EDEN-corrected scales instead of element SR")
+    ap.add_argument("--fprop-terms", type=int, choices=[1, 2], default=1,
+                    help="NVFP4 terms of the forward activations (ops.set_fprop_terms; 2: twice the fprop GEMM depth)")
     ap.add_argument("--moe-experts", type=int, default=0, help="mixture-of-experts MLPs with this many experts")
     ap.add_argument("--moe-topk", type=int, default=2)
     ap.add_argument("--moe-dff", type=int, default=0, help="expert hidden size (default 4 d / top_k: compute-matched)")
@@ -255,6 +257,8 @@ def main():
         from nvfp4 import ops as _ops
         if a.four_six:
             _ops.set_four_six(True)
+        if a.fprop_terms != 1:
+            _ops.set_fprop_terms(a.fprop_terms)
         if a.ms_eden or a.ms_eden_dgrad:
             _ops.set_ms_eden(True, dgrad=a.ms_eden_dgrad)
         if a.weight_1d:

@@ -259,6 +259,24 @@ __device__ __forceinline__ float e2m1_mag(uint32_t c) {
   return c >= 2u ? __uint_as_float(((126u + (c >> 1)) << 23) | ((c & 1u) << 22)) : (c ? 0.5f : 0.0f);
 }
 
+// Residual of a quantized block in the input's units, as reference.quantize_dual(row_terms=2) computes it:
+// r_i = v_i - (q_i * sf) * gdec, q_i the decoded E2M1 code (sign bit 3), sf the decoded scale byte `s`. Returns
+// max |r_i|.
+__device__ __forceinline__ float residual16(const float (&v)[kBlock], uint8_t s, const uint2& packed, float gdec,
+                                            float (&r)[kBlock]) {
+  const float sf = e4m3_to_float(s);
+  float m = 0.0f;
+#pragma unroll
+  for (int i = 0; i < kBlock; ++i) {
+    const uint32_t c = ((i < 8 ? packed.x : packed.y) >> (4 * (i & 7))) & 15u;
+    const float mag = e2m1_mag(c & 7u);
+    const float d = __fmul_rn(__fmul_rn((c & 8u) ? -mag : mag, sf), gdec);
+    r[i] = __fsub_rn(v[i], d);
+    m = fmaxf(m, fabsf(r[i]));
+  }
+  return m;
+}
+
 // reference._rtn_candidate: round-to-nearest with the block scale target bdiv * genc (bdiv = bmax / 6 or
 // bmax / 4); returns the scale byte, the codes, and the squared error sum((|y| - q)^2) * sf^2 (summed in
 // element order).
