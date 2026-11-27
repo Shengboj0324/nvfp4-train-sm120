@@ -97,9 +97,9 @@ def run(q, k, v, do, causal=True):
     res["bf16bwd"] = (o2.detach(), q2.grad, k2.grad, v2.grad)
     # our forward's o and lse
     kmean = k.mean(dim=2, dtype=torch.float32)
-    q8, qs, _, _, _, _, _ = _lib.attn_quant(q, None, None, True, False, False)
-    k8, ks, _, _, _, _, _ = _lib.attn_quant(k, kmean, None, True, False, False)
-    _, _, vt, vts, _, _, _ = _lib.attn_quant(v, None, None, False, True, False)
+    q8, qs, _, _, _, _, _, _ = _lib.attn_quant(q, None, None, True, False, False)
+    k8, ks, _, _, _, _, _, _ = _lib.attn_quant(k, kmean, None, True, False, False)
+    _, _, vt, vts, _, _, _, _ = _lib.attn_quant(v, None, None, False, True, False)
     o8, lse8 = _lib.attn_fwd(q8, qs, k8, ks, vt, vts, N, causal, scale, dt)
     o8 = o8.transpose(1, 2)
     lse_nat = (lse8[:, :, :N] * LN2).contiguous()

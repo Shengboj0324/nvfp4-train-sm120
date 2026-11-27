@@ -116,9 +116,9 @@ for li, c in enumerate(caps[:10]):
     qe, ke, ve = (t.float().requires_grad_() for t in (q, k, v))
     F.scaled_dot_product_attention(qe, ke, ve, is_causal=True).backward(do.float())
     kmean = k.mean(dim=2, dtype=torch.float32)
-    q8, qs, _, _, _, _, qd = _lib.attn_quant(q, None, None, True, False, False, True)
-    k8, ks, _, _, _, _, kd = _lib.attn_quant(k, kmean, None, True, False, False, True)
-    _, _, vt, vts, _, _, vd = _lib.attn_quant(v, None, None, False, True, False, True)
+    q8, qs, _, _, _, _, qd, _ = _lib.attn_quant(q, None, None, True, False, False, True)
+    k8, ks, _, _, _, _, kd, _ = _lib.attn_quant(k, kmean, None, True, False, False, True)
+    _, _, vt, vts, _, _, vd, _ = _lib.attn_quant(v, None, None, False, True, False, True)
     _, lse8 = _lib.attn_fwd(q8, qs, k8, ks, vt, vts, N, True, scale, q.dtype, True)
     lse = (lse8[:, :, :N] * LN2).contiguous()
     qd, kd, vd = qd[:, :, :N], kd[:, :, :N], vd[:, :, :N]

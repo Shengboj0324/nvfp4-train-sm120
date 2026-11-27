@@ -51,25 +51,30 @@ class _AttentionFn(torch.autograd.Function):
         N = q.shape[2]
         grad = any(ctx.needs_input_grad[:3])
         kmean = k.mean(dim=2, dtype=torch.float32) if smooth_k else None
-        q8, qs, qt, qts, _, _, _ = _lib.attn_quant(q, None, None, True, grad, False)
-        # K: INT8 rows, plus (for dQ = dS K, done in BF16) a BF16 copy, both centred by the mean
-        k8, ks, kt, kts, _, k16, _ = _lib.attn_quant(k, kmean, None, True, grad, grad)
-        v8, vs, vt, vts, _, _, _ = _lib.attn_quant(v, None, None, grad, True, False)
-        o, lse = _lib.attn_fwd(q8, qs, k8, ks, vt, vts, N, causal, scale, q.dtype)
+        f16 = 1 if grad else 0  # the INT8 codes in FP16 (dK = dS^T Q, dQ = dS K)
+        q8, qs, _, _, _, _, _, q16 = _lib.attn_quant(q, None, None, True, False, False, False, f16)
+        # K: INT8 rows (+ their codes in FP16), and the MXFP8 col layout for dQ's correction term P K
+        k8, ks, kt, kts, _, _, _, k16 = _lib.attn_quant(k, kmean, None, True, grad, False, False, f16)
+        v8, vs, vt, vts, _, _, _, _ = _lib.attn_quant(v, None, None, grad, True, False)
+        o, lse = _lib.attn_fwd(q8, qs, k8, ks, vt, vts, N, causal, scale, q.dtype, _FWD_P2_8BIT)
         o = o.transpose(1, 2)
         if grad:
-            ctx.save_for_backward(q8, qs, qt, qts, k8, ks, kt, kts, k16, v8, vs, o, lse)
+            ctx.save_for_backward(q8, qs, q16, k8, ks, kt, kts, k16, v8, vs, o, lse)
         ctx.cfg = (N, causal, scale, list(q.stride()), list(k.stride()), q.dtype)
         return o
 
     @staticmethod
     def backward(ctx, do):
-        q8, qs, qt, qts, k8, ks, kt, kts, k16, v8, vs, o, lse = ctx.saved_tensors
+        q8, qs, q16, k8, ks, kt, kts, k16, v8, vs, o, lse = ctx.saved_tensors
         N, causal, scale, q_stride, k_stride, dtype = ctx.cfg
-        g8, gs, gt, gts, delta, _, _ = _lib.attn_quant(do.to(dtype), None, o, True, True, False)
-        dq, dk, dv = _lib.attn_bwd(q8, qs, qt, qts, k8, ks, kt, kts, k16, v8, vs, g8, gs, gt, gts, lse, delta, N,
-                                   causal, scale, dtype, q_stride, k_stride)
+        g8, gs, _, _, delta, _, _, g16 = _lib.attn_quant(do.to(dtype), None, o, True, False, False, False, 2)
+        dq, dk, dv = _lib.attn_bwd(q8, qs, q16, k8, ks, kt, kts, k16, v8, vs, g8, gs, g16, lse, delta, N, causal,
+                                   scale, dtype, q_stride, k_stride)
         return dq, dk, dv, None, None, None
+
+
+# backward="8bit": the forward's P V in two e4m3 terms (as for the exact backward) or one
+_FWD_P2_8BIT = True
 
 
 _LN2 = 0.6931471805599453
@@ -123,9 +128,9 @@ class _AttentionBf16BwdFn(torch.autograd.Function):
         N = q.shape[2]
         grad = any(ctx.needs_input_grad[:3])
         kmean = k.mean(dim=2, dtype=torch.float32) if smooth_k else None
-        q8, qs, _, _, _, _, qd = _lib.attn_quant(q, None, None, True, False, False, grad)
-        k8, ks, _, _, _, _, kd = _lib.attn_quant(k, kmean, None, True, False, False, grad)
-        _, _, vt, vts, _, _, vd = _lib.attn_quant(v, None, None, False, True, False, grad)
+        q8, qs, _, _, _, _, qd, _ = _lib.attn_quant(q, None, None, True, False, False, grad)
+        k8, ks, _, _, _, _, kd, _ = _lib.attn_quant(k, kmean, None, True, False, False, grad)
+        _, _, vt, vts, _, _, vd, _ = _lib.attn_quant(v, None, None, False, True, False, grad)
         o, lse = _lib.attn_fwd(q8, qs, k8, ks, vt, vts, N, causal, scale, q.dtype, True)
         o = o.transpose(1, 2)
         if grad:
